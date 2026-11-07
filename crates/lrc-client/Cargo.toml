@@ -14,6 +14,7 @@ lrc-codec.workspace = true
 lrc-render.workspace = true
 lrc-transport.workspace = true
 lrc-video.workspace = true
+lrc-audio.workspace = true
 # Win32_Security_Cryptography 只用于 BCryptGenRandom 生成 client_id / nonce_c
 windows = { workspace = true, features = ["Win32_Security_Cryptography"] }
 anyhow.workspace = true

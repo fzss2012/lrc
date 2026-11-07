@@ -129,6 +129,34 @@ M1 用纯 Rust jpeg 编码器；M2 换 H.264/HEVC（NVENC 硬编）+ 流式视�
   `AccumulatedFrames > 4` 时视为整帧。
 - 无新帧（超时）→ 直接返回 `None`，不产生任何消息。
 - 兜底：GDI `BitBlt`（老系统/远程桌面嵌套）。
+- **首帧有效性**：`AcquiredFrame.AccumulatedFrames == 0` 的那一帧里没有桌面图像（拷出来全黑）。
+  非首帧直接丢弃；首帧做抽样检查 + 有界重试，重试用尽改用 GDI BitBlt 兜底，避免客户端黑屏。
+- **格式校验**：桌面纹理必须是 `B8G8R8A8_UNORM`/`_SRGB`，HDR/10bit 直接返回 `Unsupported`。
+
+### 4.1 取帧 API（M2 起推荐 `grab_view`）
+
+```rust
+// 旧接口：拥有数据，每帧一次 8.1 MB 全屏拷贝（1080p30 ≈ 243 MB/s）
+let frame: Frame = cap.grab()?.unwrap();
+use_frame(&frame.bgra, frame.stride, &frame.dirty, frame.full);
+
+// 新接口（推荐）：零拷贝借用，生命周期到下一次 grab_view 为止
+if let Some(v) = cap.grab_view()? {
+    // v.width / v.height / v.stride / v.bgra: &[u8] / v.dirty: &[Rect] / v.moves / v.full / v.ts_ms
+    encode_blocks(v.bgra, v.stride, v.dirty);
+}   // ← 这里之后才能再 grab_view
+```
+
+两者语义完全一致（同一份像素、同一组 dirty/moves），唯一区别是**谁拥有内存**：
+
+| | 单帧 p50 | 每帧内存拷贝 | 适用 |
+|---|---|---|---|
+| `grab()` | ≈ 3.8–4.0 ms | 8.1 MB | 需要跨线程/缓存帧 |
+| `grab_view()` | ≈ 1.4–1.9 ms | **0** | host 主循环（取一帧→编码→下一帧） |
+
+host 迁移方式：把循环体里的 `let frame = cap.grab()?...` 换成 `let Some(v) = cap.grab_view()?...`，
+`frame.bgra` → `v.bgra`、`frame.stride` → `v.stride`、`frame.dirty` → `v.dirty`，其余不变
+（注意 `v` 借用 `cap`，不能在持有时再调 `cap` 的方法）。
 
 ## 4.5 画面缩放口径（钉死）
 

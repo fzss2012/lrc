@@ -72,6 +72,29 @@ impl ModeSwitch {
         self.mode
     }
 
+    /// 视频通道是否可用（编码器探测通过且没被永久禁用）。
+    pub fn video_available(&self) -> bool {
+        self.video_available
+    }
+
+    /// 强制进入视频模式（块模式码率判据用，并联于 changed_ratio 判据）。
+    /// 调用方负责请求 IDR / 换世代。
+    pub fn force_video(&mut self) {
+        if !self.video_available {
+            return;
+        }
+        self.mode = Mode::Video;
+        self.high_streak = 0;
+        self.low_streak = 0;
+    }
+
+    /// 强制回块模式（控制器/缩放要求退出视频时用，保持状态机与实际发送路径一致）。
+    pub fn force_blocks(&mut self) {
+        self.mode = Mode::Blocks;
+        self.high_streak = 0;
+        self.low_streak = 0;
+    }
+
     /// 编码器不可用（探测失败 / 运行期失败）：永久回块模式。
     pub fn disable_video(&mut self) {
         self.video_available = false;
@@ -361,7 +384,7 @@ fn encode_loop(mut encoder: FfmpegEncoder, pipe: Arc<Pipe>, shared: Arc<Shared>,
         }
 
         let want_bitrate = pipe.bitrate_req.swap(0, Ordering::Relaxed);
-        if want_bitrate != 0 {
+        if want_bitrate != 0 && want_bitrate != encoder.bitrate() {
             match encoder.set_bitrate(want_bitrate) {
                 Ok(()) => log::info!(
                     "视频：码率切到 {}kbps（重启 {}us，新进程首帧为 IDR）",

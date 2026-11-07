@@ -18,6 +18,10 @@ pub const MSG_VIDEO_AU: u8 = 0x14;
 pub const MSG_AUDIO_FRAME: u8 = 0x15;
 pub const MSG_INPUT_EVENT: u8 = 0x20;
 pub const MSG_REQUEST_FULL: u8 = 0x30;
+/// 主控端 → 被控端：切换到第 N 个显示输出
+pub const MSG_SELECT_DISPLAY: u8 = 0x31;
+/// 被控端 → 主控端：可用显示输出列表
+pub const MSG_DISPLAY_LIST: u8 = 0x32;
 pub const MSG_PING: u8 = 0x40;
 pub const MSG_PONG: u8 = 0x41;
 
@@ -29,6 +33,8 @@ pub const MAX_CURSOR_BYTES: usize = 256 * 256 * 4;
 pub const MAX_VIDEO_AU: usize = 8 * 1024 * 1024;
 /// 单个音频帧上限（Opus 20ms 通常 <200B；PCM 兜底 48k*2ch*2B*20ms≈3.8KB）。
 pub const MAX_AUDIO_FRAME: usize = 64 * 1024;
+/// 显示输出数量上限
+pub const MAX_DISPLAYS: usize = 16;
 /// 单帧最多块数。
 pub const MAX_BLOCKS_PER_FRAME: usize = 65_535;
 
@@ -169,6 +175,24 @@ pub struct CursorShape<'a> {
     pub rgba: &'a [u8],
 }
 
+/// 一路显示输出。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayInfo {
+    pub index: u8,
+    pub width: u32,
+    pub height: u32,
+    /// 该输出在虚拟桌面中的原点（客户端不需要，被控端用它做输入换算）
+    pub origin_x: i32,
+    pub origin_y: i32,
+    pub primary: bool,
+}
+
+/// 主控端请求切换显示输出。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectDisplay {
+    pub index: u8,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameAck {
     pub seq: u32,
@@ -200,6 +224,8 @@ pub enum Message<'a> {
     VideoAck(FrameAck),
     Input(InputEvent),
     RequestFull,
+    DisplayList(Vec<DisplayInfo>),
+    SelectDisplay(SelectDisplay),
     Ping(Ping),
     Pong(Pong),
 }
@@ -219,6 +245,8 @@ impl<'a> Message<'a> {
             Message::VideoAck(_) => MSG_VIDEO_ACK,
             Message::Input(_) => MSG_INPUT_EVENT,
             Message::RequestFull => MSG_REQUEST_FULL,
+            Message::DisplayList(_) => MSG_DISPLAY_LIST,
+            Message::SelectDisplay(_) => MSG_SELECT_DISPLAY,
             Message::Ping(_) => MSG_PING,
             Message::Pong(_) => MSG_PONG,
         }
@@ -295,6 +323,20 @@ impl<'a> Message<'a> {
                 w.u64(ack.recv_bytes);
             }
             Message::Input(ev) => ev.encode(&mut w),
+            Message::DisplayList(list) => {
+                w.u8(list.len().min(MAX_DISPLAYS) as u8);
+                for d in list.iter().take(MAX_DISPLAYS) {
+                    w.u8(d.index);
+                    w.u32(d.width);
+                    w.u32(d.height);
+                    w.i32(d.origin_x);
+                    w.i32(d.origin_y);
+                    w.bool(d.primary);
+                }
+            }
+            Message::SelectDisplay(sel) => {
+                w.u8(sel.index);
+            }
             Message::RequestFull => {}
             Message::Ping(p) => w.u64(p.ts_ms),
             Message::Pong(p) => w.u64(p.ts_ms),
@@ -399,6 +441,27 @@ impl<'a> Message<'a> {
             }),
             MSG_INPUT_EVENT => Message::Input(InputEvent::decode(&mut r)?),
             MSG_REQUEST_FULL => Message::RequestFull,
+            MSG_DISPLAY_LIST => {
+                let n = usize::from(r.u8()?);
+                if n > MAX_DISPLAYS {
+                    return Err(ProtoError::BadValue);
+                }
+                let mut list = Vec::with_capacity(n);
+                for _ in 0..n {
+                    list.push(DisplayInfo {
+                        index: r.u8()?,
+                        width: r.u32()?,
+                        height: r.u32()?,
+                        origin_x: r.i32()?,
+                        origin_y: r.i32()?,
+                        primary: r.bool()?,
+                    });
+                }
+                Message::DisplayList(list)
+            }
+            MSG_SELECT_DISPLAY => {
+                Message::SelectDisplay(SelectDisplay { index: r.u8()? })
+            }
             MSG_PING => Message::Ping(Ping { ts_ms: r.u64()? }),
             MSG_PONG => Message::Pong(Pong { ts_ms: r.u64()? }),
             other => return Err(ProtoError::UnknownMessage(other)),
@@ -533,6 +596,34 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn roundtrip_display_messages() {
+        let list = Message::DisplayList(vec![
+            DisplayInfo {
+                index: 0,
+                width: 1920,
+                height: 1080,
+                origin_x: 0,
+                origin_y: 0,
+                primary: true,
+            },
+            DisplayInfo {
+                index: 1,
+                width: 2560,
+                height: 1440,
+                origin_x: 1920,
+                origin_y: 0,
+                primary: false,
+            },
+        ]);
+        let buf = list.encode();
+        assert_eq!(Message::decode(&buf).expect("decode"), list);
+
+        let sel = Message::SelectDisplay(SelectDisplay { index: 1 });
+        let buf = sel.encode();
+        assert_eq!(Message::decode(&buf).expect("decode"), sel);
     }
 
     #[test]

@@ -37,6 +37,10 @@ const IDLE_POLL: Duration = Duration::from_millis(2);
 const MAX_THROTTLE_SLEEP: Duration = Duration::from_millis(20);
 /// 采集器连续重建失败的次数上限，超过就结束这条会话。
 const CAPTURE_REOPEN_TRIES: u32 = 20;
+/// 并联判据②：块模式实际码率超过这个值（kbps）……
+const BLOCK_OVER_KBPS: f64 = 6_000.0;
+/// ……连续这么多秒，就切视频模式（窗口化播视频时 changed_ratio 只有 20-30%，不能只靠它）。
+const BLOCK_OVER_SECS: u32 = 3;
 /// CursorShape 消息的边长上限：lrc-proto 的 MAX_CURSOR_BYTES = 256*256*4，
 /// 超过客户端会解不动（更大会话就断），所以宁可不发形状只发位置。
 const MAX_CURSOR_SHAPE_DIM: u32 = 256;
@@ -140,10 +144,12 @@ impl Shared {
     /// 帧级 ack 反算——含义是"发出这一帧 → 收到它的 ack"，含客户端解码+回执时间。
     fn note_ack(&self, seq: u32) {
         self.ack_seq.store(seq, Ordering::Relaxed);
-        if seq != self.last_sent_seq.load(Ordering::Relaxed) {
+        // 客户端 ack 的往往不是"最近一帧"（会滞后一两帧），所以用"收到 ack 时距上次发送的时间"
+        // 作为往返代理；这比只匹配 last_sent_seq 稳健得多（后者会长期采不到样）。
+        let sent = self.last_send_ms.load(Ordering::Relaxed);
+        if sent == 0 {
             return;
         }
-        let sent = self.last_send_ms.load(Ordering::Relaxed);
         let now = self.elapsed_ms();
         let sample = now.saturating_sub(sent).min(5_000) as u32;
         let prev = self.rtt_ms.load(Ordering::Relaxed);
@@ -592,9 +598,21 @@ impl AdaptState {
 #[derive(Debug, Clone, Copy)]
 struct SecondSample {
     interval_secs: f64,
+    /// 这一秒的线上总字节
     bytes: u64,
+    /// 其中视频 AU 的字节（用来算"纯块模式码率"）
+    video_bytes: u64,
     dropped: u32,
     fps: f32,
+}
+
+/// 并联判据②的判定：块模式实际码率是否明显超过"整帧视频"的代价。
+///
+/// 阈值取 max(6 Mbps, --video-bitrate × 1.5)：这样即使把视频码率配得很低，
+/// 只要块模式码率远高于它，切视频依然划算。
+fn block_bitrate_trigger(block_kbps: f64, video_bitrate_bps: u32) -> bool {
+    let threshold = BLOCK_OVER_KBPS.max(f64::from(video_bitrate_bps) / 1000.0 * 1.5);
+    block_kbps > threshold
 }
 
 /// 缩放后的画面尺寸：取 block_size 的整数倍，保证块网格没有半块。
@@ -749,6 +767,13 @@ fn capture_loop(
     // 这一秒的变化块比例累加（算平均值喂控制器）
     let mut ratio_sum = 0.0f64;
     let mut ratio_n = 0u64;
+    // 并联判据②：块模式实际码率连续超阈值的秒数
+    let mut block_over_kbps_streak: u32 = 0;
+    // 码率判据强制切视频时置位：此时忽略控制器的 mode 否决（控制器只按 changed_ratio
+    // 判模式，窗口化播视频正是它看不见的场景）；内容安静后由 ModeSwitch 退出并清位。
+    let mut video_forced_by_bitrate = false;
+    // 已经请求过的视频码率（避免每秒重复请求导致编码进程反复重启）
+    let mut requested_bitrate = args.video_bitrate;
     // 降分辨率用的复用缓冲
     let mut scaled: Option<Frame> = None;
     let mut slots: Vec<BlockSlot> = Vec::new();
@@ -834,8 +859,11 @@ fn capture_loop(
                 frame_interval =
                     Duration::from_secs_f64(1.0 / f64::from(adapt.fps_limit.max(1)));
                 opts.jpeg_quality = adapt.block_quality;
-                if let Some(p) = pipeline.as_ref() {
-                    p.request_bitrate(adapt.video_bitrate);
+                if adapt.video_bitrate != requested_bitrate {
+                    if let Some(p) = pipeline.as_ref() {
+                        p.request_bitrate(adapt.video_bitrate);
+                    }
+                    requested_bitrate = adapt.video_bitrate;
                 }
                 // 分辨率缩放变化：立刻重建网格并要求下一帧整帧重发
                 if (adapt.scale - prev_scale).abs() > 0.01 {
@@ -852,11 +880,47 @@ fn capture_loop(
                     }
                     track = Track::new(sw, sh)
                         .ok_or_else(|| format!("缩放尺寸非法 {sw}x{sh}"))?;
-                    cursor.set_mapping((info.origin_x, info.origin_y), (sw, sh), adapt.scale);
+                    cursor.set_mapping(
+                        (info.origin_x, info.origin_y),
+                        (info.width, info.height),
+                        adapt.scale,
+                    );
                     force_full = true;
                     scaled = None;
                 }
             }
+
+            // ---- 并联判据②：块模式实际码率连续超阈值 → 也切视频 ----
+            // 与 changed_ratio 判据并联（任一满足就切）。典型场景：窗口化播放视频，
+            // 只有 20%-30% 屏幕在变，但逐块 JPEG 会打到 20-40 Mbps。
+            if mode_switch.video_available() && mode_switch.mode() == Mode::Blocks {
+                let block_bytes = sample.bytes.saturating_sub(sample.video_bytes);
+                let block_kbps =
+                    (block_bytes as f64 * 8.0 / 1000.0) / sample.interval_secs.max(0.001);
+                if block_bitrate_trigger(block_kbps, args.video_bitrate) {
+                    block_over_kbps_streak = block_over_kbps_streak.saturating_add(1);
+                } else {
+                    block_over_kbps_streak = 0;
+                }
+                if block_over_kbps_streak >= BLOCK_OVER_SECS {
+                    log::info!(
+                        "块模式码率连续 {} 秒超阈值（实测 {:.0}kbps，阈值 max({:.0}, video×1.5)kbps），切视频模式并请求 IDR",
+                        block_over_kbps_streak,
+                        block_kbps,
+                        BLOCK_OVER_KBPS
+                    );
+                    mode_switch.force_video();
+                    video_forced_by_bitrate = true;
+                    block_over_kbps_streak = 0;
+                    if let Some(p) = pipeline.as_ref() {
+                        video_gen = p.new_generation();
+                        p.request_keyframe();
+                    }
+                    force_full = false;
+                    next_grab_at = Instant::now();
+                }
+            }
+
             ratio_sum = 0.0;
             ratio_n = 0;
         }
@@ -953,13 +1017,11 @@ fn capture_loop(
                         log::warn!("视频编码器已失效，永久回块模式");
                         mode_switch.disable_video();
                         back_to_blocks = true;
-                    } else if adapt.enabled && !(adapt.allow_video && !adapt.scale_active()) {
-                        // 控制器要求块模式（或正在降分辨率）→ 回块模式
-                        log::info!(
-                            "自适应要求块模式（allow_video={}，scale={:.2}），退出视频模式",
-                            adapt.allow_video,
-                            adapt.scale
-                        );
+                    } else if adapt.enabled && !adapt.allow_video && !video_forced_by_bitrate {
+                        // 控制器要求块模式 → 退出视频模式。
+                        // 注意：resolution_scale 只作用于块模式（编码器按原生尺寸创建），
+                        // 视频模式下用原生整帧编码、靠 video_bitrate 控流量。
+                        log::info!("自适应要求块模式（allow_video=false），退出视频模式");
                         p.new_generation();
                         back_to_blocks = true;
                     } else {
@@ -1010,6 +1072,9 @@ fn capture_loop(
             }
 
             if back_to_blocks {
+                // 状态机必须跟着实际发送路径走，否则会一直"名义上视频、实际发块"
+                mode_switch.force_blocks();
+                video_forced_by_bitrate = false;
                 force_full = true;
                 track.scan_all = true;
                 force_cache_resend = cached.is_some();
@@ -1116,7 +1181,7 @@ fn capture_loop(
                 .ok_or_else(|| format!("帧尺寸非法 {}x{}", frame.width, frame.height))?;
             cursor.set_mapping(
                 (info.origin_x, info.origin_y),
-                (frame.width, frame.height),
+                (info.width, info.height),
                 adapt.scale,
             );
         }
@@ -1169,14 +1234,18 @@ fn capture_loop(
             ratio_n += 1;
         }
 
-        // 块模式下也观察变化比例：连续 3 帧 > 45% 就切视频通道
-        match mode_switch.observe(changed.len(), total_blocks) {
+        // 块模式下也观察变化比例：连续 3 帧 > 45% 就切视频通道。
+        // 控制器/缩放有否决权（取更保守的）：不允许时**根本不喂 observe**，
+        // 否则状态机会先切到 Video 再被打回来，导致每帧来回抖。
+        let can_enter_video = !adapt.enabled || adapt.allow_video || video_forced_by_bitrate;
+        let mode_event = if can_enter_video {
+            mode_switch.observe(changed.len(), total_blocks)
+        } else {
+            ModeEvent::None
+        };
+        match mode_event {
             ModeEvent::EnterVideo => {
-                // 控制器/缩放有否决权（取更保守的）：控制器说 blocks 就 blocks；
-                // 降分辨率时编码器尺寸不匹配，也留在块模式。
-                if adapt.enabled && !(adapt.allow_video && !adapt.scale_active()) {
-                    log::debug!("控制器暂不允许视频模式（allow_video={}），继续块模式", adapt.allow_video);
-                } else if let Some(p) = pipeline.as_ref() {
+                if let Some(p) = pipeline.as_ref() {
                     log::info!(
                         "变化比例 {} / {} 块，切到视频模式（请求 IDR，码率 {}kbps）",
                         changed.len(),
@@ -1413,6 +1482,7 @@ fn report_if_due(
     let sample = SecondSample {
         interval_secs: interval,
         bytes: sec.bytes,
+        video_bytes: d_bytes,
         dropped: u32::try_from(sec.dropped).unwrap_or(u32::MAX),
         fps: sec.frames as f32 / interval as f32,
     };
@@ -1531,9 +1601,9 @@ struct CursorTracker {
     last_shape: Option<Arc<lrc_capture::CursorShape>>,
     /// 采集输出在虚拟桌面里的原点
     origin: (i32, i32),
-    /// 采集画面尺寸
-    region: (u32, u32),
-    /// 自适应降分辨率时的坐标缩放（1.0 = 原生）；客户端画面也被缩到这个尺寸
+    /// 原生采集尺寸（判断光标是否在采集区域内）
+    native: (u32, u32),
+    /// 自适应降分辨率时的坐标缩放（1.0 = 原生）；客户端画面 = native × scale
     scale: f32,
 }
 
@@ -1544,7 +1614,7 @@ impl CursorTracker {
             last_pos: None,
             last_shape: None,
             origin,
-            region,
+            native: region,
             scale: 1.0,
         }
     }
@@ -1554,9 +1624,9 @@ impl CursorTracker {
     }
 
     /// 采集器重建 / 分辨率变化 / 自适应缩放变化时更新映射口径。
-    fn set_mapping(&mut self, origin: (i32, i32), region: (u32, u32), scale: f32) {
+    fn set_mapping(&mut self, origin: (i32, i32), native: (u32, u32), scale: f32) {
         self.origin = origin;
-        self.region = region;
+        self.native = native;
         self.scale = if scale.is_finite() && scale > 0.0 {
             scale
         } else {
@@ -1574,7 +1644,7 @@ impl CursorTracker {
         };
 
         let ((sx, sy), inside) =
-            map_cursor_pos((state.x, state.y), self.origin, self.region, self.scale);
+            map_cursor_pos((state.x, state.y), self.origin, self.native, self.scale);
         let pos = (clamp_i16(sx), clamp_i16(sy), state.visible && inside);
         if self.last_pos != Some(pos) {
             let payload = Message::CursorPos(CursorPos {
@@ -1647,7 +1717,7 @@ fn encode_cursor_shape(shape: &lrc_capture::CursorShape) -> Option<Vec<u8>> {
 fn map_cursor_pos(
     desk: (i32, i32),
     origin: (i32, i32),
-    region: (u32, u32),
+    native: (u32, u32),
     scale: f32,
 ) -> ((i32, i32), bool) {
     let s = if scale.is_finite() && scale > 0.0 {
@@ -1655,19 +1725,22 @@ fn map_cursor_pos(
     } else {
         1.0
     };
-    // 先按原生像素判断是否在采集区域内（region 是缩放后的尺寸 → 换算回原生再比）
+    // 先按**原生像素**判断是否在采集区域内，再换算到缩放后的客户端坐标空间
     let raw_x = desk.0.saturating_sub(origin.0);
     let raw_y = desk.1.saturating_sub(origin.1);
-    let native_w = (region.0 as f32 / s).round().max(1.0) as i32;
-    let native_h = (region.1 as f32 / s).round().max(1.0) as i32;
-    let local_x = (raw_x as f32 * s).round() as i32;
-    let local_y = (raw_y as f32 * s).round() as i32;
-    let inside = raw_x >= 0 && raw_y >= 0 && raw_x < native_w && raw_y < native_h;
+    let (region_w, region_h) = scaled_dims(native.0, native.1, s);
+    // 缩放后的尺寸会被吸附到块网格上，所以 x/y 各自的实际比例可能略有不同，分开换算
+    let sx = region_w as f32 / native.0.max(1) as f32;
+    let sy = region_h as f32 / native.1.max(1) as f32;
+    let local_x = (raw_x as f32 * sx).round() as i32;
+    let local_y = (raw_y as f32 * sy).round() as i32;
+    let inside =
+        raw_x >= 0 && raw_y >= 0 && raw_x < native.0 as i32 && raw_y < native.1 as i32;
     if inside {
         return ((local_x, local_y), true);
     }
-    let max_x = region.0.saturating_sub(1) as i32;
-    let max_y = region.1.saturating_sub(1) as i32;
+    let max_x = region_w.saturating_sub(1) as i32;
+    let max_y = region_h.saturating_sub(1) as i32;
     ((local_x.clamp(0, max_x), local_y.clamp(0, max_y)), false)
 }
 
@@ -1788,25 +1861,29 @@ mod tests {
 
     #[test]
     fn cursor_mapping_with_resolution_scale() {
-        // 原生 1920x1080，自适应缩到 1600x896（scale=0.8333），客户端画面是 1600x896
+        // 原生 1920x1080，自适应缩到 1600x896（scale≈0.833），客户端画面就是 1600x896
         let scale = 1600.0f32 / 1920.0;
-        let region = (1600u32, 896u32);
+        let native = (1920u32, 1080u32);
         let origin = (0, 0);
         // 原生左上角 → 缩放画面左上角
-        let ((x, y), inside) = map_cursor_pos((0, 0), origin, region, scale);
+        let ((x, y), inside) = map_cursor_pos((0, 0), origin, native, scale);
         assert_eq!((x, y), (0, 0));
         assert!(inside);
-        // 原生 (960, 540) 屏幕中心 → 缩放画面中心 (800, 448)
-        let ((x, y), inside) = map_cursor_pos((960, 540), origin, region, scale);
-        assert_eq!((x, y), (800, 450));
+        // 原生 (960, 540) 屏幕中心 → 缩放画面中心（y 轴比例略小：896/1080）
+        let ((x, y), inside) = map_cursor_pos((960, 540), origin, native, scale);
+        assert_eq!((x, y), (800, 448));
         assert!(inside);
-        // 原生右下角前一像素 → 缩放画面内
-        let ((x, y), inside) = map_cursor_pos((1919, 1079), origin, region, scale);
+        // 原生右下角前一像素仍在画面内，且坐标不超过缩放后尺寸
+        let ((x, y), inside) = map_cursor_pos((1919, 1079), origin, native, scale);
         assert!(inside, "({x},{y})");
-        assert!(x <= 1600 && y <= 896);
+        assert!(x <= 1600 && y <= 896, "({x},{y})");
         // 原生越界（另一块屏）→ 不在画面内
-        let ((_, _), inside) = map_cursor_pos((2000, 500), origin, region, scale);
+        let ((_, _), inside) = map_cursor_pos((2000, 500), origin, native, scale);
         assert!(!inside);
+        // 缩放 0.5（尺寸刚好是块倍数）时坐标严格减半
+        let ((x, y), inside) = map_cursor_pos((800, 600), origin, (1920, 1024), 0.5);
+        assert_eq!((x, y), (400, 300));
+        assert!(inside);
     }
 
     #[test]
@@ -1968,6 +2045,30 @@ mod tests {
         assert_eq!(adapt.block_quality, args.quality);
         assert_eq!(adapt.scale, 1.0);
         assert_eq!(adapt.video_bitrate, args.video_bitrate);
+    }
+
+    #[test]
+    fn block_bitrate_trigger_thresholds() {
+        // 默认 4 Mbps 视频码率 → 阈值 max(6M, 6M) = 6 Mbps
+        assert!(!block_bitrate_trigger(5_900.0, 4_000_000));
+        assert!(block_bitrate_trigger(6_100.0, 4_000_000));
+        // 视频码率配得很高（8 Mbps）→ 阈值抬到 12 Mbps
+        assert!(!block_bitrate_trigger(8_000.0, 8_000_000));
+        assert!(block_bitrate_trigger(12_100.0, 8_000_000));
+        // 视频码率很低（1 Mbps）→ 阈值仍是 6 Mbps 底线
+        assert!(block_bitrate_trigger(6_500.0, 1_000_000));
+        assert!(!block_bitrate_trigger(5_000.0, 1_000_000));
+    }
+
+    #[test]
+    fn force_video_switches_mode_and_respects_unavailable() {
+        let mut sw = ModeSwitch::new(true);
+        sw.force_video();
+        assert_eq!(sw.mode(), Mode::Video);
+        // 不可用时不允许强制
+        let mut sw = ModeSwitch::new(false);
+        sw.force_video();
+        assert_eq!(sw.mode(), Mode::Blocks);
     }
 
     #[test]

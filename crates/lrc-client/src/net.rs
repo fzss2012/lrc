@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 use hmac::{Hmac, Mac};
 use lrc_codec as codec;
 use lrc_proto::{
-    auth_reason, codec_tag, ClientHello, Message, Pong, VideoAu, VideoFrame, PROTO_VERSION,
+    auth_reason, codec_tag, ClientHello, DisplayInfo, Message, Pong, VideoAu, VideoFrame,
+    PROTO_VERSION,
 };
+use crate::audio::AudioSink;
 use lrc_transport::{Conn, ConnReader, ConnWriter};
 use lrc_video::{DecoderConfig, FfmpegDecoder, VideoDecoder};
 use sha2::Sha256;
@@ -49,16 +51,19 @@ enum HandshakeError {
 pub fn spawn(cfg: &Config, shared: Arc<Shared>) -> io::Result<()> {
     let addr = cfg.connect.clone();
     let password = cfg.password.clone();
+    let audio_on = cfg.audio;
     std::thread::Builder::new()
         .name(String::from("lrc-client-net"))
-        .spawn(move || supervise(&addr, &password, &shared))?;
+        .spawn(move || supervise(&addr, &password, audio_on, &shared))?;
     Ok(())
 }
 
 /// 连接监管循环：断线不退出，指数退避重连；认证失败才终止（窗口保留）。
-fn supervise(addr: &str, password: &str, shared: &Arc<Shared>) {
+fn supervise(addr: &str, password: &str, audio_on: bool, shared: &Arc<Shared>) {
     let mut attempt: u32 = 0;
     let mut ever_connected = false;
+    // 音频线程跟进程同寿命（跨重连保留设备）；--audio off 时是 None
+    let mut audio = AudioSink::start(audio_on, shared.clone());
     loop {
         if shared.is_quit() {
             return;
@@ -98,7 +103,10 @@ fn supervise(addr: &str, password: &str, shared: &Arc<Shared>) {
                 // 首帧要整屏；被控端收到会回一整帧
                 send(&tx, Message::RequestFull.encode());
 
-                let end = session_loop(&mut reader, shared, &tx);
+                if let Some(sink) = audio.as_mut() {
+                    sink.reset();
+                }
+                let end = session_loop(&mut reader, shared, &tx, &mut audio);
                 shared.set_out_tx(None);
                 shared.set_connected(false);
                 shared.clear_session_state();
@@ -247,6 +255,7 @@ fn session_loop(
     reader: &mut ConnReader,
     shared: &Arc<Shared>,
     tx: &Sender<Vec<u8>>,
+    audio: &mut Option<AudioSink>,
 ) -> SessionEnd {
     let mut buf: Vec<u8> = Vec::with_capacity(128 * 1024);
     // 解码器跟着会话走：断线时随 VideoRx drop 掉，重连后重新建（不串台）
@@ -286,6 +295,31 @@ fn session_loop(
                 handle_frame(&frame, shared);
             }
             Ok(Message::VideoAu(au)) => video.handle_au(&au, shared, tx),
+            Ok(Message::AudioFrame(af)) => {
+                if let Some(sink) = audio.as_mut() {
+                    sink.push_frame(&af);
+                }
+            }
+            Ok(Message::DisplayList(list)) => {
+                let displays: Vec<DisplayInfo> = list.iter().copied().collect();
+                let summary: Vec<String> = displays
+                    .iter()
+                    .map(|d| {
+                        format!(
+                            "#{} {}x{}{}",
+                            d.index,
+                            d.width,
+                            d.height,
+                            if d.primary { "(primary)" } else { "" }
+                        )
+                    })
+                    .collect();
+                log::info!("可用显示输出 {} 个：{}", displays.len(), summary.join("，"));
+                shared.set_displays(displays);
+            }
+            Ok(Message::SelectDisplay(sel)) => {
+                log::debug!("忽略对端发来的 SelectDisplay #{}", sel.index);
+            }
             Ok(Message::Ping(ping)) => {
                 send(tx, Message::Pong(Pong { ts_ms: ping.ts_ms }).encode());
             }

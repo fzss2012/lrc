@@ -206,6 +206,9 @@ pub struct FrameDebug {
     pub first_frame_attempts: u32,
     /// 本帧是不是 GDI BitBlt 兜底出来的（DXGI 首帧没有桌面图像时）
     pub gdi_fallback: bool,
+    /// 本帧为了把像素交给调用方而做的那次全屏拷贝耗时（微秒）。
+    /// `grab()` = 8MB memcpy；`grab_view()` = 0（零拷贝借用）。
+    pub clone_us: u64,
     /// 各阶段耗时（微秒）：查元数据 / CopyResource / Map / 逐行拷贝 / Unmap
     pub meta_us: u64,
     pub copy_us: u64,
@@ -228,6 +231,26 @@ pub struct Frame {
     pub full: bool,
     /// 单调毫秒时间戳（采集完成时刻）
     pub ts_ms: u64,
+}
+
+/// 零拷贝帧视图：直接借用 [`Capturer`] 的内部底图，不复制 8 MB。
+///
+/// 生命周期绑定在 `Capturer` 上——下一次 `grab_view()` 之前必须用完，
+/// host 的"取一帧 → 编码 → 下一帧"循环天然满足。
+/// 需要拥有数据（跨线程/缓存）时继续用 [`Capturer::grab`]，那条路径会复制一份全屏。
+#[derive(Debug, Clone, Copy)]
+pub struct FrameView<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub stride: usize,
+    /// 只读的完整桌面 BGRA（stride = width*4）
+    pub bgra: &'a [u8],
+    pub dirty: &'a [Rect],
+    pub moves: &'a [MoveRect],
+    pub full: bool,
+    pub ts_ms: u64,
+    /// 本帧的 DXGI 诊断信息
+    pub debug: FrameDebug,
 }
 
 #[derive(Debug)]
@@ -340,6 +363,10 @@ pub fn list_outputs() -> CaptureResult<Vec<ScreenInfo>> {
 }
 
 /// 一块 CPU 可读的 staging 纹理，DXGI 回读的终点。
+///
+/// staging 永远是 `D3D11_USAGE_STAGING + CPU_ACCESS_READ`：GPU 不能直接读回桌面纹理，
+/// 必须 CopyResource 到 staging 才能 Map。尺寸不是精确值而是 [`bucket_size`] 分桶后的值
+/// （原因见那里），所以调用方要按 `region_w/region_h` 而不是脏区精确尺寸来算偏移。
 fn create_staging(
     device: &ID3D11Device,
     w: u32,
@@ -385,6 +412,11 @@ fn clamp_rect(l: i32, t: i32, r: i32, b: i32, sw: u32, sh: u32) -> Option<Rect> 
 }
 
 /// 回读 staging 的尺寸分桶：向上取到 2 的幂，减少重建次数。
+///
+/// 为什么用 2 的幂：脏区并集每帧都在变（一个光标 21x22、一次拖动 811x229），
+/// 如果按精确尺寸建 staging，几乎每帧都要销毁+重建 D3D11 纹理（一次约 100µs，还会让显存碎片化）；
+/// 分桶后同一个量级只建一次（实测 1080p 桌面下 8 个桶就够），Map 的成本也按桶大小平滑变化。
+/// 上限 16384 是为了防驱动给出离谱尺寸时把显存打爆。
 fn bucket_size(v: u32) -> u32 {
     v.max(1).next_power_of_two().min(16384)
 }
@@ -414,6 +446,14 @@ pub struct Capturer {
     region_tex: Option<ID3D11Texture2D>,
     region_w: u32,
     region_h: u32,
+    /// 最近一帧的变化矩形（grab_view 借用它，避免复制）
+    dirty: Vec<Rect>,
+    /// 最近一帧的 move rect
+    moves: Vec<MoveRect>,
+    /// 最近一帧是否整帧
+    last_full: bool,
+    /// 最近一帧的时间戳
+    last_ts: u64,
     /// 首帧全零被丢弃重取的累计次数（诊断用）
     blank_retries: u64,
     /// 重试期间 AcquireNextFrame 超时的累计次数
@@ -525,6 +565,10 @@ impl Capturer {
             region_tex: None,
             region_w: 0,
             region_h: 0,
+            dirty: Vec::new(),
+            moves: Vec::new(),
+            last_full: false,
+            last_ts: 0,
             no_rect_count: 0,
             blank_retries: 0,
             retry_timeouts: 0,
@@ -543,15 +587,15 @@ impl Capturer {
 
     /// 用 GDI BitBlt 把一帧填成当前桌面内容（DXGI 首帧没有桌面图像时的兜底）。
     /// 成功返回 true，并把这帧标成 full、清掉 dirty/moves。
-    fn try_gdi_fill(&mut self, frame: &mut Frame) -> bool {
+    fn try_gdi_fill_buf(&mut self) -> bool {
         let t0 = Instant::now();
-        match grab_gdi(self.info.origin_x, self.info.origin_y, frame.width, frame.height) {
-            Ok(buf) if buf.len() == frame.bgra.len() => {
-                frame.bgra.copy_from_slice(&buf);
-                frame.full = true;
-                frame.dirty.clear();
-                frame.moves.clear();
-                frame.ts_ms = now_ms();
+        match grab_gdi(self.info.origin_x, self.info.origin_y, self.tex_w, self.tex_h) {
+            Ok(buf) if buf.len() == self.full_buf.len() => {
+                self.full_buf.copy_from_slice(&buf);
+                self.dirty.clear();
+                self.moves.clear();
+                self.last_full = true;
+                self.last_ts = now_ms();
                 self.debug.sampled_blank = false;
                 self.debug.gdi_fallback = true;
                 log::info!(
@@ -605,14 +649,64 @@ impl Capturer {
     /// 最多重试 BLANK_RETRY_MAX 次 / BLANK_RETRY_BUDGET_MS 毫秒；仍不行就告警后照常返回，
     /// 绝不死等（静止桌面上可能迟迟等不到新帧）。
     pub fn grab(&mut self) -> CaptureResult<Option<Frame>> {
+        if !self.grab_core()? {
+            return Ok(None);
+        }
+        // 兼容路径：把内部底图复制一份交给调用方（8.1 MB @1080p）。
+        // 只要换成 grab_view() 就完全没有这一下。
+        let t_clone = Instant::now();
+        let bgra = self.full_buf.clone();
+        self.debug.clone_us = t_clone.elapsed().as_micros() as u64;
+        Ok(Some(Frame {
+            width: self.tex_w,
+            height: self.tex_h,
+            stride: self.stride(),
+            bgra,
+            dirty: self.dirty.clone(),
+            moves: self.moves.clone(),
+            full: self.last_full,
+            ts_ms: self.last_ts,
+        }))
+    }
+
+    /// **零拷贝**取帧：直接借用内部底图，不复制 8 MB。
+    ///
+    /// 返回的 FrameView 借用了 self，下一次 grab_view() 之前必须用完
+    /// （host 的"取一帧 → 编码 → 下一帧"循环天然满足）。需要拥有数据时仍可用 grab()。
+    pub fn grab_view(&mut self) -> CaptureResult<Option<FrameView<'_>>> {
+        if !self.grab_core()? {
+            return Ok(None);
+        }
+        self.debug.clone_us = 0;
+        Ok(Some(FrameView {
+            width: self.tex_w,
+            height: self.tex_h,
+            stride: self.stride(),
+            bgra: &self.full_buf,
+            dirty: &self.dirty,
+            moves: &self.moves,
+            full: self.last_full,
+            ts_ms: self.last_ts,
+            debug: self.debug,
+        }))
+    }
+
+    pub fn stride(&self) -> usize {
+        self.tex_w as usize * 4
+    }
+
+    /// 真正的采集循环：产出一律落在 self.full_buf + self.dirty/moves/last_* 里，
+    /// 由 grab()/grab_view() 决定怎么交给调用方（复制 or 借用）。
+    /// 返回 Ok(true) 表示产出了一帧。
+    fn grab_core(&mut self) -> CaptureResult<bool> {
         let budget_ms = std::env::var("LRC_BLANK_RETRY_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(BLANK_RETRY_BUDGET_MS);
-    let deadline = Instant::now() + std::time::Duration::from_millis(budget_ms);
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(BLANK_RETRY_BUDGET_MS);
+        let deadline = Instant::now() + std::time::Duration::from_millis(budget_ms);
         let mut attempts: u32 = 0;
-        // 重试期间要是等不到新帧，就把这张（全零的）帧交出去兜底
-        let mut blank_fallback: Option<Frame> = None;
+        // 重试期间要是等不到新帧，就把当前（全零的）底图交出去兜底
+        let mut blank_fallback = false;
 
         loop {
             attempts = attempts.saturating_add(1);
@@ -630,18 +724,17 @@ impl Capturer {
                         self.retry_timeouts = self.retry_timeouts.saturating_add(1);
                         continue;
                     }
-                    if let Some(mut f) = blank_fallback.take() {
-                        let ok = self.try_gdi_fill(&mut f);
-                        if !ok {
+                    if blank_fallback {
+                        if !self.try_gdi_fill_buf() {
                             log::warn!(
-                                "capture: 首帧连续 {} 次全零、等不到新帧且 GDI 兜底也失败，                                 照常返回（客户端可能短暂黑屏）",
+                                "capture: 首帧连续 {} 次全零、等不到新帧且 GDI 兜底也失败，照常返回",
                                 attempts.saturating_sub(1)
                             );
                         }
-                        return Ok(Some(f));
+                        return Ok(true);
                     }
                     // 「零变化零发送」的关键：超时不是错误。
-                    return Ok(None);
+                    return Ok(false);
                 }
                 if code == DXGI_ERROR_ACCESS_LOST {
                     return Err(CaptureError::Lost);
@@ -659,10 +752,10 @@ impl Capturer {
             }
 
             match built {
-                Ok(Some(mut frame)) => {
+                Ok(true) => {
                     // 只对整帧（首帧一定是）做全零抽样检查；局部帧因为只贴了脏区，
                     // 全量化检查没意义（未变化区域本来就该是旧内容）。
-                    let blank = frame.full && sample_is_blank(&frame.bgra);
+                    let blank = self.last_full && sample_is_blank(&self.full_buf);
                     self.debug.sampled_blank = blank;
                     self.debug.first_frame_attempts = if self.first_frame {
                         attempts
@@ -673,14 +766,14 @@ impl Capturer {
                         self.blank_retries = self.blank_retries.saturating_add(1);
                         if attempts < BLANK_RETRY_MAX && Instant::now() < deadline {
                             log::debug!("capture: 首帧全零（第 {} 次 acquire），丢弃重取", attempts);
-                            blank_fallback = Some(frame);
+                            blank_fallback = true;
                             // timeout=0 时重试循环会空转烧 CPU，让出 1ms
                             std::thread::sleep(std::time::Duration::from_millis(1));
                             continue;
                         }
                         // 重试预算用完：改用 GDI BitBlt 直接抓桌面（静止桌面也能拿到内容）
-                        if self.try_gdi_fill(&mut frame) {
-                            return Ok(Some(frame));
+                        if self.try_gdi_fill_buf() {
+                            return Ok(true);
                         }
                         log::warn!(
                             "capture: 连续 {} 次拿到全零桌面图像（累计 {} 次），GDI 兜底也失败，照常返回（客户端可能短暂黑屏）",
@@ -690,19 +783,21 @@ impl Capturer {
                     } else if attempts > 1 {
                         log::info!("capture: 首帧第 {} 次 acquire 才拿到有效图像", attempts);
                     }
-                    return Ok(Some(frame));
+                    return Ok(true);
                 }
-                Ok(None) => return Ok(None),
+                Ok(false) => return Ok(false),
                 Err(err) => return Err(err),
             }
         }
     }
 
+    /// 产出一帧到 self.full_buf（局部帧只贴脏区，不产生全屏拷贝）。
+    /// 返回 Ok(true) = 有帧，Ok(false) = 这帧没变化/不需要。
     fn build_frame(
         &mut self,
         info: &DXGI_OUTDUPL_FRAME_INFO,
         resource: Option<IDXGIResource>,
-    ) -> CaptureResult<Option<Frame>> {
+    ) -> CaptureResult<bool> {
         let is_first = self.first_frame;
         let sw = self.info.width;
         let sh = self.info.height;
@@ -722,7 +817,7 @@ impl Capturer {
         // 【零变化零发送的核心】DXGI 的 TotalMetadataBufferSize 覆盖 dirty/move/pointer 全部可见元数据，
         // 非首帧为 0 就说明「presented 但没有任何可见变化」→ 直接丢，连 CopyResource 都不做。
         if !is_first && info.TotalMetadataBufferSize == 0 && !dims_changed {
-            return Ok(None);
+            return Ok(false);
         }
 
         let t_meta = Instant::now();
@@ -740,7 +835,7 @@ impl Capturer {
         // AccumulatedFrames == 0 且没有矩形 ⇒ 这一帧只更新了鼠标/元数据，桌面像素没变。
         if !is_first && info.AccumulatedFrames == 0 && dirty.is_empty() && moves.is_empty() && !dims_changed
         {
-            return Ok(None);
+            return Ok(false);
         }
 
         // 「有元数据却解析不出任何矩形」是异常分支：保守走整帧，但要留痕（否则线上会永远发整屏）。
@@ -861,20 +956,14 @@ impl Capturer {
             self.read_region(&texture, &union, &regions, stride)?;
         }
 
-        // Frame 拥有自己的 BGRA：调用方随时可以扔，我们保留一份全量底图做局部增量。
-        let bgra = self.full_buf.clone();
-
+        // 注意：这里**不再拷贝**。像素留在 self.full_buf，元数据存到 self.dirty/moves/...，
+        // 由 grab()（复制一份交出去，兼容旧调用）或 grab_view()（零拷贝借用）决定怎么交付。
+        self.dirty = dirty;
+        self.moves = moves;
+        self.last_full = use_full;
+        self.last_ts = now_ms();
         self.first_frame = false;
-        Ok(Some(Frame {
-            width,
-            height,
-            stride,
-            bgra,
-            dirty,
-            moves,
-            full: use_full,
-            ts_ms: now_ms(),
-        }))
+        Ok(true)
     }
 
     /// 把 staging 映射区的一块（sx,sy,w,h）拷进常驻全量底图。

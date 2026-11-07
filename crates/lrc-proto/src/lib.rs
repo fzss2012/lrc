@@ -11,11 +11,11 @@ pub mod wire;
 pub use grid::{Grid, Rect};
 pub use input::InputEvent;
 pub use message::{
-    AudioFrame, AuthRequest, AuthResult, BlockEntry, ClientHello, CursorPos, CursorShape, FrameAck,
-    Message, Ping, Pong, ServerHello, VideoAu, VideoFrame, MSG_AUDIO_FRAME, MSG_AUTH_REQUEST,
-    MSG_AUTH_RESULT, MSG_CLIENT_HELLO, MSG_CURSOR_POS, MSG_CURSOR_SHAPE, MSG_INPUT_EVENT,
-    MSG_PING, MSG_PONG, MSG_REQUEST_FULL, MSG_SERVER_HELLO, MSG_VIDEO_ACK, MSG_VIDEO_AU,
-    MSG_VIDEO_FRAME,
+    AudioFrame, AuthRequest, AuthResult, BlockEntry, ClientHello, CursorPos, CursorShape,
+    DisplayInfo, FrameAck, Message, Ping, Pong, SelectDisplay, ServerHello, VideoAu, VideoFrame,
+    MSG_AUDIO_FRAME, MSG_AUTH_REQUEST, MSG_AUTH_RESULT, MSG_CLIENT_HELLO, MSG_CURSOR_POS,
+    MSG_CURSOR_SHAPE, MSG_DISPLAY_LIST, MSG_INPUT_EVENT, MSG_PING, MSG_PONG, MSG_REQUEST_FULL,
+    MSG_SELECT_DISPLAY, MSG_SERVER_HELLO, MSG_VIDEO_ACK, MSG_VIDEO_AU, MSG_VIDEO_FRAME,
 };
 pub use wire::{ProtoError, Reader, Writer};
 

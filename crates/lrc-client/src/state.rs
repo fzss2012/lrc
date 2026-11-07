@@ -8,7 +8,18 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use lrc_proto::DisplayInfo;
 use windows::Win32::System::SystemInformation::GetTickCount64;
+
+/// 音频通道状态（--stats 的 audio= 字段）。
+pub mod audio_state {
+    /// 未启用（--audio off，或还没收到音频包）
+    pub const OFF: u8 = 0;
+    /// 正在播放
+    pub const ON: u8 = 1;
+    /// 设备/解码不可用，通道已关闭（不重试、不影响视频）
+    pub const ERR: u8 = 2;
+}
 
 /// 连接状态：窗口线程据此改标题栏提示。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +156,16 @@ pub struct Shared {
     lat_samples: AtomicU64,
     /// 从视频模式切回块模式：要求窗口线程整屏重建 clean
     block_full_reset: AtomicBool,
+    /// 音频通道状态（audio_state::*）
+    audio: AtomicU8,
+    /// 已成功写进播放器的音频包数
+    pub audio_pkts: AtomicU64,
+    /// 丢掉的音频包数（队列满 / seq 跳变 / 解码失败）
+    pub audio_drop: AtomicU64,
+    /// 最近一次播放器水位（毫秒）
+    audio_ms: AtomicU32,
+    /// host 上报的显示输出列表（DisplayList）
+    displays: Mutex<Vec<DisplayInfo>>,
 }
 
 impl Shared {
@@ -176,6 +197,11 @@ impl Shared {
             lat_sum_ms: AtomicU64::new(0),
             lat_samples: AtomicU64::new(0),
             block_full_reset: AtomicBool::new(false),
+            audio: AtomicU8::new(audio_state::OFF),
+            audio_pkts: AtomicU64::new(0),
+            audio_drop: AtomicU64::new(0),
+            audio_ms: AtomicU32::new(0),
+            displays: Mutex::new(Vec::new()),
         }
     }
 
@@ -410,6 +436,43 @@ impl Shared {
         self.decode_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    // ---- 音频 ----
+
+    pub fn set_audio_state(&self, state: u8) {
+        self.audio.store(state, Ordering::Relaxed);
+    }
+
+    pub fn audio_state(&self) -> u8 {
+        self.audio.load(Ordering::Relaxed)
+    }
+
+    /// audio= 字段的文本形式
+    pub fn audio_state_name(&self) -> &'static str {
+        match self.audio_state() {
+            audio_state::ON => "on",
+            audio_state::ERR => "err",
+            _ => "off",
+        }
+    }
+
+    pub fn set_audio_buffered_ms(&self, ms: u32) {
+        self.audio_ms.store(ms, Ordering::Relaxed);
+    }
+
+    pub fn audio_buffered_ms(&self) -> u32 {
+        self.audio_ms.load(Ordering::Relaxed)
+    }
+
+    // ---- 显示输出列表 ----
+
+    pub fn set_displays(&self, list: Vec<DisplayInfo>) {
+        *lock_or_recover(&self.displays) = list;
+    }
+
+    pub fn displays(&self) -> Vec<DisplayInfo> {
+        lock_or_recover(&self.displays).clone()
+    }
+
     pub fn add_recv_bytes(&self, n: u64) {
         self.recv_bytes.fetch_add(n, Ordering::Relaxed);
     }
@@ -630,6 +693,51 @@ mod tests {
         shared.bump_reconnects();
         shared.bump_reconnects();
         assert_eq!(shared.reconnect_count(), 2);
+    }
+
+    #[test]
+    fn audio_state_and_counters() {
+        let shared = Shared::new();
+        assert_eq!(shared.audio_state_name(), "off");
+        shared.set_audio_state(audio_state::ON);
+        assert_eq!(shared.audio_state_name(), "on");
+        shared.set_audio_state(audio_state::ERR);
+        assert_eq!(shared.audio_state_name(), "err");
+        shared.set_audio_buffered_ms(42);
+        assert_eq!(shared.audio_buffered_ms(), 42);
+        shared.audio_pkts.fetch_add(3, Ordering::Relaxed);
+        shared.audio_drop.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(shared.audio_pkts.load(Ordering::Relaxed), 3);
+        assert_eq!(shared.audio_drop.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn display_list_roundtrip() {
+        let shared = Shared::new();
+        assert!(shared.displays().is_empty());
+        shared.set_displays(vec![
+            DisplayInfo {
+                index: 0,
+                width: 1920,
+                height: 1080,
+                origin_x: 0,
+                origin_y: 0,
+                primary: true,
+            },
+            DisplayInfo {
+                index: 1,
+                width: 1280,
+                height: 720,
+                origin_x: 1920,
+                origin_y: 0,
+                primary: false,
+            },
+        ]);
+        let list = shared.displays();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[1].index, 1);
+        assert_eq!((list[1].width, list[1].height), (1280, 720));
+        assert!(list[0].primary);
     }
 
     #[test]

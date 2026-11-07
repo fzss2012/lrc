@@ -6,7 +6,8 @@ pub const USAGE: &str = "\
   --connect <addr>   被控端地址，例如 127.0.0.1:7800（连不上会每秒重试，窗口保持打开）
   --password <pwd>   认证密码，作为 HMAC-SHA256 的 key
   --title <text>     窗口标题，默认 \"lrc viewer\"
-  --stats            每秒打印一行 fps= recv_kbps= decoded_blocks=
+  --audio on|off     音频通道，默认 on（设备不可用会自动降级为 off，不影响视频）
+  --stats            每秒打印一行 fps= recv_kbps= decoded_blocks= ...
   -h, --help         显示本帮助
 ";
 
@@ -17,6 +18,8 @@ pub struct Config {
     pub password: String,
     pub title: String,
     pub stats: bool,
+    /// 音频通道开关（--audio on|off，默认 on）
+    pub audio: bool,
     /// 窗口客户区默认宽度（物理像素）
     pub width: u32,
     /// 窗口客户区默认高度（物理像素）
@@ -30,6 +33,7 @@ impl Default for Config {
             password: String::new(),
             title: String::from("lrc viewer"),
             stats: false,
+            audio: true,
             width: 1280,
             height: 720,
         }
@@ -78,6 +82,14 @@ impl Config {
                         return Err(String::from("--stats 不接受取值"));
                     }
                     cfg.stats = true;
+                }
+                "--audio" => {
+                    let value = take_value(inline, &mut it, "--audio")?;
+                    cfg.audio = match value.to_ascii_lowercase().as_str() {
+                        "on" | "1" | "true" => true,
+                        "off" | "0" | "false" => false,
+                        other => return Err(format!("--audio 只接受 on|off（收到 {other}）")),
+                    };
                 }
                 other => return Err(format!("未知参数 {other}")),
             }

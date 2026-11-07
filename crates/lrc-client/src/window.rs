@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use lrc_proto::input::mouse_button;
-use lrc_proto::{FrameAck, InputEvent, Message, Ping, Rect};
+use lrc_proto::{FrameAck, InputEvent, Message, Ping, Rect, SelectDisplay};
 use lrc_render::Presenter;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -25,7 +25,9 @@ use windows::Win32::Graphics::Gdi::{
     TRANSPARENT, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_MENU,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
@@ -296,6 +298,8 @@ struct AppState {
     title_applied: String,
     /// 窗口内叠加的状态提示（重连中/认证失败）；None = 不显示
     status_text: Option<String>,
+    /// 被 Ctrl+Alt+数字 吃掉 keydown 的那个键（对应的 keyup 也要吃掉）
+    pending_switch_vk: Option<u32>,
     stats_enabled: bool,
     surface: Surface,
     /// 当前呈现面对应的被控端尺寸
@@ -345,6 +349,7 @@ impl AppState {
             base_title: cfg.title.clone(),
             title_applied: cfg.title.clone(),
             status_text: None,
+            pending_switch_vk: None,
             stats_enabled: cfg.stats,
             surface: Surface::None,
             surface_size: None,
@@ -1024,10 +1029,16 @@ impl AppState {
         let rtt_ms = self.shared.rtt_micros() as f64 / 1000.0;
         // 每秒一行，便于重定向到文件后逐行看。
         // lat_ms 只在视频模式下、且两端用同一时钟源（GetTickCount64）时才是真延迟。
+        let audio_pkts = self.shared.audio_pkts.load(Ordering::Relaxed);
+        let audio_drop = self.shared.audio_drop.load(Ordering::Relaxed);
         println!(
             "fps={fps:.0} recv_kbps={kbps:.1} decoded_blocks={blocks} rtt_ms={rtt_ms:.3} \
-mode={mode} video_fps={video_fps:.1} lat_ms={lat_ms:.1} reconnects={}",
-            self.shared.reconnect_count()
+mode={mode} video_fps={video_fps:.1} lat_ms={lat_ms:.1} reconnects={} audio={} \
+audio_ms={} audio_pkts={audio_pkts} audio_drop={audio_drop} displays={}",
+            self.shared.reconnect_count(),
+            self.shared.audio_state_name(),
+            self.shared.audio_buffered_ms(),
+            self.shared.displays().len()
         );
         let _ = std::io::stdout().flush();
     }
@@ -1123,6 +1134,39 @@ mode={mode} video_fps={video_fps:.1} lat_ms={lat_ms:.1} reconnects={}",
     fn on_key(&mut self, lparam: LPARAM, down: bool) {
         let event = mapping::key_from_lparam(lparam.0, down);
         self.send_input(event);
+    }
+
+    /// Ctrl+Alt+1..9：切换被控端显示输出。
+    ///
+    /// 返回 true 表示这个按键被快捷键吃掉了（**不转发给被控端**）。
+    /// 按下时发 SelectDisplay，抬起时按记录把 keyup 也吃掉，避免被控端收到"无主的 keyup"。
+    fn intercept_display_switch(&mut self, wparam: WPARAM, lparam: LPARAM, down: bool) -> bool {
+        let vk = wparam.0 as u32;
+        if down {
+            if !(u32::from(b'1')..=u32::from(b'9')).contains(&vk) {
+                return false;
+            }
+            let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+            let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
+            if !(ctrl && alt) {
+                return false;
+            }
+            // 长按的重复消息只吃掉、不重复发
+            let repeat = (lparam.0 >> 30) & 1 != 0;
+            if !repeat {
+                let index = (vk - u32::from(b'1')) as u8;
+                log::info!("快捷键 Ctrl+Alt+{} → 请求切换显示输出 #{index}", index + 1);
+                self.shared
+                    .send(Message::SelectDisplay(SelectDisplay { index }).encode());
+            }
+            self.pending_switch_vk = Some(vk);
+            true
+        } else if self.pending_switch_vk == Some(vk) {
+            self.pending_switch_vk = None;
+            true
+        } else {
+            false
+        }
     }
 
 
@@ -1417,8 +1461,17 @@ unsafe extern "system" fn wndproc(
             }
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
-        WM_KEYDOWN | WM_SYSKEYDOWN => app.on_key(lparam, true),
-        WM_KEYUP | WM_SYSKEYUP => app.on_key(lparam, false),
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            // Ctrl+Alt+1..9 是切换显示的快捷键，先拦截，别把组合键转发给被控端
+            if !app.intercept_display_switch(wparam, lparam, true) {
+                app.on_key(lparam, true);
+            }
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            if !app.intercept_display_switch(wparam, lparam, false) {
+                app.on_key(lparam, false);
+            }
+        }
         WM_MOUSEMOVE => app.on_mouse_move(lparam),
         WM_LBUTTONDOWN => app.on_mouse_button(mouse_button::LEFT, true, lparam),
         WM_LBUTTONUP => app.on_mouse_button(mouse_button::LEFT, false, lparam),

@@ -21,6 +21,7 @@ struct Args {
     out: String,
     save: bool,
     dump: u64,
+    view: bool,
 }
 
 impl Default for Args {
@@ -32,6 +33,7 @@ impl Default for Args {
             out: DEFAULT_OUT.to_string(),
             save: true,
             dump: 0,
+            view: false,
         }
     }
 }
@@ -66,6 +68,7 @@ fn parse_args() -> Result<Args, String> {
                 a.out = it.next().ok_or("--out 需要参数")?;
             }
             "--no-save" => a.save = false,
+            "--view" => a.view = true,
             "--dump" => {
                 a.dump = it
                     .next()
@@ -246,6 +249,86 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         info.width, info.height, info.origin_x, info.origin_y, info.rotation
     );
 
+    // --view：零拷贝路径（grab_view），只测耗时，用来和默认的 grab() 对比
+    if args.view {
+        let deadline = Instant::now() + Duration::from_secs_f64(args.seconds);
+        let mut grabs = 0u64;
+        let mut frames = 0u64;
+        let mut frame_us: Vec<u64> = Vec::new();
+        let mut clone_us: Vec<u64> = Vec::new();
+        let mut phase = [0u64; 5];
+        let mut readback_px = 0u64;
+        let mut full_n = 0u64;
+        let t_start = Instant::now();
+        while Instant::now() < deadline {
+            grabs += 1;
+            let t0 = Instant::now();
+            match cap.grab_view() {
+                Ok(Some(v)) => {
+                    let dt = t0.elapsed().as_micros() as u64;
+                    frames += 1;
+                    frame_us.push(dt);
+                    readback_px += v.debug.readback_px;
+                    phase[0] += v.debug.meta_us;
+                    phase[1] += v.debug.copy_us;
+                    phase[2] += v.debug.map_us;
+                    phase[3] += v.debug.blit_us;
+                    phase[4] += v.debug.unmap_us;
+                    if v.full {
+                        full_n += 1;
+                    }
+                    // 用一下像素，防止整段被优化掉
+                    std::hint::black_box(v.bgra.get(0).copied());
+                    // 对照：如果调用方需要"拥有"这份像素（旧的 grab() 语义），就得付这一下
+                    let tc = Instant::now();
+                    let owned = v.bgra.to_vec();
+                    clone_us.push(tc.elapsed().as_micros() as u64);
+                    std::hint::black_box(owned.len());
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("[capture-probe] grab_view 失败: {e}");
+                    return Err(e.into());
+                }
+            }
+        }
+        let wall = t_start.elapsed().as_secs_f64();
+        frame_us.sort_unstable();
+        let n = frame_us.len().max(1);
+        let avg = frame_us.iter().sum::<u64>() as f64 / n as f64;
+        let p50 = frame_us[n / 2] as f64;
+        let p95_idx = ((n as f64 * 0.95) as usize).min(n - 1);
+        let p95 = frame_us[p95_idx] as f64;
+        println!();
+        println!("==== grab_view（零拷贝）汇总 ({wall:.2}s) ====");
+        println!("grab 调用          : {grabs}");
+        println!(
+            "产出帧             : {frames}  ({:.1} 帧/秒)  整帧 {full_n}",
+            frames as f64 / wall.max(1e-9)
+        );
+        println!("单帧总耗时         : avg {avg:.0}us  p50 {p50:.0}us  p95 {p95:.0}us");
+        clone_us.sort_unstable();
+        let clone_avg = clone_us.iter().sum::<u64>() as f64 / clone_us.len().max(1) as f64;
+        let clone_p50 = clone_us.get(clone_us.len() / 2).copied().unwrap_or(0) as f64;
+        println!("拷贝开销/帧        : **0us**（像素直接借用内部底图）");
+        println!(
+            "  └ 对照：若要拥有数据，每帧还要 {clone_avg:.0}us (p50 {clone_p50:.0}us) 的 8.1MB 拷贝"
+        );
+        println!(
+            "阶段耗时/帧        : meta {:.0}us  copy {:.0}us  map {:.0}us  blit {:.0}us  unmap {:.0}us",
+            phase[0] as f64 / n as f64,
+            phase[1] as f64 / n as f64,
+            phase[2] as f64 / n as f64,
+            phase[3] as f64 / n as f64,
+            phase[4] as f64 / n as f64
+        );
+        println!(
+            "平均回读           : {:.1} 万像素/帧",
+            readback_px as f64 / n as f64 / 10000.0
+        );
+        return Ok(());
+    }
+
     let deadline = Instant::now() + Duration::from_secs_f64(args.seconds);
     let mut grabs: u64 = 0;
     let mut frames: u64 = 0;
@@ -265,6 +348,8 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut dirty_area_total: u64 = 0;
     let mut move_total: u64 = 0;
     let mut phase = [0u64; 5]; // meta / copy / map / blit / unmap
+    let mut clone_sum_us: u64 = 0;
+    let mut frame_us_all: Vec<u64> = Vec::new();
     let mut readback_full_n: u64 = 0;
     let mut readback_px_sum: u64 = 0;
     let mut blank_full_frames: u64 = 0;
@@ -285,6 +370,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 none_run = 0;
                 grab_sum_us += elapsed;
                 grab_max_us = grab_max_us.max(elapsed);
+                frame_us_all.push(elapsed);
                 if first_grab_us == 0 {
                     first_grab_us = elapsed;
                     let d = cap.last_debug();
@@ -308,6 +394,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     readback_full_n += 1;
                 }
                 readback_px_sum += dbg.readback_px;
+                clone_sum_us += dbg.clone_us;
                 phase[0] += dbg.meta_us;
                 phase[1] += dbg.copy_us;
                 phase[2] += dbg.map_us;
@@ -443,6 +530,16 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 0.0
             }
+        );
+        frame_us_all.sort_unstable();
+        let p50 = frame_us_all[frame_us_all.len() / 2] as f64;
+        println!(
+            "单帧总耗时         : avg {:.0}us  p50 {p50:.0}us  max {grab_max_us}us",
+            grab_sum_us as f64 / n
+        );
+        println!(
+            "拷贝开销/帧        : {:.0}us  (交给调用方的全屏拷贝；8.1MB @1080p)",
+            clone_sum_us as f64 / n
         );
         println!(
             "阶段耗时/帧        : meta {:.0}us  copy {:.0}us  map {:.0}us  blit {:.0}us  unmap {:.0}us",

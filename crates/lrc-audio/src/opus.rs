@@ -23,6 +23,12 @@ impl OpusEncoder {
             "-hide_banner".into(),
             "-loglevel".into(),
             "error".into(),
+            // 关键：关掉输入探测缓冲。默认 probesize=5MB / analyzeduration=5s 会让
+            // ffmpeg 攒够 4~5 秒输入才开始编码（实测首次输出延迟 4.3 秒）。
+            "-probesize".into(),
+            "32".into(),
+            "-analyzeduration".into(),
+            "0".into(),
             "-f".into(),
             "s16le".into(),
             "-ar".into(),
@@ -35,6 +41,10 @@ impl OpusEncoder {
             "libopus".into(),
             "-b:a".into(),
             format!("{}k", (bitrate_bps + 500) / 1000),
+            // 固定码率：ffmpeg 默认 VBR，实测纯音上会超目标 2 倍；CBR 才能保证
+            // 「实际码率 ≈ 目标码率」，对带宽敏感的远控更合适。
+            "-vbr".into(),
+            "off".into(),
             "-frame_duration".into(),
             "20".into(),
             "-application".into(),
@@ -110,6 +120,11 @@ impl OpusDecoder {
             "-hide_banner".into(),
             "-loglevel".into(),
             "error".into(),
+            // 同样关掉探测缓冲，否则解码端也会攒一大段才吐 PCM
+            "-probesize".into(),
+            "32".into(),
+            "-analyzeduration".into(),
+            "0".into(),
             // 这个 ffmpeg 没有 opus 解封装器，Ogg 容器必须用 -f ogg
             "-f".into(),
             "ogg".into(),

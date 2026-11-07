@@ -5,6 +5,7 @@
 //! lrc-client --connect 127.0.0.1:7800 --password 1234 [--title "lrc viewer"] [--stats]
 //! ```
 
+mod audio;
 mod cli;
 mod mapping;
 mod net;
