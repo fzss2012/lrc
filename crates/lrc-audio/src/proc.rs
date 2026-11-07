@@ -54,7 +54,7 @@ impl FfmpegChild {
             .stdout
             .take()
             .ok_or_else(|| AudioError::Io("拿不到 ffmpeg stdout".to_string()))?;
-        let handle = HANDLE(stdout.as_raw_handle() as isize);
+        let handle = HANDLE(stdout.as_raw_handle() as *mut core::ffi::c_void);
         Ok(Self {
             child,
             stdin,

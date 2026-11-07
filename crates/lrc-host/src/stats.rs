@@ -31,6 +31,12 @@ pub struct VideoLine {
     pub mode: &'static str,
     pub fps: f64,
     pub kbps: f64,
+    /// 自适应控制器档位（0 = 原生；未启用 --budget-bps 时恒为 0）
+    pub level: u8,
+    /// 当前降级阶段标签
+    pub stage: &'static str,
+    /// 编码前分辨率缩放（1.0 = 原生）
+    pub scale: f32,
 }
 
 impl Default for VideoLine {
@@ -39,6 +45,9 @@ impl Default for VideoLine {
             mode: "blocks",
             fps: 0.0,
             kbps: 0.0,
+            level: 0,
+            stage: "原生",
+            scale: 1.0,
         }
     }
 }
@@ -104,7 +113,7 @@ fn line(
     video: &VideoLine,
 ) -> String {
     format!(
-        "t={t:.1} fps={fps:.1} blocks={blocks} sent_frames={} bytes={} kbps={kbps:.1} idle_frames={idle_frames} dropped={} sec_bytes={sec_bytes} cursor_msgs={} full_resends={} mode={} video_kbps={:.1} video_fps={:.1}",
+        "t={t:.1} fps={fps:.1} blocks={blocks} sent_frames={} bytes={} kbps={kbps:.1} idle_frames={idle_frames} dropped={} sec_bytes={sec_bytes} cursor_msgs={} full_resends={} mode={} video_kbps={:.1} video_fps={:.1} level={} stage={} scale={:.2}",
         total.frames,
         total.bytes,
         total.dropped,
@@ -112,7 +121,10 @@ fn line(
         total.full_resends,
         video.mode,
         video.kbps,
-        video.fps
+        video.fps,
+        video.level,
+        video.stage,
+        video.scale
     )
 }
 
@@ -140,7 +152,7 @@ mod tests {
         let sec = sec_sample();
         assert_eq!(
             format_line(&total, &sec, 1.0, 1.0, &VideoLine::default()),
-            "t=1.0 fps=30.0 blocks=120 sent_frames=30 bytes=100000 kbps=800.0 idle_frames=5 dropped=2 sec_bytes=100000 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0"
+            "t=1.0 fps=30.0 blocks=120 sent_frames=30 bytes=100000 kbps=800.0 idle_frames=5 dropped=2 sec_bytes=100000 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00"
         );
     }
 
@@ -158,7 +170,7 @@ mod tests {
         let line = format_line(&total, &sec, 12.0, 1.0, &VideoLine::default());
         assert_eq!(
             line,
-            "t=12.0 fps=0.0 blocks=0 sent_frames=220 bytes=1234567 kbps=0.0 idle_frames=490 dropped=0 sec_bytes=0 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0"
+            "t=12.0 fps=0.0 blocks=0 sent_frames=220 bytes=1234567 kbps=0.0 idle_frames=490 dropped=0 sec_bytes=0 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00"
         );
         // 验收脚本按 kbps= 抓数
         assert!(line.contains("kbps=0.0"));
@@ -175,7 +187,7 @@ mod tests {
         let line = format_line(&total, &total, 2.0, 2.0, &VideoLine::default());
         assert_eq!(
             line,
-            "t=2.0 fps=15.0 blocks=0 sent_frames=30 bytes=1000 kbps=4.0 idle_frames=0 dropped=0 sec_bytes=1000 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0"
+            "t=2.0 fps=15.0 blocks=0 sent_frames=30 bytes=1000 kbps=4.0 idle_frames=0 dropped=0 sec_bytes=1000 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00"
         );
     }
 
@@ -194,7 +206,7 @@ mod tests {
         let line = format_summary(&total, 10.0, &VideoLine::default());
         assert_eq!(
             line,
-            "t=10.0 fps=10.0 blocks=500 sent_frames=100 bytes=10000 kbps=8.0 idle_frames=50 dropped=1 sec_bytes=10000 cursor_msgs=3 full_resends=1 mode=blocks video_kbps=0.0 video_fps=0.0"
+            "t=10.0 fps=10.0 blocks=500 sent_frames=100 bytes=10000 kbps=8.0 idle_frames=50 dropped=1 sec_bytes=10000 cursor_msgs=3 full_resends=1 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00"
         );
     }
 

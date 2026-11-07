@@ -27,14 +27,6 @@ pub(crate) fn page_len(buf: &[u8]) -> Option<usize> {
     }
 }
 
-/// 是不是音频数据页（BOS 位是 OpusHead 页，第二页是 OpusTags）。
-pub(crate) fn is_data_page(page: &[u8]) -> bool {
-    if page.len() <= PAGE_HEADER {
-        return false;
-    }
-    page[5] & 0x02 == 0 // header_type bit1 = BOS
-}
-
 /// 如果流里混进了垃圾字节，找到下一个 OggS 的位置（用于重同步）。
 pub(crate) fn find_next_page(buf: &[u8]) -> Option<usize> {
     if buf.len() < 4 {

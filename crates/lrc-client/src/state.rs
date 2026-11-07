@@ -3,17 +3,29 @@
 //! 窗口线程（主线程）是唯一碰 D3D/GDI 的地方；接收线程只解码并把"脏块"塞进队列，
 //! 由 8ms 定时器在主线程 drain。
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::System::SystemInformation::GetTickCount64;
 
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+/// 连接状态：窗口线程据此改标题栏提示。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConnStatus {
+    /// 没连上（首次连接中或断线重连中）；`attempt` 从 1 开始
+    Reconnecting { attempt: u32 },
+    Connected,
+    /// 终止状态（认证失败/版本不符）：不再重连，窗口保留并显示提示
+    Terminal { message: String },
+}
 
-/// 自绘错误框（握手失败/连接断开）的自定义窗口消息。
-pub const WM_APP_FAILURE: u32 = WM_APP + 1;
+/// 重连退避：第 1/2/3/4 次分别等 1s/2s/4s/8s，之后封顶 10s。
+pub fn backoff_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(4);
+    let secs = 1u64 << shift; // 1, 2, 4, 8, 16
+    Duration::from_secs(secs.min(10))
+}
 
 /// 待呈现队列上限：一帧 1080p 全屏也就 510 块，8192 已经是"主线程卡了很久"。
 /// 超过就丢弃并请求整帧，避免无界内存增长。
@@ -105,10 +117,12 @@ pub struct Shared {
     first_full_frame: AtomicBool,
     connected: AtomicBool,
     quit: AtomicBool,
-    /// 需要弹框并退出的错误（握手失败、连接断开）
-    failure: Mutex<Option<String>>,
-    /// 窗口句柄（isize 形式，避免把非 Send 的 HWND 存进来）
-    hwnd: AtomicIsize,
+    /// 当前连接状态（窗口线程据此改标题）
+    status: Mutex<ConnStatus>,
+    /// 成功重连次数（第一次连接不算）
+    pub reconnects: AtomicU32,
+    /// 当前会话的发送端；断线期间为 None
+    out_tx: Mutex<Option<Sender<Vec<u8>>>>,
     /// 光标状态 + 版本号（版本变了主线程才重绘光标）
     cursor: Mutex<CursorSnapshot>,
     cursor_version: AtomicU64,
@@ -147,8 +161,9 @@ impl Shared {
             first_full_frame: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             quit: AtomicBool::new(false),
-            failure: Mutex::new(None),
-            hwnd: AtomicIsize::new(0),
+            status: Mutex::new(ConnStatus::Reconnecting { attempt: 0 }),
+            reconnects: AtomicU32::new(0),
+            out_tx: Mutex::new(None),
             cursor: Mutex::new(CursorSnapshot::default()),
             cursor_version: AtomicU64::new(0),
             ping_pending: Mutex::new(None),
@@ -164,19 +179,47 @@ impl Shared {
         }
     }
 
-    /// 窗口创建后由主线程写入，接收线程用它 PostMessage。
-    pub fn set_hwnd(&self, hwnd: isize) {
-        self.hwnd.store(hwnd, Ordering::SeqCst);
+    // ---- 连接状态 / 发送端 ----
+
+    pub fn set_status(&self, status: ConnStatus) {
+        *lock_or_recover(&self.status) = status;
     }
 
-    /// 从任意线程往窗口线程投递自定义消息。
-    pub fn post(&self, msg: u32) {
-        let raw = self.hwnd.load(Ordering::SeqCst);
-        if raw == 0 {
-            return;
+    pub fn status(&self) -> ConnStatus {
+        lock_or_recover(&self.status).clone()
+    }
+
+    pub fn bump_reconnects(&self) {
+        self.reconnects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn reconnect_count(&self) -> u32 {
+        self.reconnects.load(Ordering::Relaxed)
+    }
+
+    /// 会话建立时窗口线程从这里拿发送端；断开时置 None。
+    pub fn set_out_tx(&self, tx: Option<Sender<Vec<u8>>>) {
+        *lock_or_recover(&self.out_tx) = tx;
+    }
+
+    /// 往当前会话发一条已编码消息；没连接就丢掉（断线期间的输入/ack 不需要排队）。
+    pub fn send(&self, payload: Vec<u8>) -> bool {
+        let tx = lock_or_recover(&self.out_tx).clone();
+        match tx {
+            Some(tx) => tx.send(payload).is_ok(),
+            None => false,
         }
-        let hwnd = HWND(raw as *mut core::ffi::c_void);
-        let _ = unsafe { PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(0)) };
+    }
+
+    /// 会话结束/重连：清掉旧会话的脏块与视频帧，避免旧状态串台。
+    pub fn clear_session_state(&self) {
+        lock_or_recover(&self.pending).clear();
+        *lock_or_recover(&self.video_frame) = None;
+        self.want_full.store(false, Ordering::Relaxed);
+        self.mode.store(0, Ordering::Relaxed);
+        self.first_full_frame.store(false, Ordering::SeqCst);
+        // 旧会话的"整屏重建"标记不该带到新会话（新会话会重新发 RequestFull）
+        self.block_full_reset.store(false, Ordering::Relaxed);
     }
 
     /// 记录被控端尺寸；返回是否变化。
@@ -388,21 +431,7 @@ impl Shared {
         self.quit.load(Ordering::SeqCst)
     }
 
-    /// 记录致命错误并唤醒窗口线程弹框。
-    pub fn fail(&self, message: String) {
-        {
-            let mut slot = lock_or_recover(&self.failure);
-            if slot.is_none() {
-                *slot = Some(message);
-            }
-        }
-        self.post(WM_APP_FAILURE);
-    }
 
-    /// 窗口线程取走待弹框的错误。
-    pub fn take_failure(&self) -> Option<String> {
-        lock_or_recover(&self.failure).take()
-    }
 }
 
 impl Default for Shared {
@@ -566,11 +595,71 @@ mod tests {
     }
 
     #[test]
-    fn failure_is_sticky_until_taken() {
+    fn backoff_sequence_1_2_4_8_then_cap_10() {
+        let secs: Vec<u64> = (1..=8).map(|a| backoff_delay(a).as_secs()).collect();
+        assert_eq!(secs, vec![1, 2, 4, 8, 10, 10, 10, 10]);
+        // 0 也按第 1 次处理，别退化成 0 秒空转
+        assert_eq!(backoff_delay(0).as_secs(), 1);
+    }
+
+    #[test]
+    fn status_and_send_slot() {
         let shared = Shared::new();
-        shared.fail(String::from("认证失败"));
-        shared.fail(String::from("连接断开"));
-        assert_eq!(shared.take_failure().as_deref(), Some("认证失败"));
-        assert!(shared.take_failure().is_none());
+        assert!(!shared.send(vec![1, 2, 3]), "没连接时发送应被丢弃");
+        assert_eq!(
+            shared.status(),
+            ConnStatus::Reconnecting { attempt: 0 }
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        shared.set_out_tx(Some(tx));
+        assert!(shared.send(vec![7]));
+        assert_eq!(rx.recv().expect("payload"), vec![7]);
+
+        shared.set_status(ConnStatus::Connected);
+        assert_eq!(shared.status(), ConnStatus::Connected);
+        shared.set_status(ConnStatus::Reconnecting { attempt: 3 });
+        assert_eq!(shared.status(), ConnStatus::Reconnecting { attempt: 3 });
+        shared.set_status(ConnStatus::Terminal {
+            message: String::from("认证失败：密码错误"),
+        });
+        assert!(matches!(shared.status(), ConnStatus::Terminal { .. }));
+
+        shared.set_out_tx(None);
+        assert!(!shared.send(vec![9]));
+        shared.bump_reconnects();
+        shared.bump_reconnects();
+        assert_eq!(shared.reconnect_count(), 2);
+    }
+
+    #[test]
+    fn clear_session_state_drops_queued_frames() {
+        let shared = Shared::new();
+        shared.push_blocks(vec![BlockUpdate {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+            data: vec![1u8; 4],
+        }]);
+        shared.put_video_frame(VideoFrameUpdate {
+            width: 4,
+            height: 2,
+            stride: 16,
+            bgra: vec![0u8; 32],
+            ts_ms: 1,
+            seq: 1,
+        });
+        shared.set_mode_video();
+        shared.mark_block_full_reset();
+        shared.request_full();
+
+        shared.clear_session_state();
+
+        assert!(shared.take_blocks().is_empty());
+        assert!(shared.take_video_frame().is_none());
+        assert!(!shared.is_video_mode());
+        assert!(!shared.take_block_full_reset());
+        assert!(!shared.take_want_full());
     }
 }

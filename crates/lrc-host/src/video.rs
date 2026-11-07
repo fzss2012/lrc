@@ -147,6 +147,8 @@ struct Pipe {
     broken: AtomicBool,
     /// 写 socket 失败 → 会话该结束了
     send_failed: AtomicBool,
+    /// 自适应控制器要求的新码率（0 = 无请求）；由编码线程在主循环里应用
+    bitrate_req: AtomicU32,
     aus: AtomicU64,
     bytes: AtomicU64,
     dropped: AtomicU64,
@@ -171,6 +173,12 @@ pub struct VideoPipeline {
 impl VideoPipeline {
     pub fn codec_name(&self) -> &str {
         &self.codec_name
+    }
+
+    /// 请求改视频码率（编码线程在下一帧前用 set_bitrate 应用；会重启编码进程 ~100-300ms，
+    /// 新进程第一帧必为 IDR，客户端能立刻接上）。
+    pub fn request_bitrate(&self, bps: u32) {
+        self.pipe.bitrate_req.store(bps.max(1), Ordering::Relaxed);
     }
 
     /// 请求下一个编码帧为 IDR。
@@ -299,6 +307,7 @@ pub fn start(args: &Args, width: u32, height: u32, shared: Arc<Shared>) -> Optio
         keyframe_req: AtomicBool::new(false),
         broken: AtomicBool::new(false),
         send_failed: AtomicBool::new(false),
+        bitrate_req: AtomicU32::new(0),
         aus: AtomicU64::new(0),
         bytes: AtomicU64::new(0),
         dropped: AtomicU64::new(0),
@@ -351,6 +360,17 @@ fn encode_loop(mut encoder: FfmpegEncoder, pipe: Arc<Pipe>, shared: Arc<Shared>,
             continue;
         }
 
+        let want_bitrate = pipe.bitrate_req.swap(0, Ordering::Relaxed);
+        if want_bitrate != 0 {
+            match encoder.set_bitrate(want_bitrate) {
+                Ok(()) => log::info!(
+                    "视频：码率切到 {}kbps（重启 {}us，新进程首帧为 IDR）",
+                    want_bitrate / 1000,
+                    encoder.restart_cost_us()
+                ),
+                Err(e) => log::warn!("视频：切换码率失败：{e}"),
+            }
+        }
         if pipe.keyframe_req.swap(false, Ordering::Relaxed) {
             if let Err(e) = encoder.request_keyframe() {
                 log::warn!("视频：请求 IDR 失败：{e}");
@@ -395,6 +415,7 @@ fn encode_loop(mut encoder: FfmpegEncoder, pipe: Arc<Pipe>, shared: Arc<Shared>,
                 encoder.shutdown();
                 return;
             }
+            shared.note_send(job.seq);
             pipe.aus.fetch_add(1, Ordering::Relaxed);
             pipe.bytes
                 .fetch_add(payload.len() as u64 + 4, Ordering::Relaxed);

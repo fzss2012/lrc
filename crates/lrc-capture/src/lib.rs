@@ -33,9 +33,95 @@ pub use lrc_proto::Rect;
 
 /// dirty 面积超过屏幕的这个百分比就当成整帧。
 const FULL_DIRTY_RATIO_PCT: u64 = 60;
-/// 首帧全零时的重试预算（时间 / 次数，先到者为准）
-const BLANK_RETRY_BUDGET_MS: u64 = 500;
-const BLANK_RETRY_MAX: u32 = 20;
+/// 首帧全零时的重试预算（时间 / 次数，先到者为准）。超时就改用 GDI BitBlt 兜底，
+/// 兜底也失败才把（仍然是黑的）帧交出去。
+const BLANK_RETRY_BUDGET_MS: u64 = 150;
+const BLANK_RETRY_MAX: u32 = 40;
+
+/// GDI 兜底：直接从屏幕 DC BitBlt 出一张 BGRA（DXGI 首帧没有桌面图像时用）。
+///
+/// 实测：`AcquiredFrame.AccumulatedFrames == 0` 的那一帧里**没有桌面图像**，
+/// CopyResource 出来就是全黑；而静止桌面可能长时间不产生新帧，光靠重试解决不了。
+fn grab_gdi(origin_x: i32, origin_y: i32, width: u32, height: u32) -> CaptureResult<Vec<u8>> {
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
+        GetDIBits, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
+        DIB_RGB_COLORS, HGDIOBJ, SRCCOPY,
+    };
+    if width == 0 || height == 0 {
+        return Err(CaptureError::Runtime("GDI 兜底：尺寸为 0".into()));
+    }
+    let w = width.min(i32::MAX as u32) as i32;
+    let h = height.min(i32::MAX as u32) as i32;
+    unsafe {
+        let screen = GetDC(None);
+        if screen.0.is_null() {
+            return Err(CaptureError::Runtime("GDI 兜底：GetDC 失败".into()));
+        }
+        let mem = CreateCompatibleDC(Some(screen));
+        if mem.0.is_null() {
+            let _ = ReleaseDC(None, screen);
+            return Err(CaptureError::Runtime("GDI 兜底：CreateCompatibleDC 失败".into()));
+        }
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        if bmp.0.is_null() {
+            let _ = DeleteDC(mem);
+            let _ = ReleaseDC(None, screen);
+            return Err(CaptureError::Runtime("GDI 兜底：CreateCompatibleBitmap 失败".into()));
+        }
+        let old = SelectObject(mem, HGDIOBJ(bmp.0));
+        // CAPTUREBLT：把分层窗口（DWM 合成的窗口）也一起拷进来
+        let blt = BitBlt(
+            mem,
+            0,
+            0,
+            w,
+            h,
+            Some(screen),
+            origin_x,
+            origin_y,
+            SRCCOPY | CAPTUREBLT,
+        );
+
+        let mut buf = vec![0u8; width as usize * height as usize * 4];
+        let mut bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // 负高度 = 自上而下
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..BITMAPINFOHEADER::default()
+            },
+            ..BITMAPINFO::default()
+        };
+        let lines = GetDIBits(
+            mem,
+            bmp,
+            0,
+            height,
+            Some(buf.as_mut_ptr() as *mut std::ffi::c_void),
+            &mut bi,
+            DIB_RGB_COLORS,
+        );
+
+        let _ = SelectObject(mem, old);
+        let _ = DeleteObject(HGDIOBJ(bmp.0));
+        let _ = DeleteDC(mem);
+        let _ = ReleaseDC(None, screen);
+
+        blt.map_err(|e| CaptureError::Runtime(format!("GDI 兜底 BitBlt 失败: {}", hr_text(&e))))?;
+        if lines == 0 {
+            return Err(CaptureError::Runtime("GDI 兜底 GetDIBits 返回 0 行".into()));
+        }
+        // GDI 不写 alpha 通道，补成不透明（否则客户端可能当全透明）
+        for px in buf.chunks_exact_mut(4) {
+            px[3] = 255;
+        }
+        Ok(buf)
+    }
+}
 
 /// 抽样判断一帧是否全零：每 4KB 取 1 字节，再额外看首尾各 4 字节，覆盖全图。
 ///
@@ -118,6 +204,8 @@ pub struct FrameDebug {
     pub sampled_blank: bool,
     /// 拿到本帧（首帧）时一共 acquire 了几次；1 = 一次就成功
     pub first_frame_attempts: u32,
+    /// 本帧是不是 GDI BitBlt 兜底出来的（DXGI 首帧没有桌面图像时）
+    pub gdi_fallback: bool,
     /// 各阶段耗时（微秒）：查元数据 / CopyResource / Map / 逐行拷贝 / Unmap
     pub meta_us: u64,
     pub copy_us: u64,
@@ -453,6 +541,36 @@ impl Capturer {
         self.debug
     }
 
+    /// 用 GDI BitBlt 把一帧填成当前桌面内容（DXGI 首帧没有桌面图像时的兜底）。
+    /// 成功返回 true，并把这帧标成 full、清掉 dirty/moves。
+    fn try_gdi_fill(&mut self, frame: &mut Frame) -> bool {
+        let t0 = Instant::now();
+        match grab_gdi(self.info.origin_x, self.info.origin_y, frame.width, frame.height) {
+            Ok(buf) if buf.len() == frame.bgra.len() => {
+                frame.bgra.copy_from_slice(&buf);
+                frame.full = true;
+                frame.dirty.clear();
+                frame.moves.clear();
+                frame.ts_ms = now_ms();
+                self.debug.sampled_blank = false;
+                self.debug.gdi_fallback = true;
+                log::info!(
+                    "capture: DXGI 帧无桌面图像，已用 GDI BitBlt 兜底（{}us）",
+                    t0.elapsed().as_micros()
+                );
+                true
+            }
+            Ok(_) => {
+                log::warn!("capture: GDI 兜底数据尺寸不匹配");
+                false
+            }
+            Err(e) => {
+                log::warn!("capture: GDI 兜底失败: {e}");
+                false
+            }
+        }
+    }
+
     /// 首帧全零被丢弃重取的累计次数。
     pub fn blank_retries(&self) -> u64 {
         self.blank_retries
@@ -487,7 +605,11 @@ impl Capturer {
     /// 最多重试 BLANK_RETRY_MAX 次 / BLANK_RETRY_BUDGET_MS 毫秒；仍不行就告警后照常返回，
     /// 绝不死等（静止桌面上可能迟迟等不到新帧）。
     pub fn grab(&mut self) -> CaptureResult<Option<Frame>> {
-        let deadline = Instant::now() + std::time::Duration::from_millis(BLANK_RETRY_BUDGET_MS);
+        let budget_ms = std::env::var("LRC_BLANK_RETRY_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(BLANK_RETRY_BUDGET_MS);
+    let deadline = Instant::now() + std::time::Duration::from_millis(budget_ms);
         let mut attempts: u32 = 0;
         // 重试期间要是等不到新帧，就把这张（全零的）帧交出去兜底
         let mut blank_fallback: Option<Frame> = None;
@@ -508,11 +630,14 @@ impl Capturer {
                         self.retry_timeouts = self.retry_timeouts.saturating_add(1);
                         continue;
                     }
-                    if let Some(f) = blank_fallback.take() {
-                        log::warn!(
-                            "capture: 首帧连续 {} 次全零且等不到新帧，返回该帧（客户端可能短暂黑屏）",
-                            attempts.saturating_sub(1)
-                        );
+                    if let Some(mut f) = blank_fallback.take() {
+                        let ok = self.try_gdi_fill(&mut f);
+                        if !ok {
+                            log::warn!(
+                                "capture: 首帧连续 {} 次全零、等不到新帧且 GDI 兜底也失败，                                 照常返回（客户端可能短暂黑屏）",
+                                attempts.saturating_sub(1)
+                            );
+                        }
                         return Ok(Some(f));
                     }
                     // 「零变化零发送」的关键：超时不是错误。
@@ -534,7 +659,7 @@ impl Capturer {
             }
 
             match built {
-                Ok(Some(frame)) => {
+                Ok(Some(mut frame)) => {
                     // 只对整帧（首帧一定是）做全零抽样检查；局部帧因为只贴了脏区，
                     // 全量化检查没意义（未变化区域本来就该是旧内容）。
                     let blank = frame.full && sample_is_blank(&frame.bgra);
@@ -547,15 +672,18 @@ impl Capturer {
                     if blank {
                         self.blank_retries = self.blank_retries.saturating_add(1);
                         if attempts < BLANK_RETRY_MAX && Instant::now() < deadline {
-                            log::debug!(
-                                "capture: 首帧全零（第 {} 次 acquire），丢弃重取",
-                                attempts
-                            );
+                            log::debug!("capture: 首帧全零（第 {} 次 acquire），丢弃重取", attempts);
                             blank_fallback = Some(frame);
+                            // timeout=0 时重试循环会空转烧 CPU，让出 1ms
+                            std::thread::sleep(std::time::Duration::from_millis(1));
                             continue;
                         }
+                        // 重试预算用完：改用 GDI BitBlt 直接抓桌面（静止桌面也能拿到内容）
+                        if self.try_gdi_fill(&mut frame) {
+                            return Ok(Some(frame));
+                        }
                         log::warn!(
-                            "capture: 连续 {} 次拿到全零桌面图像（累计 {} 次），照常返回；                             若是 HDR/10bit 桌面请检查格式校验日志",
+                            "capture: 连续 {} 次拿到全零桌面图像（累计 {} 次），GDI 兜底也失败，照常返回（客户端可能短暂黑屏）",
                             attempts,
                             self.blank_retries
                         );
@@ -1099,6 +1227,41 @@ mod tests {
         assert_eq!(hash_block(&buf, 256, 64, 0), 0);
         // 数据不足不 panic
         assert_eq!(hash_block(&buf[..100], 256, 64, 64), 0);
+    }
+
+    #[test]
+    fn sample_is_blank_detects_zero_and_nonzero() {
+        // 全零
+        assert!(sample_is_blank(&vec![0u8; 8 * 1024 * 1024]));
+        // 小缓冲全零
+        assert!(sample_is_blank(&[0u8; 16]));
+        assert!(!sample_is_blank(&[0u8, 0, 0, 0, 1]));
+        // 头部非零
+        let mut v = vec![0u8; 8 * 1024 * 1024];
+        v[0] = 1;
+        assert!(!sample_is_blank(&v));
+        // 中间（抽样点）非零
+        let mut v = vec![0u8; 8 * 1024 * 1024];
+        v[4096 * 7] = 0xAB;
+        assert!(!sample_is_blank(&v));
+        // 尾部非零
+        let mut v = vec![0u8; 8 * 1024 * 1024];
+        let n = v.len();
+        v[n - 1] = 1;
+        assert!(!sample_is_blank(&v));
+    }
+
+    #[test]
+    fn gdi_fallback_captures_real_desktop() {
+        // 直接验证兜底路径：BitBlt 出来的必须不是全零，且 alpha 被补成 255
+        let (w, h) = (1920u32, 1080u32);
+        let buf = grab_gdi(0, 0, w, h).expect("GDI BitBlt 兜底");
+        assert_eq!(buf.len(), (w * h * 4) as usize);
+        assert!(!sample_is_blank(&buf), "GDI 兜底拿到的画面不应全零");
+        assert_eq!(buf[3], 255, "alpha 必须补成不透明");
+        // 抽样看看确实有内容
+        let nonzero = buf.iter().step_by(4096).filter(|b| **b != 0).count();
+        assert!(nonzero > 0);
     }
 
     #[test]

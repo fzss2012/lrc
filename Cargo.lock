@@ -380,6 +380,7 @@ dependencies = [
  "env_logger",
  "hmac",
  "log",
+ "lrc-adapt",
  "lrc-capture",
  "lrc-codec",
  "lrc-proto",

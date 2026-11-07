@@ -7,7 +7,6 @@
 use std::io::Write;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -19,20 +18,21 @@ use windows::Win32::Foundation::{
     GetLastError, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect,
-    MonitorFromWindow, ScreenToClient, StretchDIBits, UpdateWindow, ValidateRect, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, COLOR_WINDOW, DIB_RGB_COLORS, HBRUSH, HGDIOBJ, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RGBQUAD, SRCCOPY,
+    BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, GetMonitorInfoW,
+    InvalidateRect, MonitorFromWindow, ScreenToClient, SetBkMode, SetTextColor, StretchDIBits,
+    UpdateWindow, ValidateRect, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, COLOR_WINDOW, DIB_RGB_COLORS,
+    HBRUSH, HDC, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RGBQUAD, SRCCOPY,
+    TRANSPARENT, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
-    MessageBoxW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_STYLE,
-    GWLP_USERDATA, HICON, IDC_ARROW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MSG,
-    SetCursor, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WM_CREATE, WM_DESTROY,
+    GWLP_USERDATA, HICON, IDC_ARROW, MSG, SetCursor, SetWindowTextW, SW_SHOWNORMAL,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WM_CREATE, WM_DESTROY,
     WM_ERASEBKGND, WM_KEYDOWN,
     WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
@@ -43,7 +43,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::cli::Config;
 use crate::mapping;
 use crate::net;
-use crate::state::{BlockUpdate, CursorShapeOwned, Shared, WM_APP_FAILURE};
+use crate::state::{BlockUpdate, ConnStatus, CursorShapeOwned, Shared};
 
 /// 呈现定时器：8 ms 拉一次脏块队列（≈125 Hz 上限）。
 const TIMER_PRESENT: usize = 1;
@@ -61,9 +61,7 @@ fn window_class() -> PCWSTR {
 /// 创建窗口、启动接收线程、跑消息循环，直到窗口销毁。
 pub fn run(cfg: &Config) -> anyhow::Result<()> {
     let shared = Arc::new(Shared::new());
-    let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-
-    let mut app = Box::new(AppState::new(shared.clone(), out_tx, cfg));
+    let mut app = Box::new(AppState::new(shared.clone(), cfg));
     let app_ptr: *mut AppState = &mut *app;
 
     let hwnd = match create_window(app_ptr, cfg) {
@@ -74,10 +72,8 @@ pub fn run(cfg: &Config) -> anyhow::Result<()> {
         }
     };
 
-    // 接收线程：连接 + 握手 + 收流解码。hwnd 必须先写进 Shared，线程才能 PostMessage。
-    shared.set_hwnd(hwnd.0 as isize);
-    let net_tx = app.out_tx.clone();
-    if let Err(e) = net::spawn(cfg, shared.clone(), net_tx, out_rx) {
+    // 接收线程：连接 + 握手 + 收流解码；断线自动重连，不需要窗口线程参与。
+    if let Err(e) = net::spawn(cfg, shared.clone()) {
         log::error!("接收线程启动失败: {e}");
         let _ = unsafe { DestroyWindow(hwnd) };
     }
@@ -239,13 +235,8 @@ impl SoftCanvas {
         }
     }
 
-    /// WM_PAINT：黑底 + 拉伸铺满客户区（与 D3D 的 `DXGI_SCALING_STRETCH` 口径一致）。
-    unsafe fn paint(&self, hwnd: HWND, client: (u32, u32)) {
-        let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
-        if hdc.is_invalid() {
-            return;
-        }
+    /// 往 HDC 上画：黑底 + 拉伸铺满客户区（与 D3D 的 DXGI_SCALING_STRETCH 同口径）。
+    unsafe fn paint_hdc(&self, hdc: HDC, client: (u32, u32)) {
         let client_rect = RECT {
             left: 0,
             top: 0,
@@ -292,7 +283,6 @@ impl SoftCanvas {
                 SRCCOPY,
             );
         }
-        let _ = EndPaint(hwnd, &ps);
     }
 }
 
@@ -300,8 +290,12 @@ impl SoftCanvas {
 struct AppState {
     hwnd: HWND,
     shared: Arc<Shared>,
-    out_tx: Sender<Vec<u8>>,
-    title: String,
+    /// 命令行给的基础标题（重连/错误提示在它后面加后缀）
+    base_title: String,
+    /// 当前已经设到窗口上的标题（避免每 tick 都 SetWindowText）
+    title_applied: String,
+    /// 窗口内叠加的状态提示（重连中/认证失败）；None = 不显示
+    status_text: Option<String>,
     stats_enabled: bool,
     surface: Surface,
     /// 当前呈现面对应的被控端尺寸
@@ -344,12 +338,13 @@ impl Stats {
 }
 
 impl AppState {
-    fn new(shared: Arc<Shared>, out_tx: Sender<Vec<u8>>, cfg: &Config) -> Self {
+    fn new(shared: Arc<Shared>, cfg: &Config) -> Self {
         Self {
             hwnd: HWND(std::ptr::null_mut()),
             shared,
-            out_tx,
-            title: cfg.title.clone(),
+            base_title: cfg.title.clone(),
+            title_applied: cfg.title.clone(),
+            status_text: None,
             stats_enabled: cfg.stats,
             surface: Surface::None,
             surface_size: None,
@@ -903,14 +898,36 @@ impl AppState {
 
     fn on_paint(&mut self, hwnd: HWND) {
         let client = self.client_size();
+        let status = self.status_text.clone();
         match &mut self.surface {
             Surface::Gpu(_) => {
                 // D3D 自己画；这里只要校验区域，另外借下一次定时器重画一帧。
+                // 断线时画面保持最后一帧，连接状态看标题栏。
                 self.need_present = true;
                 let _ = unsafe { ValidateRect(Some(hwnd), None) };
             }
-            Surface::Gdi(canvas) => unsafe { canvas.paint(hwnd, client) },
-            Surface::None => paint_black(hwnd, client),
+            Surface::Gdi(canvas) => unsafe {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                if !hdc.is_invalid() {
+                    canvas.paint_hdc(hdc, client);
+                    if let Some(text) = status.as_deref() {
+                        draw_status_text(hdc, client, text);
+                    }
+                }
+                let _ = EndPaint(hwnd, &ps);
+            },
+            Surface::None => unsafe {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(hwnd, &mut ps);
+                if !hdc.is_invalid() {
+                    fill_black(hdc, client);
+                    if let Some(text) = status.as_deref() {
+                        draw_status_text(hdc, client, text);
+                    }
+                }
+                let _ = EndPaint(hwnd, &ps);
+            },
         }
     }
 
@@ -921,23 +938,53 @@ impl AppState {
         }
     }
 
-    // ---- 每秒：ack + stats ----
+    // ---- 每秒：连接状态 + ack + stats ----
+
+    /// 把 Shared 里的连接状态同步到窗口标题/内嵌提示。
+    ///
+    /// - 断线重连：标题 `lrc viewer — 重连中(第 N 次)`，画面保持最后一帧；
+    /// - 认证失败：标题显示原因，窗口内叠加一行提示（不再弹 MessageBox 阻塞）。
+    fn sync_status(&mut self) {
+        let status = self.shared.status();
+        let (desired, overlay) = match &status {
+            ConnStatus::Terminal { message } => (
+                format!("{} — {message}", self.base_title),
+                Some(message.clone()),
+            ),
+            ConnStatus::Reconnecting { attempt } => (
+                format!("{} — 重连中(第 {attempt} 次)", self.base_title),
+                Some(format!("连接断开，重连中（第 {attempt} 次）…")),
+            ),
+            ConnStatus::Connected => (self.base_title.clone(), None),
+        };
+        if desired == self.title_applied {
+            return;
+        }
+        self.title_applied = desired.clone();
+        self.status_text = overlay;
+        let wide = encode_wide(&desired);
+        let _ = unsafe { SetWindowTextW(self.hwnd, PCWSTR::from_raw(wide.as_ptr())) };
+        // GDI/无画面时能把提示画出来；D3D 模式靠标题栏（画面保持最后一帧）
+        let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+        log::info!("窗口状态：{desired}");
+    }
 
     fn on_tick(&mut self) {
+        self.sync_status();
         self.print_stats();
         if self.shared.is_connected() {
             let ack = FrameAck {
                 seq: self.shared.last_seq.load(Ordering::Relaxed),
                 recv_bytes: self.shared.recv_bytes.load(Ordering::Relaxed),
             };
-            let _ = self.out_tx.send(Message::VideoAck(ack).encode());
+            self.shared.send(Message::VideoAck(ack).encode());
             // RTT：每秒一个 Ping，Pong 回来算最近一次往返（loopback 亚毫秒级）
             let ts = self.shared.begin_ping();
-            let _ = self.out_tx.send(Message::Ping(Ping { ts_ms: ts }).encode());
+            self.shared.send(Message::Ping(Ping { ts_ms: ts }).encode());
         }
         if self.shared.take_want_full() {
             log::debug!("请求整帧");
-            let _ = self.out_tx.send(Message::RequestFull.encode());
+            self.shared.send(Message::RequestFull.encode());
         }
     }
 
@@ -979,7 +1026,8 @@ impl AppState {
         // lat_ms 只在视频模式下、且两端用同一时钟源（GetTickCount64）时才是真延迟。
         println!(
             "fps={fps:.0} recv_kbps={kbps:.1} decoded_blocks={blocks} rtt_ms={rtt_ms:.3} \
-mode={mode} video_fps={video_fps:.1} lat_ms={lat_ms:.1}"
+mode={mode} video_fps={video_fps:.1} lat_ms={lat_ms:.1} reconnects={}",
+            self.shared.reconnect_count()
         );
         let _ = std::io::stdout().flush();
     }
@@ -1017,7 +1065,7 @@ mode={mode} video_fps={video_fps:.1} lat_ms={lat_ms:.1}"
             return;
         }
         log::debug!("input -> {event:?}");
-        let _ = self.out_tx.send(Message::Input(event).encode());
+        self.shared.send(Message::Input(event).encode());
     }
 
     fn on_mouse_move(&mut self, lparam: LPARAM) {
@@ -1077,25 +1125,7 @@ mode={mode} video_fps={video_fps:.1} lat_ms={lat_ms:.1}"
         self.send_input(event);
     }
 
-    // ---- 致命错误：弹框后退出 ----
 
-    fn on_failure(&mut self) {
-        let Some(message) = self.shared.take_failure() else {
-            return;
-        };
-        log::error!("{message}");
-        let text = encode_wide(&message);
-        let title = encode_wide(&self.title);
-        unsafe {
-            MessageBoxW(
-                Some(self.hwnd),
-                PCWSTR::from_raw(text.as_ptr()),
-                PCWSTR::from_raw(title.as_ptr()),
-                MB_OK | MB_ICONERROR | MB_SETFOREGROUND,
-            );
-            let _ = DestroyWindow(self.hwnd);
-        }
-    }
 }
 
 /// 光标本地合成状态（只在窗口线程用）。
@@ -1280,24 +1310,50 @@ fn compose_rect<'a>(
 }
 
 /// 没有画面时的黑底。
-fn paint_black(hwnd: HWND, client: (u32, u32)) {
-    let mut ps = PAINTSTRUCT::default();
-    unsafe {
-        let hdc = BeginPaint(hwnd, &mut ps);
-        if hdc.is_invalid() {
-            return;
-        }
-        let rect = RECT {
-            left: 0,
-            top: 0,
-            right: client.0 as i32,
-            bottom: client.1 as i32,
-        };
-        let brush = CreateSolidBrush(COLORREF(0));
-        FillRect(hdc, &rect, brush);
-        let _ = DeleteObject(HGDIOBJ(brush.0));
-        let _ = EndPaint(hwnd, &ps);
-    }
+unsafe fn fill_black(hdc: HDC, client: (u32, u32)) {
+    let rect = RECT {
+        left: 0,
+        top: 0,
+        right: client.0 as i32,
+        bottom: client.1 as i32,
+    };
+    let brush = CreateSolidBrush(COLORREF(0));
+    FillRect(hdc, &rect, brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+}
+
+/// 在客户区底部叠一条状态提示带（重连中 / 认证失败）。
+///
+/// D3D 模式下画面由 swapchain 覆盖，这条提示看不到（靠标题栏），
+/// 无画面或 GDI 回退时能直接看到。
+unsafe fn draw_status_text(hdc: HDC, client: (u32, u32), text: &str) {
+    let bottom = client.1 as i32;
+    let band_h = 34;
+    let band = RECT {
+        left: 0,
+        top: (bottom - band_h).max(0),
+        right: client.0 as i32,
+        bottom,
+    };
+    let brush = CreateSolidBrush(COLORREF(0x0020_2020));
+    FillRect(hdc, &band, brush);
+    let _ = DeleteObject(HGDIOBJ(brush.0));
+
+    let mut rect = RECT {
+        left: 12,
+        top: band.top,
+        right: (band.right - 12).max(0),
+        bottom,
+    };
+    let mut wide = encode_wide(text);
+    let _ = SetBkMode(hdc, TRANSPARENT);
+    let _ = SetTextColor(hdc, COLORREF(0x00D0_D0D0));
+    let _ = DrawTextW(
+        hdc,
+        &mut wide[..],
+        &mut rect,
+        DT_LEFT | DT_SINGLELINE | DT_VCENTER,
+    );
 }
 
 /// 取窗口关联的 AppState（WM_NCCREATE 时存进 GWLP_USERDATA）。
@@ -1372,7 +1428,6 @@ unsafe extern "system" fn wndproc(
         WM_MBUTTONUP => app.on_mouse_button(mouse_button::MIDDLE, false, lparam),
         WM_MOUSEWHEEL => app.on_wheel(wparam, lparam, false),
         WM_MOUSEHWHEEL => app.on_wheel(wparam, lparam, true),
-        WM_APP_FAILURE => app.on_failure(),
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)

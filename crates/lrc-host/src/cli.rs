@@ -44,7 +44,7 @@ impl VideoChoice {
     }
 }
 
-pub const USAGE: &str = "用法: lrc-host --password <PASS> [--listen <IP:PORT>] [--display N] [--fps N] [--quality N] [--stats] [--video auto|off|hevc|h264] [--video-bitrate B] [--video-max-fps N]";
+pub const USAGE: &str = "用法: lrc-host --password <PASS> [--listen <IP:PORT>] [--display N] [--fps N] [--quality N] [--stats] [--video auto|off|hevc|h264] [--video-bitrate B] [--video-max-fps N] [--budget-bps B]";
 
 pub const HELP: &str = "\
 lrc-host — lrc 被控端（单流点对点）
@@ -64,11 +64,14 @@ lrc-host — lrc 被控端（单流点对点）
   --video <MODE>      视频通道 auto|off|hevc|h264，默认 auto（探测到 NVENC 就用 hevc）
   --video-bitrate <B> 视频码率 bit/s，默认 4000000
   --video-max-fps <N> 视频模式帧率上限 1..=240，默认 30
+  --budget-bps <B>    链路预算 bit/s；>0 时启用自适应控制器（降帧率/抬QP/降分辨率/调码率），
+                      默认 0 = 关闭（参数固定，行为与不加此参数前完全一致）
   -h, --help          显示本帮助
 
 统计行:
   t=<秒> fps= blocks= sent_frames= bytes= kbps= idle_frames= dropped= sec_bytes=
   cursor_msgs= full_resends= mode=blocks|video video_kbps= video_fps=
+  level=<档位> stage=<阶段> scale=<缩放>（--budget-bps 生效时才有意义）
 ";
 
 /// 解析后的启动参数。
@@ -86,6 +89,8 @@ pub struct Args {
     pub video_bitrate: u32,
     /// 视频模式帧率上限
     pub video_max_fps: u32,
+    /// 链路预算（bit/s）；0 = 不使用自适应控制器（保持固定参数）
+    pub budget_bps: u32,
 }
 
 /// 解析结果：要么是帮助，要么是运行参数。
@@ -141,6 +146,7 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
     let mut video = VideoChoice::Auto;
     let mut video_bitrate = DEFAULT_VIDEO_BITRATE;
     let mut video_max_fps = DEFAULT_VIDEO_MAX_FPS;
+    let mut budget_bps = 0u32;
 
     let mut i = 0usize;
     while i < argv.len() {
@@ -156,7 +162,7 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
             }
             "--no-stats" => stats = false,
             "--listen" | "--password" | "--display" | "--fps" | "--quality" | "--video"
-            | "--video-bitrate" | "--video-max-fps" => {
+            | "--video-bitrate" | "--video-max-fps" | "--budget-bps" => {
                 let value = match inline {
                     Some(v) => v,
                     None => {
@@ -233,6 +239,22 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
                             }
                         }
                     }
+                    "--budget-bps" => {
+                        let v = parse_usize(name, &value)?;
+                        let v = u32::try_from(v).ok().filter(|v| {
+                            *v == 0 || VIDEO_BITRATE_RANGE.contains(v)
+                        });
+                        match v {
+                            Some(v) => budget_bps = v,
+                            None => {
+                                return Err(CliError::BadValue {
+                                    flag: name.to_string(),
+                                    value,
+                                    expect: "0（关闭）或 100000..=80000000",
+                                })
+                            }
+                        }
+                    }
                     "--video-max-fps" => {
                         let v = parse_usize(name, &value)?;
                         if v == 0 || v > MAX_FPS as usize {
@@ -267,6 +289,7 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
         video,
         video_bitrate,
         video_max_fps,
+        budget_bps,
     }))
 }
 
@@ -312,6 +335,19 @@ mod tests {
         assert_eq!(a.video, VideoChoice::Auto);
         assert_eq!(a.video_bitrate, DEFAULT_VIDEO_BITRATE);
         assert_eq!(a.video_max_fps, DEFAULT_VIDEO_MAX_FPS);
+        assert_eq!(a.budget_bps, 0);
+    }
+
+    #[test]
+    fn budget_flag() {
+        let a = run(&["--password", "1", "--budget-bps", "2000000"]);
+        assert_eq!(a.budget_bps, 2_000_000);
+        let a = run(&["--password", "1", "--budget-bps=0"]);
+        assert_eq!(a.budget_bps, 0);
+        assert!(matches!(
+            parse(&argv(&["--password", "1", "--budget-bps", "1234"])),
+            Err(CliError::BadValue { .. })
+        ));
     }
 
     #[test]

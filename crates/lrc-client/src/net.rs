@@ -7,15 +7,14 @@
 
 use std::io;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use lrc_codec as codec;
 use lrc_proto::{
-    auth_reason, codec_tag, ClientHello, Message, Pong, ServerHello, VideoAu, VideoFrame,
-    PROTO_VERSION,
+    auth_reason, codec_tag, ClientHello, Message, Pong, VideoAu, VideoFrame, PROTO_VERSION,
 };
 use lrc_transport::{Conn, ConnReader, ConnWriter};
 use lrc_video::{DecoderConfig, FfmpegDecoder, VideoDecoder};
@@ -23,67 +22,179 @@ use sha2::Sha256;
 use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
 
 use crate::cli::Config;
-use crate::state::{host_clock_ms, BlockUpdate, CursorShapeOwned, Shared, VideoFrameUpdate};
+use crate::state::{
+    backoff_delay, host_clock_ms, BlockUpdate, ConnStatus, CursorShapeOwned, Shared,
+    VideoFrameUpdate,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// 启动接收线程。连接失败会自动重试，直到窗口关闭。
-pub fn spawn(
-    cfg: &Config,
-    shared: Arc<Shared>,
-    tx: Sender<Vec<u8>>,
-    rx: Receiver<Vec<u8>>,
-) -> io::Result<()> {
+/// 会话结束原因（供重连逻辑判断）。
+enum SessionEnd {
+    /// 窗口关闭，接收线程直接退出
+    Quit,
+    /// 连接断了（可以重连）
+    Disconnected(String),
+}
+
+/// 握手失败：认证/版本问题不重试，IO/时序问题可以重连。
+enum HandshakeError {
+    /// 认证失败、协议版本不匹配等：再试也没用
+    Terminal(String),
+    /// 网络类问题：退避后重连
+    Transient(String),
+}
+
+/// 启动接收线程：连接 → 握手 → 收流；断线自动退避重连，直到窗口关闭。
+pub fn spawn(cfg: &Config, shared: Arc<Shared>) -> io::Result<()> {
     let addr = cfg.connect.clone();
     let password = cfg.password.clone();
     std::thread::Builder::new()
         .name(String::from("lrc-client-net"))
-        .spawn(move || {
-            if let Err(e) = receiver_main(&addr, &password, &shared, tx, rx) {
-                if !shared.is_quit() {
-                    shared.fail(format!("{e:#}"));
-                }
-            }
-        })?;
+        .spawn(move || supervise(&addr, &password, &shared))?;
     Ok(())
 }
 
-fn receiver_main(
-    addr: &str,
-    password: &str,
-    shared: &Arc<Shared>,
-    tx: Sender<Vec<u8>>,
-    rx: Receiver<Vec<u8>>,
-) -> anyhow::Result<()> {
-    let mut conn = connect_retry(addr, shared)?;
+/// 连接监管循环：断线不退出，指数退避重连；认证失败才终止（窗口保留）。
+fn supervise(addr: &str, password: &str, shared: &Arc<Shared>) {
+    let mut attempt: u32 = 0;
+    let mut ever_connected = false;
+    loop {
+        if shared.is_quit() {
+            return;
+        }
 
-    // ---- 握手：ClientHello → ServerHello → AuthRequest → AuthResult ----
-    let client_id = random_id()?;
-    let nonce_c = random_id()?;
+        // ---- 1) 建连 ----
+        let conn = match Conn::connect(addr) {
+            Ok(conn) => conn,
+            Err(e) => {
+                attempt = attempt.saturating_add(1);
+                shared.set_status(ConnStatus::Reconnecting { attempt });
+                let delay = backoff_delay(attempt);
+                log::warn!("连接 {addr} 失败（第 {attempt} 次）: {e}；{}s 后重试", delay.as_secs());
+                if !sleep_backoff(shared, attempt) {
+                    return;
+                }
+                continue;
+            }
+        };
+
+        // ---- 2) 握手 ----
+        match handshake(conn, password, shared) {
+            Ok((writer, mut reader)) => {
+                if ever_connected {
+                    shared.bump_reconnects();
+                }
+                ever_connected = true;
+                attempt = 0;
+                let (tx, rx) = channel::<Vec<u8>>();
+                spawn_writer(writer, rx, shared.clone());
+                // 新会话：清掉上一会话的脏块/视频帧/解码器状态（解码器是 VideoRx 的局部变量，随会话结束 drop）
+                shared.clear_session_state();
+                shared.set_out_tx(Some(tx.clone()));
+                shared.set_connected(true);
+                shared.set_status(ConnStatus::Connected);
+                log::info!("已连接 {addr}，开始接收");
+                // 首帧要整屏；被控端收到会回一整帧
+                send(&tx, Message::RequestFull.encode());
+
+                let end = session_loop(&mut reader, shared, &tx);
+                shared.set_out_tx(None);
+                shared.set_connected(false);
+                shared.clear_session_state();
+                drop(tx);
+
+                match end {
+                    SessionEnd::Quit => return,
+                    SessionEnd::Disconnected(reason) => {
+                        if shared.is_quit() {
+                            return;
+                        }
+                        attempt = attempt.saturating_add(1);
+                        shared.set_status(ConnStatus::Reconnecting { attempt });
+                        let delay = backoff_delay(attempt);
+                        log::warn!(
+                            "连接断开（{reason}）；第 {attempt} 次重连，{}s 后重试",
+                            delay.as_secs()
+                        );
+                        if !sleep_backoff(shared, attempt) {
+                            return;
+                        }
+                    }
+                }
+            }
+            Err(HandshakeError::Terminal(message)) => {
+                log::error!("{message}（不再重连）");
+                shared.set_out_tx(None);
+                shared.set_connected(false);
+                shared.clear_session_state();
+                shared.set_status(ConnStatus::Terminal { message });
+                return;
+            }
+            Err(HandshakeError::Transient(e)) => {
+                attempt = attempt.saturating_add(1);
+                shared.set_status(ConnStatus::Reconnecting { attempt });
+                let delay = backoff_delay(attempt);
+                log::warn!("握手失败（第 {attempt} 次）: {e}；{}s 后重试", delay.as_secs());
+                if !sleep_backoff(shared, attempt) {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// 退避等待；窗口关闭时立刻返回 false。
+fn sleep_backoff(shared: &Shared, attempt: u32) -> bool {
+    let mut left = backoff_delay(attempt);
+    while !left.is_zero() {
+        if shared.is_quit() {
+            return false;
+        }
+        let step = left.min(Duration::from_millis(100));
+        std::thread::sleep(step);
+        left -= step;
+    }
+    !shared.is_quit()
+}
+
+/// 握手：ClientHello → ServerHello → AuthRequest → AuthResult；成功后拆成读写两半。
+fn handshake(
+    mut conn: Conn,
+    password: &str,
+    shared: &Shared,
+) -> Result<(ConnWriter, ConnReader), HandshakeError> {
+    let client_id = random_id().map_err(|e| HandshakeError::Transient(format!("{e:#}")))?;
+    let nonce_c = random_id().map_err(|e| HandshakeError::Transient(format!("{e:#}")))?;
     let hello = Message::ClientHello(ClientHello {
         version: PROTO_VERSION,
         client_id,
         nonce_c,
     });
-    conn.send(&hello.encode())?;
+    conn.send(&hello.encode())
+        .map_err(|e| HandshakeError::Transient(format!("发 ClientHello 失败: {e}")))?;
 
     let mut buf = Vec::with_capacity(4096);
-    let server: ServerHello = match recv_msg(&mut conn, &mut buf)? {
-        Some(Message::ServerHello(hello)) => hello,
-        Some(other) => {
-            return Err(anyhow::anyhow!(
-                "握手失败：期望 ServerHello，收到消息类型 {:#x}",
+    let server = match recv_msg(&mut conn, &mut buf) {
+        Ok(Some(Message::ServerHello(hello))) => hello,
+        Ok(Some(other)) => {
+            return Err(HandshakeError::Transient(format!(
+                "期望 ServerHello，收到消息类型 {:#x}",
                 other.msg_type()
-            ))
+            )))
         }
-        None => return Err(anyhow::anyhow!("握手失败：对端在 ServerHello 之前关闭连接")),
+        Ok(None) => {
+            return Err(HandshakeError::Transient(String::from(
+                "对端在 ServerHello 之前关闭连接",
+            )))
+        }
+        Err(e) => return Err(HandshakeError::Transient(format!("读 ServerHello 失败: {e}"))),
     };
     if server.version != PROTO_VERSION {
-        return Err(anyhow::anyhow!(
+        return Err(HandshakeError::Terminal(format!(
             "协议版本不匹配：对端 v{}，本地 v{}",
-            server.version,
-            PROTO_VERSION
-        ));
+            server.version, PROTO_VERSION
+        )));
     }
     shared.set_remote_size(server.width, server.height);
     log::info!(
@@ -98,88 +209,67 @@ fn receiver_main(
     let mut mac_input = [0u8; 32];
     mac_input[..16].copy_from_slice(&nonce_c);
     mac_input[16..].copy_from_slice(&server.nonce_s);
-    let mac = hmac_sha256(password.as_bytes(), &mac_input)?;
-    conn.send(&Message::AuthRequest(lrc_proto::AuthRequest { mac }).encode())?;
+    let mac = hmac_sha256(password.as_bytes(), &mac_input)
+        .map_err(|e| HandshakeError::Transient(format!("{e:#}")))?;
+    conn.send(&Message::AuthRequest(lrc_proto::AuthRequest { mac }).encode())
+        .map_err(|e| HandshakeError::Transient(format!("发 AuthRequest 失败: {e}")))?;
 
-    match recv_msg(&mut conn, &mut buf)? {
-        Some(Message::AuthResult(result)) => {
+    match recv_msg(&mut conn, &mut buf) {
+        Ok(Some(Message::AuthResult(result))) => {
             if !result.ok {
-                return Err(anyhow::anyhow!(
+                return Err(HandshakeError::Terminal(format!(
                     "认证失败：{}",
                     auth_reason_text(result.reason)
-                ));
+                )));
             }
         }
-        Some(other) => {
-            return Err(anyhow::anyhow!(
-                "握手失败：期望 AuthResult，收到消息类型 {:#x}",
+        Ok(Some(other)) => {
+            return Err(HandshakeError::Transient(format!(
+                "期望 AuthResult，收到消息类型 {:#x}",
                 other.msg_type()
-            ))
+            )))
         }
-        None => return Err(anyhow::anyhow!("握手失败：对端在 AuthResult 之前关闭连接")),
+        Ok(None) => {
+            return Err(HandshakeError::Transient(String::from(
+                "对端在 AuthResult 之前关闭连接",
+            )))
+        }
+        Err(e) => return Err(HandshakeError::Transient(format!("读 AuthResult 失败: {e}"))),
     }
-    log::info!("认证通过，开始接收视频");
+    log::info!("认证通过");
 
-    // ---- 拆成收发两半：写半边交给发送线程，读半边留在本线程 ----
-    let (writer, mut reader) = conn.split()?;
-    spawn_writer(writer, rx, shared.clone());
-    shared.set_connected(true);
-    // 首帧要整屏；被控端如果实现了 RequestFull 会立刻发全量块。
-    send(&tx, Message::RequestFull.encode());
-
-    let result = video_loop(&mut reader, shared, &tx);
-    shared.set_connected(false);
-    result
+    conn.split()
+        .map_err(|e| HandshakeError::Transient(format!("split 失败: {e}")))
 }
 
-/// 连接失败时每秒重试一次（窗口还没关就会一直试）。
-fn connect_retry(addr: &str, shared: &Arc<Shared>) -> anyhow::Result<Conn> {
-    let mut attempt = 0u32;
-    // 失败日志最多每 10 s 一条，免得一直连不上时刷屏
-    let mut next_log = std::time::Instant::now();
-    loop {
-        if shared.is_quit() {
-            return Err(anyhow::anyhow!("窗口已关闭"));
-        }
-        match Conn::connect(addr) {
-            Ok(conn) => {
-                log::info!("已连接 {addr}");
-                return Ok(conn);
-            }
-            Err(e) => {
-                attempt = attempt.saturating_add(1);
-                let now = std::time::Instant::now();
-                if now >= next_log {
-                    log::warn!("连接 {addr} 失败（第 {attempt} 次）: {e}；1s 后重试");
-                    next_log = now + Duration::from_secs(10);
-                }
-                std::thread::sleep(Duration::from_millis(1000));
-            }
-        }
-    }
-}
-
-fn video_loop(
+/// 会话循环：收消息 → 解码。连接断了返回 Disconnected（由上层重连），窗口关了返回 Quit。
+fn session_loop(
     reader: &mut ConnReader,
     shared: &Arc<Shared>,
     tx: &Sender<Vec<u8>>,
-) -> anyhow::Result<()> {
+) -> SessionEnd {
     let mut buf: Vec<u8> = Vec::with_capacity(128 * 1024);
+    // 解码器跟着会话走：断线时随 VideoRx drop 掉，重连后重新建（不串台）
     let mut video = VideoRx::new();
     loop {
         if shared.is_quit() {
-            return Ok(());
+            return SessionEnd::Quit;
         }
         let n = match reader.recv(&mut buf) {
             Ok(Some(n)) => n,
             Ok(None) => {
                 if shared.is_quit() {
-                    return Ok(());
+                    return SessionEnd::Quit;
                 }
-                return Err(anyhow::anyhow!("对端关闭了连接"));
+                return SessionEnd::Disconnected(String::from("对端关闭了连接"));
             }
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(anyhow::anyhow!("收包失败: {e}")),
+            Err(e) => {
+                if shared.is_quit() {
+                    return SessionEnd::Quit;
+                }
+                return SessionEnd::Disconnected(format!("收包失败: {e}"));
+            }
         };
         shared.add_recv_bytes(n as u64);
 

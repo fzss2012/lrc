@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use lrc_adapt::{Controller, ControllerConfig, LinkStats, Mode as AdaptMode, Target};
 use lrc_capture::cursor::CursorWatcher;
 use lrc_capture::{CaptureError, Capturer, Frame, ScreenInfo};
 use lrc_codec::{self, Options};
@@ -57,6 +58,14 @@ pub(crate) struct Shared {
     ack_seen: AtomicBool,
     /// 客户端最近一次上报的累计接收字节（用于估算在途字节）。
     ack_bytes: AtomicU64,
+    /// 会话起点（算 ack RTT 用）
+    session_start: Instant,
+    /// 最近一次发出帧的时刻（会话内毫秒）
+    last_send_ms: AtomicU64,
+    /// 最近一次发出帧的 seq
+    last_sent_seq: AtomicU32,
+    /// ack 往返（毫秒，平滑值；没有 ack 时为 0）
+    rtt_ms: AtomicU32,
     /// 客户端请求整帧。
     request_full: AtomicBool,
     /// 当前采集输出在虚拟桌面里的原点（输入坐标换算用）。
@@ -73,6 +82,10 @@ impl Shared {
             ack_seq: AtomicU32::new(0),
             ack_seen: AtomicBool::new(false),
             ack_bytes: AtomicU64::new(0),
+            session_start: Instant::now(),
+            last_send_ms: AtomicU64::new(0),
+            last_sent_seq: AtomicU32::new(0),
+            rtt_ms: AtomicU32::new(0),
             request_full: AtomicBool::new(false),
             origin_x: AtomicI32::new(origin.0),
             origin_y: AtomicI32::new(origin.1),
@@ -108,6 +121,43 @@ impl Shared {
 
     fn ack_seq(&self) -> u32 {
         self.ack_seq.load(Ordering::Relaxed)
+    }
+
+    /// 会话内毫秒时钟（ack RTT 用；不跨会话）
+    fn elapsed_ms(&self) -> u64 {
+        self.session_start.elapsed().as_millis() as u64
+    }
+
+    /// 记下"刚发出一帧"（块帧或视频 AU 都算），供 ack RTT 反算。
+    pub(crate) fn note_send(&self, seq: u32) {
+        self.last_sent_seq.store(seq, Ordering::Relaxed);
+        self.last_send_ms.store(self.elapsed_ms(), Ordering::Relaxed);
+    }
+
+    /// 收到 ack：如果确认的就是最近发出的那一帧，就得到一次 RTT 采样（做简单平滑）。
+    ///
+    /// 注：Ping/Pong 里 host 侧算不出 RTT（Pong 只是回显客户端的 ts），所以这里用
+    /// 帧级 ack 反算——含义是"发出这一帧 → 收到它的 ack"，含客户端解码+回执时间。
+    fn note_ack(&self, seq: u32) {
+        self.ack_seq.store(seq, Ordering::Relaxed);
+        if seq != self.last_sent_seq.load(Ordering::Relaxed) {
+            return;
+        }
+        let sent = self.last_send_ms.load(Ordering::Relaxed);
+        let now = self.elapsed_ms();
+        let sample = now.saturating_sub(sent).min(5_000) as u32;
+        let prev = self.rtt_ms.load(Ordering::Relaxed);
+        let smoothed = if prev == 0 {
+            sample
+        } else {
+            (prev.saturating_mul(3) + sample) / 4
+        };
+        self.rtt_ms.store(smoothed, Ordering::Relaxed);
+    }
+
+    /// 平滑后的 ack RTT（毫秒）；一次都没采到时是 0。
+    fn rtt_ms(&self) -> u32 {
+        self.rtt_ms.load(Ordering::Relaxed)
     }
 
     /// 已经收到过 ack，才启用基于未确认字节的流控。
@@ -417,7 +467,7 @@ fn handle_incoming(payload: &[u8], shared: &Shared) {
             }
         }
         Message::VideoAck(ack) => {
-            shared.ack_seq.store(ack.seq, Ordering::Relaxed);
+            shared.note_ack(ack.seq);
             shared.ack_seen.store(true, Ordering::Relaxed);
             shared.ack_bytes.store(ack.recv_bytes, Ordering::Relaxed);
             log::trace!("ack seq={} recv_bytes={}", ack.seq, ack.recv_bytes);
@@ -472,6 +522,185 @@ struct BlockSlot {
     data: Vec<u8>,
 }
 
+/// 自适应控制器的"落地参数"：把 Target 变成主循环真正用的值（纯逻辑，可单测）。
+#[derive(Debug, Clone, Copy)]
+struct AdaptState {
+    /// 是否启用（--budget-bps > 0）
+    enabled: bool,
+    fps_limit: u32,
+    block_quality: u8,
+    scale: f32,
+    video_bitrate: u32,
+    /// 控制器是否允许视频模式（内容驱动的 ModeSwitch 还要再判一次，取更保守的）
+    allow_video: bool,
+    level: u8,
+    stage: &'static str,
+}
+
+impl AdaptState {
+    fn new(args: &Args) -> Self {
+        Self {
+            enabled: args.budget_bps > 0,
+            fps_limit: args.fps.max(1),
+            block_quality: args.quality,
+            scale: 1.0,
+            video_bitrate: args.video_bitrate,
+            allow_video: true,
+            level: 0,
+            stage: "原生",
+        }
+    }
+
+    /// 应用控制器目标；返回参数是否有变化。
+    ///
+    /// 注意 --fps 仍然是硬上限（用户显式给的），控制器只能在它之下往下调。
+    fn apply(&mut self, target: &Target, args: &Args, video_present: bool) -> bool {
+        let mut changed = false;
+        let fps = u32::from(target.fps.max(1)).min(args.fps.max(1));
+        if fps != self.fps_limit {
+            self.fps_limit = fps;
+            changed = true;
+        }
+        if target.block_quality != self.block_quality {
+            self.block_quality = target.block_quality;
+            changed = true;
+        }
+        let scale = if target.resolution_scale.is_finite() {
+            target.resolution_scale.clamp(0.25, 1.0)
+        } else {
+            1.0
+        };
+        if (scale - self.scale).abs() > 0.01 {
+            self.scale = scale;
+            changed = true;
+        }
+        let bitrate = target.video_bitrate_bps.max(1);
+        if bitrate != self.video_bitrate {
+            self.video_bitrate = bitrate;
+            changed = true;
+        }
+        self.allow_video = video_present && matches!(target.mode, AdaptMode::Video);
+        changed
+    }
+
+    fn scale_active(&self) -> bool {
+        (self.scale - 1.0).abs() > 0.01
+    }
+}
+
+/// 一秒的采样（喂控制器 + 打 stats）。
+#[derive(Debug, Clone, Copy)]
+struct SecondSample {
+    interval_secs: f64,
+    bytes: u64,
+    dropped: u32,
+    fps: f32,
+}
+
+/// 缩放后的画面尺寸：取 block_size 的整数倍，保证块网格没有半块。
+fn scaled_dims(width: u32, height: u32, scale: f32) -> (u32, u32) {
+    let bs = u32::from(BLOCK_SIZE);
+    let s = if scale.is_finite() {
+        scale.clamp(0.25, 1.0)
+    } else {
+        1.0
+    };
+    let round_blocks = |v: u32| -> u32 {
+        let scaled = (v as f32 * s).round().max(bs as f32) as u32;
+        let blocks = ((scaled + bs / 2) / bs).max(1);
+        (blocks * bs).min(v.max(bs))
+    };
+    (round_blocks(width), round_blocks(height))
+}
+
+/// 面积平均（box filter）降采样 BGRA。dst 会被 resize 成 4*sw*sh。
+fn downscale_bgra(
+    src: &[u8],
+    src_stride: usize,
+    src_w: u32,
+    src_h: u32,
+    dst: &mut Vec<u8>,
+    dst_w: u32,
+    dst_h: u32,
+) -> bool {
+    if src_w == 0 || src_h == 0 || dst_w == 0 || dst_h == 0 {
+        return false;
+    }
+    let dst_stride = dst_w as usize * 4;
+    dst.clear();
+    dst.resize(dst_stride.saturating_mul(dst_h as usize), 0);
+    let (sw, sh) = (src_w as usize, src_h as usize);
+    for dy in 0..dst_h as usize {
+        let sy0 = dy * sh / dst_h as usize;
+        let sy1 = (((dy + 1) * sh / dst_h as usize).max(sy0 + 1)).min(sh);
+        let row_out = dy * dst_stride;
+        for dx in 0..dst_w as usize {
+            let sx0 = dx * sw / dst_w as usize;
+            let sx1 = (((dx + 1) * sw / dst_w as usize).max(sx0 + 1)).min(sw);
+            let mut sum = [0u32; 4];
+            let mut n = 0u32;
+            for sy in sy0..sy1 {
+                let row = sy * src_stride;
+                for sx in sx0..sx1 {
+                    let p = row + sx * 4;
+                    let Some(px) = src.get(p..p + 4) else {
+                        continue;
+                    };
+                    sum[0] += u32::from(px[0]);
+                    sum[1] += u32::from(px[1]);
+                    sum[2] += u32::from(px[2]);
+                    sum[3] += u32::from(px[3]);
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                continue;
+            }
+            let o = row_out + dx * 4;
+            dst[o] = (sum[0] / n) as u8;
+            dst[o + 1] = (sum[1] / n) as u8;
+            dst[o + 2] = (sum[2] / n) as u8;
+            dst[o + 3] = (sum[3] / n) as u8;
+        }
+    }
+    true
+}
+
+/// 把缩放结果放进一个可复用的 Frame（避免每帧重新分配几 MB）。
+fn prepare_scaled_frame(scaled: &mut Option<Frame>, src: &Frame, scale: f32) -> Option<(u32, u32)> {
+    let (sw, sh) = scaled_dims(src.width, src.height, scale);
+    let slot = scaled.get_or_insert_with(|| Frame {
+        width: 0,
+        height: 0,
+        stride: 0,
+        bgra: Vec::new(),
+        dirty: Vec::new(),
+        moves: Vec::new(),
+        full: true,
+        ts_ms: 0,
+    });
+    if !downscale_bgra(
+        &src.bgra,
+        src.stride,
+        src.width,
+        src.height,
+        &mut slot.bgra,
+        sw,
+        sh,
+    ) {
+        return None;
+    }
+    slot.width = sw;
+    slot.height = sh;
+    slot.stride = sw as usize * 4;
+    slot.full = true;
+    slot.ts_ms = src.ts_ms;
+    // 缩放帧是整帧重算的：dirty/move 不再有意义（走全网格扫描）
+    slot.dirty.clear();
+    slot.moves.clear();
+    Some((sw, sh))
+}
+
 /// 采集/差分/编码/发送主循环。
 fn capture_loop(
     args: &Args,
@@ -482,11 +711,12 @@ fn capture_loop(
 ) -> Result<(), String> {
     let mut track = Track::new(info.width, info.height)
         .ok_or_else(|| format!("采集尺寸非法 {}x{}", info.width, info.height))?;
-    let opts = Options {
+    let mut opts = Options {
         jpeg_quality: args.quality,
         ..Options::default()
     };
-    let frame_interval = Duration::from_secs_f64(1.0 / f64::from(args.fps.max(1)));
+    // 块模式节拍（--budget-bps 时会被控制器往下调，--fps 仍是硬上限）
+    let mut frame_interval = Duration::from_secs_f64(1.0 / f64::from(args.fps.max(1)));
     // 视频模式不跟随 --fps，单独按 --video-max-fps 采集
     let video_interval = Duration::from_secs_f64(1.0 / f64::from(args.video_max_fps.max(1)));
     let session_start = Instant::now();
@@ -504,6 +734,23 @@ fn capture_loop(
     // 一次性标志：本轮若没有新帧，就用缓存帧发一帧整帧（RequestFull / 模式退出）
     let mut force_cache_resend = false;
     let mut last_video = VideoCounters::default();
+    // 自适应控制器（--budget-bps 0 = 关闭，此时所有参数与不加该参数时完全一致）
+    let mut adapt = AdaptState::new(args);
+    let mut controller = if args.budget_bps > 0 {
+        log::info!("自适应控制器启用：链路预算 {}kbps", args.budget_bps / 1000);
+        Some(Controller::new(ControllerConfig {
+            link_budget_bps: args.budget_bps,
+            video_enabled: pipeline.is_some(),
+            ..ControllerConfig::default()
+        }))
+    } else {
+        None
+    };
+    // 这一秒的变化块比例累加（算平均值喂控制器）
+    let mut ratio_sum = 0.0f64;
+    let mut ratio_n = 0u64;
+    // 降分辨率用的复用缓冲
+    let mut scaled: Option<Frame> = None;
     let mut slots: Vec<BlockSlot> = Vec::new();
     let mut cand: Vec<u32> = Vec::new();
     let mut rects: Vec<Rect> = Vec::new();
@@ -532,16 +779,87 @@ fn capture_loop(
             .as_ref()
             .map(|p| p.counters())
             .unwrap_or_default();
-        report_if_due(
+        if let Some(sample) = report_if_due(
             args,
             &mut sec,
             &mut total,
             &mut last_report,
             session_start,
             mode_switch.mode().label(),
+            &adapt,
             video_now,
             &mut last_video,
-        );
+        ) {
+            // 每秒喂一次自适应控制器
+            if let Some(ctrl) = controller.as_mut() {
+                let ratio = if ratio_n > 0 {
+                    (ratio_sum / ratio_n as f64) as f32
+                } else {
+                    0.0
+                };
+                let link = LinkStats {
+                    bytes_sent: sample.bytes,
+                    inflight_bytes: shared.inflight_bytes(),
+                    rtt_ms: shared.rtt_ms(),
+                    dropped_frames: sample.dropped,
+                    changed_ratio: ratio.clamp(0.0, 1.0),
+                    fps: sample.fps,
+                };
+                let target = ctrl.on_tick(
+                    &link,
+                    (sample.interval_secs * 1000.0).round() as u32,
+                );
+                let prev_level = adapt.level;
+                let prev_scale = adapt.scale;
+                let changed = adapt.apply(&target, args, pipeline.is_some());
+                adapt.level = ctrl.level();
+                adapt.stage = ctrl.stage();
+                if changed || prev_level != adapt.level {
+                    log::info!(
+                        "自适应：level={}（{}）fps={} q={} scale={:.2} 视频码率={}kbps｜实测 {:.0}kbps rtt={}ms inflight={}KB ratio={:.2} fps={:.1}",
+                        adapt.level,
+                        adapt.stage,
+                        adapt.fps_limit,
+                        adapt.block_quality,
+                        adapt.scale,
+                        adapt.video_bitrate / 1000,
+                        link.bps() / 1000.0,
+                        link.rtt_ms,
+                        link.inflight_bytes / 1024,
+                        link.changed_ratio,
+                        link.fps
+                    );
+                }
+                // 帧率 / 块质量 / 视频码率
+                frame_interval =
+                    Duration::from_secs_f64(1.0 / f64::from(adapt.fps_limit.max(1)));
+                opts.jpeg_quality = adapt.block_quality;
+                if let Some(p) = pipeline.as_ref() {
+                    p.request_bitrate(adapt.video_bitrate);
+                }
+                // 分辨率缩放变化：立刻重建网格并要求下一帧整帧重发
+                if (adapt.scale - prev_scale).abs() > 0.01 {
+                    let (sw, sh) = scaled_dims(info.width, info.height, adapt.scale);
+                    if adapt.scale_active() {
+                        log::info!(
+                            "自适应：降分辨率 → {}x{}（scale={:.2}）",
+                            sw,
+                            sh,
+                            adapt.scale
+                        );
+                    } else {
+                        log::info!("自适应：恢复原生分辨率 {}x{}", sw, sh);
+                    }
+                    track = Track::new(sw, sh)
+                        .ok_or_else(|| format!("缩放尺寸非法 {sw}x{sh}"))?;
+                    cursor.set_mapping((info.origin_x, info.origin_y), (sw, sh), adapt.scale);
+                    force_full = true;
+                    scaled = None;
+                }
+            }
+            ratio_sum = 0.0;
+            ratio_n = 0;
+        }
 
         // 帧率节流：采集前等待。丢帧不能只丢"发送"，因为 dirty rect 一旦被
         // AcquireNextFrame 消费掉就补不回来了，所以宁可少采。
@@ -593,6 +911,7 @@ fn capture_loop(
                         cursor.set_mapping(
                             (fresh_info.origin_x, fresh_info.origin_y),
                             (fresh_info.width, fresh_info.height),
+                            1.0,
                         );
                         shared.set_origin((fresh_info.origin_x, fresh_info.origin_y));
                         reopen_failures = 0;
@@ -634,6 +953,15 @@ fn capture_loop(
                         log::warn!("视频编码器已失效，永久回块模式");
                         mode_switch.disable_video();
                         back_to_blocks = true;
+                    } else if adapt.enabled && !(adapt.allow_video && !adapt.scale_active()) {
+                        // 控制器要求块模式（或正在降分辨率）→ 回块模式
+                        log::info!(
+                            "自适应要求块模式（allow_video={}，scale={:.2}），退出视频模式",
+                            adapt.allow_video,
+                            adapt.scale
+                        );
+                        p.new_generation();
+                        back_to_blocks = true;
                     } else {
                         if request_full_now {
                             // 视频模式下整帧请求 = 让编码器出 IDR（不要回块模式）
@@ -645,6 +973,10 @@ fn capture_loop(
                             Some(f) => video_changed_ratio(&mut track, f, &mut rects, &mut cand),
                             None => 0,
                         };
+                        if total_blocks > 0 && has_new_frame {
+                            ratio_sum += changed_n as f64 / total_blocks as f64;
+                            ratio_n += 1;
+                        }
                         if has_new_frame {
                             match mode_switch.observe(changed_n, total_blocks) {
                                 ModeEvent::ExitToBlocks => {
@@ -732,6 +1064,31 @@ fn capture_loop(
             continue;
         };
 
+        // 自适应降分辨率：编码前把整帧缩到 scale 尺寸。
+        // 缩放帧一律当整帧处理（网格按缩放后尺寸重建、光标坐标按 scale 换算、客户端画面也变小）。
+        if adapt.scale_active() {
+            match prepare_scaled_frame(&mut scaled, frame, adapt.scale) {
+                Some(_) => {}
+                None => {
+                    log::warn!("降分辨率失败（帧缓冲异常），本帧跳过");
+                    if let Err(e) = cursor.poll_and_send(&shared, &mut sec) {
+                        log_send_failure(&shared, "发送光标", &e);
+                        break;
+                    }
+                    next_grab_at = t_cap + frame_interval;
+                    continue;
+                }
+            }
+        }
+        let frame: &Frame = if adapt.scale_active() {
+            match scaled.as_ref() {
+                Some(f) => f,
+                None => frame,
+            }
+        } else {
+            frame
+        };
+
         // 流控：客户端没确认的字节太多 → 丢这一帧、不排队。
         // 这一帧的 dirty rect 已经消费掉了，所以下一帧必须全盘重扫（否则变化块永久丢失）。
         if shared.ack_seen() && shared.inflight_bytes() > MAX_INFLIGHT_BYTES {
@@ -757,7 +1114,11 @@ fn capture_loop(
             );
             track = Track::new(frame.width, frame.height)
                 .ok_or_else(|| format!("帧尺寸非法 {}x{}", frame.width, frame.height))?;
-            cursor.set_mapping((info.origin_x, info.origin_y), (frame.width, frame.height));
+            cursor.set_mapping(
+                (info.origin_x, info.origin_y),
+                (frame.width, frame.height),
+                adapt.scale,
+            );
         }
 
         // 首帧 / 客户端请求整帧 / 刚重建过 → 整帧发，flags 带 FULL|KEY
@@ -801,10 +1162,21 @@ fn capture_loop(
             }
         }
 
+        // 这一秒的变化块比例（喂控制器）
+        let total_blocks = track.grid.count() as usize;
+        if total_blocks > 0 {
+            ratio_sum += changed.len() as f64 / total_blocks as f64;
+            ratio_n += 1;
+        }
+
         // 块模式下也观察变化比例：连续 3 帧 > 45% 就切视频通道
-        match mode_switch.observe(changed.len(), track.grid.count() as usize) {
+        match mode_switch.observe(changed.len(), total_blocks) {
             ModeEvent::EnterVideo => {
-                if let Some(p) = pipeline.as_ref() {
+                // 控制器/缩放有否决权（取更保守的）：控制器说 blocks 就 blocks；
+                // 降分辨率时编码器尺寸不匹配，也留在块模式。
+                if adapt.enabled && !(adapt.allow_video && !adapt.scale_active()) {
+                    log::debug!("控制器暂不允许视频模式（allow_video={}），继续块模式", adapt.allow_video);
+                } else if let Some(p) = pipeline.as_ref() {
                     log::info!(
                         "变化比例 {} / {} 块，切到视频模式（请求 IDR，码率 {}kbps）",
                         changed.len(),
@@ -974,6 +1346,9 @@ fn capture_loop(
         mode: mode_switch.mode().label(),
         fps: final_video.aus as f64 / session_secs.max(0.001),
         kbps: (final_video.bytes as f64 * 8.0 / 1000.0) / session_secs.max(0.001),
+        level: adapt.level,
+        stage: adapt.stage,
+        scale: adapt.scale,
     };
     if let Some(p) = pipeline.as_ref() {
         log::info!(
@@ -1009,13 +1384,14 @@ fn report_if_due(
     last_report: &mut Instant,
     session_start: Instant,
     mode: &'static str,
+    adapt: &AdaptState,
     video_now: VideoCounters,
     last_video: &mut VideoCounters,
-) {
+) -> Option<SecondSample> {
     let now = Instant::now();
     let elapsed = now.saturating_duration_since(*last_report);
     if elapsed < Duration::from_secs(1) {
-        return;
+        return None;
     }
     let interval = elapsed.as_secs_f64();
 
@@ -1029,6 +1405,16 @@ fn report_if_due(
         mode,
         fps: d_aus as f64 / interval,
         kbps: (d_bytes as f64 * 8.0 / 1000.0) / interval,
+        level: adapt.level,
+        stage: adapt.stage,
+        scale: adapt.scale,
+    };
+
+    let sample = SecondSample {
+        interval_secs: interval,
+        bytes: sec.bytes,
+        dropped: u32::try_from(sec.dropped).unwrap_or(u32::MAX),
+        fps: sec.frames as f32 / interval as f32,
     };
 
     total.add(sec);
@@ -1042,6 +1428,7 @@ fn report_if_due(
     }
     sec.reset();
     *last_report = now;
+    Some(sample)
 }
 
 /// 把 dirty/move 矩形规约成"需要重新哈希的块下标"（升序、去重）。
@@ -1146,6 +1533,8 @@ struct CursorTracker {
     origin: (i32, i32),
     /// 采集画面尺寸
     region: (u32, u32),
+    /// 自适应降分辨率时的坐标缩放（1.0 = 原生）；客户端画面也被缩到这个尺寸
+    scale: f32,
 }
 
 impl CursorTracker {
@@ -1156,6 +1545,7 @@ impl CursorTracker {
             last_shape: None,
             origin,
             region,
+            scale: 1.0,
         }
     }
 
@@ -1163,10 +1553,18 @@ impl CursorTracker {
         self.watcher.stats()
     }
 
-    /// 采集器重建 / 分辨率变化时更新映射口径。
-    fn set_mapping(&mut self, origin: (i32, i32), region: (u32, u32)) {
+    /// 采集器重建 / 分辨率变化 / 自适应缩放变化时更新映射口径。
+    fn set_mapping(&mut self, origin: (i32, i32), region: (u32, u32), scale: f32) {
         self.origin = origin;
         self.region = region;
+        self.scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        // 口径变了：下一帧无条件把所有状态重发一遍
+        self.last_pos = None;
+        self.last_shape = None;
     }
 
     /// 主循环每轮调一次；只有真的有变化才发消息（静止时 0 字节）。
@@ -1175,7 +1573,8 @@ impl CursorTracker {
             return Ok(());
         };
 
-        let ((sx, sy), inside) = map_cursor_pos((state.x, state.y), self.origin, self.region);
+        let ((sx, sy), inside) =
+            map_cursor_pos((state.x, state.y), self.origin, self.region, self.scale);
         let pos = (clamp_i16(sx), clamp_i16(sy), state.visible && inside);
         if self.last_pos != Some(pos) {
             let payload = Message::CursorPos(CursorPos {
@@ -1249,13 +1648,21 @@ fn map_cursor_pos(
     desk: (i32, i32),
     origin: (i32, i32),
     region: (u32, u32),
+    scale: f32,
 ) -> ((i32, i32), bool) {
-    let local_x = desk.0.saturating_sub(origin.0);
-    let local_y = desk.1.saturating_sub(origin.1);
-    let inside = local_x >= 0
-        && local_y >= 0
-        && (local_x as u32) < region.0
-        && (local_y as u32) < region.1;
+    let s = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    // 先按原生像素判断是否在采集区域内（region 是缩放后的尺寸 → 换算回原生再比）
+    let raw_x = desk.0.saturating_sub(origin.0);
+    let raw_y = desk.1.saturating_sub(origin.1);
+    let native_w = (region.0 as f32 / s).round().max(1.0) as i32;
+    let native_h = (region.1 as f32 / s).round().max(1.0) as i32;
+    let local_x = (raw_x as f32 * s).round() as i32;
+    let local_y = (raw_y as f32 * s).round() as i32;
+    let inside = raw_x >= 0 && raw_y >= 0 && raw_x < native_w && raw_y < native_h;
     if inside {
         return ((local_x, local_y), true);
     }
@@ -1342,18 +1749,18 @@ mod tests {
     #[test]
     fn cursor_mapping_single_screen() {
         // 单屏 1920x1080，origin=(0,0)
-        let ((x, y), inside) = map_cursor_pos((100, 200), (0, 0), (1920, 1080));
+        let ((x, y), inside) = map_cursor_pos((100, 200), (0, 0), (1920, 1080), 1.0);
         assert_eq!((x, y), (100, 200));
         assert!(inside);
         // 右下角最后一个像素仍算在内
-        let ((x, y), inside) = map_cursor_pos((1919, 1079), (0, 0), (1920, 1080));
+        let ((x, y), inside) = map_cursor_pos((1919, 1079), (0, 0), (1920, 1080), 1.0);
         assert_eq!((x, y), (1919, 1079));
         assert!(inside);
         // 刚好越界一个像素
-        let ((x, _), inside) = map_cursor_pos((1920, 0), (0, 0), (1920, 1080));
+        let ((x, _), inside) = map_cursor_pos((1920, 0), (0, 0), (1920, 1080), 1.0);
         assert_eq!(x, 1919);
         assert!(!inside);
-        let ((_, y), inside) = map_cursor_pos((0, 1080), (0, 0), (1920, 1080));
+        let ((_, y), inside) = map_cursor_pos((0, 1080), (0, 0), (1920, 1080), 1.0);
         assert_eq!(y, 1079);
         assert!(!inside);
     }
@@ -1363,19 +1770,42 @@ mod tests {
         // 双屏并排：采集第 2 块屏，origin=(1920,0)
         let origin = (1920, 0);
         let region = (1920u32, 1080u32);
-        let ((x, y), inside) = map_cursor_pos((1920, 0), origin, region);
+        let ((x, y), inside) = map_cursor_pos((1920, 0), origin, region, 1.0);
         assert_eq!((x, y), (0, 0));
         assert!(inside);
-        let ((x, y), inside) = map_cursor_pos((3839, 1079), origin, region);
+        let ((x, y), inside) = map_cursor_pos((3839, 1079), origin, region, 1.0);
         assert_eq!((x, y), (1919, 1079));
         assert!(inside);
         // 光标跑到第 1 块屏 → 本地坐标为负、不在画面内
-        let ((x, y), inside) = map_cursor_pos((1000, 500), origin, region);
+        let ((x, y), inside) = map_cursor_pos((1000, 500), origin, region, 1.0);
         assert_eq!((x, y), (0, 500));
         assert!(!inside);
         // 坐标负得更多也不会溢出
-        let ((x, _), inside) = map_cursor_pos((i32::MIN, 0), origin, region);
+        let ((x, _), inside) = map_cursor_pos((i32::MIN, 0), origin, region, 1.0);
         assert_eq!(x, 0);
+        assert!(!inside);
+    }
+
+    #[test]
+    fn cursor_mapping_with_resolution_scale() {
+        // 原生 1920x1080，自适应缩到 1600x896（scale=0.8333），客户端画面是 1600x896
+        let scale = 1600.0f32 / 1920.0;
+        let region = (1600u32, 896u32);
+        let origin = (0, 0);
+        // 原生左上角 → 缩放画面左上角
+        let ((x, y), inside) = map_cursor_pos((0, 0), origin, region, scale);
+        assert_eq!((x, y), (0, 0));
+        assert!(inside);
+        // 原生 (960, 540) 屏幕中心 → 缩放画面中心 (800, 448)
+        let ((x, y), inside) = map_cursor_pos((960, 540), origin, region, scale);
+        assert_eq!((x, y), (800, 450));
+        assert!(inside);
+        // 原生右下角前一像素 → 缩放画面内
+        let ((x, y), inside) = map_cursor_pos((1919, 1079), origin, region, scale);
+        assert!(inside, "({x},{y})");
+        assert!(x <= 1600 && y <= 896);
+        // 原生越界（另一块屏）→ 不在画面内
+        let ((_, _), inside) = map_cursor_pos((2000, 500), origin, region, scale);
         assert!(!inside);
     }
 
@@ -1407,6 +1837,185 @@ mod tests {
         assert_eq!(clamp_i16(-1920), -1920);
     }
 
+    // ---------------------------------------------------- 自适应控制器集成
+    fn test_args() -> Args {
+        Args {
+            listen: "127.0.0.1:0".to_string(),
+            password: "1".to_string(),
+            display: 0,
+            fps: 30,
+            quality: 85,
+            stats: false,
+            video: crate::cli::VideoChoice::Auto,
+            video_bitrate: 4_000_000,
+            video_max_fps: 30,
+            budget_bps: 2_000_000,
+        }
+    }
+
+    fn ctrl(budget: u32) -> Controller {
+        Controller::new(ControllerConfig {
+            link_budget_bps: budget,
+            video_enabled: true,
+            ..ControllerConfig::default()
+        })
+    }
+
+    fn over_stats() -> LinkStats {
+        // 8 Mbps（预算 2M 的 4 倍），高变化比例，无丢帧
+        LinkStats {
+            bytes_sent: 1_000_000,
+            inflight_bytes: 0,
+            rtt_ms: 20,
+            dropped_frames: 0,
+            changed_ratio: 0.9,
+            fps: 30.0,
+        }
+    }
+
+    fn slack_stats() -> LinkStats {
+        // 80 kbps，几乎静止
+        LinkStats {
+            bytes_sent: 10_000,
+            inflight_bytes: 0,
+            rtt_ms: 5,
+            dropped_frames: 0,
+            changed_ratio: 0.0,
+            fps: 30.0,
+        }
+    }
+
+    #[test]
+    fn adapt_targets_degrade_monotonically_under_overload() {
+        let args = test_args();
+        let mut c = ctrl(args.budget_bps);
+        let mut adapt = AdaptState::new(&args);
+        let mut prev_fps = adapt.fps_limit;
+        let mut prev_q = adapt.block_quality;
+        let mut prev_scale = adapt.scale;
+        for _ in 0..15 {
+            let t = c.on_tick(&over_stats(), 1000);
+            adapt.level = c.level();
+            adapt.stage = c.stage();
+            adapt.apply(&t, &args, true);
+            assert!(adapt.fps_limit <= prev_fps, "fps 不应回升");
+            assert!(adapt.block_quality <= prev_q, "质量不应回升");
+            assert!(adapt.scale <= prev_scale + 1e-6, "scale 不应变大");
+            prev_fps = adapt.fps_limit;
+            prev_q = adapt.block_quality;
+            prev_scale = adapt.scale;
+        }
+        assert!(
+            adapt.level > 0,
+            "持续超预算必须降档（level={}）",
+            adapt.level
+        );
+        assert!(adapt.fps_limit < 30, "fps 必须降下来：{}", adapt.fps_limit);
+        assert!(adapt.block_quality < 85, "质量必须降下来：{}", adapt.block_quality);
+    }
+
+    #[test]
+    fn adapt_targets_recover_monotonically_under_slack() {
+        let args = test_args();
+        let mut c = ctrl(args.budget_bps);
+        let mut adapt = AdaptState::new(&args);
+        // 先压到低档
+        for _ in 0..15 {
+            let t = c.on_tick(&over_stats(), 1000);
+            adapt.level = c.level();
+            adapt.apply(&t, &args, true);
+        }
+        let low_level = adapt.level;
+        assert!(low_level > 0);
+        let mut prev_fps = adapt.fps_limit;
+        let mut prev_q = adapt.block_quality;
+        let mut prev_level = adapt.level;
+        for _ in 0..60 {
+            let t = c.on_tick(&slack_stats(), 1000);
+            adapt.level = c.level();
+            adapt.stage = c.stage();
+            adapt.apply(&t, &args, true);
+            assert!(adapt.fps_limit >= prev_fps, "fps 不应再降");
+            assert!(adapt.block_quality >= prev_q, "质量不应再降");
+            assert!(adapt.level <= prev_level, "档位不应再升（数值越小越好）");
+            prev_fps = adapt.fps_limit;
+            prev_q = adapt.block_quality;
+            prev_level = adapt.level;
+        }
+        assert_eq!(adapt.level, 0, "链路富余 60 秒应回到 0 档");
+        assert_eq!(adapt.fps_limit, 30);
+        assert_eq!(adapt.block_quality, 85);
+        assert!(!adapt.scale_active(), "应恢复原生分辨率");
+    }
+
+    #[test]
+    fn adapt_never_exceeds_user_fps_cap() {
+        let mut args = test_args();
+        args.fps = 20; // 用户显式上限 20
+        let mut adapt = AdaptState::new(&args);
+        let target = Target::default_blocks(); // fps 30
+        adapt.apply(&target, &args, true);
+        assert_eq!(adapt.fps_limit, 20, "--fps 必须是硬上限");
+    }
+
+    #[test]
+    fn adapt_disabled_keeps_original_params() {
+        let mut args = test_args();
+        args.budget_bps = 0;
+        let adapt = AdaptState::new(&args);
+        assert!(!adapt.enabled);
+        assert_eq!(adapt.fps_limit, args.fps);
+        assert_eq!(adapt.block_quality, args.quality);
+        assert_eq!(adapt.scale, 1.0);
+        assert_eq!(adapt.video_bitrate, args.video_bitrate);
+    }
+
+    #[test]
+    fn scaled_dims_snap_to_block_grid() {
+        assert_eq!(scaled_dims(1920, 1080, 1.0), (1920, 1080));
+        let (w, h) = scaled_dims(1920, 1080, 0.83);
+        assert_eq!(w % 64, 0);
+        assert_eq!(h % 64, 0);
+        assert_eq!((w, h), (1600, 896));
+        let (w, h) = scaled_dims(1920, 1080, 0.67);
+        assert_eq!((w, h), (1280, 704));
+        // 极端缩放也不出 0
+        let (w, h) = scaled_dims(1920, 1080, 0.0);
+        assert!(w >= 64 && h >= 64);
+    }
+
+    #[test]
+    fn downscale_box_filter_averages() {
+        let (w, h) = (4u32, 4u32);
+        let stride = w as usize * 4;
+        let mut src = vec![0u8; stride * h as usize];
+        for y in 0..4usize {
+            for x in 0..4usize {
+                let v: u8 = match (x < 2, y < 2) {
+                    (true, true) => 100,
+                    (false, true) => 200,
+                    (true, false) => 50,
+                    (false, false) => 0,
+                };
+                let o = y * stride + x * 4;
+                src[o] = v;
+                src[o + 1] = v;
+                src[o + 2] = v;
+                src[o + 3] = 255;
+            }
+        }
+        let mut dst = Vec::new();
+        assert!(downscale_bgra(&src, stride, 4, 4, &mut dst, 2, 2));
+        assert_eq!(dst.len(), 2 * 2 * 4);
+        // 2x2 -> 1x1：每块正好 4 个像素平均
+        assert_eq!(&dst[0..4], &[100, 100, 100, 255]);
+        assert_eq!(&dst[4..8], &[200, 200, 200, 255]);
+        assert_eq!(&dst[8..12], &[50, 50, 50, 255]);
+        assert_eq!(&dst[12..16], &[0, 0, 0, 255]);
+        // 非法尺寸直接失败，不 panic
+        assert!(!downscale_bgra(&src, stride, 4, 4, &mut dst, 0, 2));
+    }
+
     #[test]
     fn stats_line_has_all_keys() {
         let zero = Stats::default();
@@ -1421,6 +2030,9 @@ mod tests {
             "idle_frames=",
             "dropped=",
             "sec_bytes=",
+            "level=",
+            "stage=",
+            "scale=",
         ] {
             assert!(line.contains(key), "统计行缺少 {key}: {line}");
         }
