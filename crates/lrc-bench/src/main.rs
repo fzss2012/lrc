@@ -211,7 +211,10 @@ fn run() -> Result<()> {
     };
 
     println!("=== lrc-bench：离线真内容带宽基准 ===");
-    println!("帧源   : {source}");
+    println!(
+        "帧源   : {source}（xxh3_64={:016x}，换帧后数字不可直接比）",
+        xxhash_rust::xxh3::xxh3_64(&base.data)
+    );
     if !is_real {
         println!("         ⚠ 用的是合成桌面帧，数字只反映管线行为，不代表真实桌面内容");
     }

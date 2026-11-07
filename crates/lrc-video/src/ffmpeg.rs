@@ -145,6 +145,11 @@ pub fn decode_command_line(codec: &str, ffmpeg: &Path) -> Vec<String> {
         "0".into(),
         "-probesize".into(),
         "32".into(),
+        // 关键：默认帧级多线程会让解码器先攒 N 帧才出画面（活管道上看起来就是"永远没输出"）
+        "-threads".into(),
+        "1".into(),
+        // 注意：不要用 -c:v hevc_cuvid（NVDEC）。实测它内部攒帧，
+        // 在"一次喂一个 AU、同步等画面"的模式下会卡住；软解 -threads 1 才是确定性的。
         "-f".into(),
         if is_hevc(codec) { "hevc".into() } else { "h264".into() },
         "-i".into(),
@@ -498,6 +503,80 @@ fn au_has_vcl(au: &[u8], hevc: bool) -> bool {
     false
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> EncoderConfig {
+        EncoderConfig {
+            bitrate_bps: 4_000_000,
+            gop: 60,
+            fps: 30,
+            codec: "hevc_nvenc".into(),
+            ffmpeg_path: None,
+        }
+    }
+
+    #[test]
+    fn encoder_cmdline_has_low_latency_flags() {
+        let line = encode_command_line(&cfg(), 1920, 1080, Path::new("ffmpeg")).join(" ");
+        // 这几个参数少一个延迟/帧率就会崩，必须钉住
+        assert!(line.contains("-delay 0"), "缺 -delay 0（nvenc 异步深度）");
+        assert!(line.contains("-zerolatency 1"));
+        assert!(line.contains("-bf 0"));
+        assert!(line.contains("-flush_packets 1"));
+        assert!(line.contains("-s 1920x1080"));
+        assert!(line.contains("-f hevc pipe:1"));
+        assert!(!line.contains("aud=insert"), "AUD bsf 会改变分帧，不该再用");
+    }
+
+    #[test]
+    fn decoder_cmdline_has_single_thread() {
+        let line = decode_command_line("hevc", Path::new("ffmpeg")).join(" ");
+        // -threads 1：帧级多线程会攒帧，活管道上看起来就是"永远没有输出"
+        assert!(line.contains("-threads 1"));
+        assert!(!line.contains("+nobuffer"), "解码端加 nobuffer 会丢第一个 AU");
+        assert!(line.contains("-probesize 32"));
+        assert!(line.contains("-f rawvideo"));
+    }
+
+    #[test]
+    fn h264_and_hevc_use_different_demuxers() {
+        let hevc = encode_command_line(&cfg(), 640, 480, Path::new("ffmpeg")).join(" ");
+        let mut c = cfg();
+        c.codec = "h264_nvenc".into();
+        let h264 = encode_command_line(&c, 640, 480, Path::new("ffmpeg")).join(" ");
+        assert!(hevc.contains("-f hevc"));
+        assert!(h264.contains("-f h264"));
+        assert!(decode_command_line("hevc", Path::new("f")).join(" ").contains("-f hevc"));
+        assert!(decode_command_line("h264", Path::new("f")).join(" ").contains("-f h264"));
+    }
+
+    /// 一个最小的 HEVC AU：VPS/SPS/PPS + IDR slice
+    fn hevc_au(idr: bool) -> Vec<u8> {
+        let mut v = Vec::new();
+        for t in [32u8, 33, 34] {
+            v.extend_from_slice(&[0, 0, 0, 1, t << 1, 0x01]);
+        }
+        let nal_type: u8 = if idr { 19 } else { 1 };
+        v.extend_from_slice(&[0, 0, 0, 1, nal_type << 1, 0x01, 0xAA]);
+        v
+    }
+
+    #[test]
+    fn keyframe_and_vcl_detection() {
+        let idr = hevc_au(true);
+        let p = hevc_au(false);
+        assert!(au_has_vcl(&idr, true));
+        assert!(au_has_vcl(&p, true));
+        assert!(au_is_keyframe(&idr, true));
+        assert!(!au_is_keyframe(&p, true));
+        // 只有参数集、没有 slice
+        let params_only = vec![0u8, 0, 0, 1, 32 << 1, 1, 0, 0, 1, 33 << 1, 1];
+        assert!(!au_has_vcl(&params_only, true));
+    }
+}
+
 /// 用 ffmpeg + NVENC 的编码器。
 pub struct FfmpegEncoder {
     proc: PipeChild,
@@ -532,7 +611,7 @@ impl FfmpegEncoder {
             cmdline,
             pack: Vec::new(),
             // 收尾静默窗口：太短会把一个 AU 切成两半，太长白加延迟
-            idle: Duration::from_micros(env_us("LRC_VIDEO_IDLE_US", 1200)),
+            idle: Duration::from_micros(env_us("LRC_VIDEO_IDLE_US", 600)),
             last_keyframe: false,
             au_count: 0,
             force_keyframe: false,

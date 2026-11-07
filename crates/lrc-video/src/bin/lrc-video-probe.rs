@@ -129,7 +129,6 @@ struct Frames {
     out: Vec<u8>,
     col: Vec<i32>,
     row: Vec<i32>,
-    rng: u32,
 }
 
 impl Frames {
@@ -141,7 +140,6 @@ impl Frames {
             out: vec![0u8; w as usize * h as usize * 4],
             col: Vec::with_capacity(w as usize),
             row: Vec::with_capacity(h as usize),
-            rng: 0x1234_5678,
         };
         f.base = f.load_base();
         f
@@ -198,19 +196,12 @@ impl Frames {
         v
     }
 
-    fn next_rng(&mut self) -> u32 {
-        // xorshift32：确定性、够用
-        let mut x = self.rng;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.rng = x;
-        x
-    }
-
+    /// 真实场景更像"桌面上有个视频窗口在播"：底色是静态桌面，只有一块区域全帧变化。
     fn fill_video(&mut self, t: usize) {
         let w = self.w as usize;
         let h = self.h as usize;
+        // 先把静态桌面铺上
+        self.out.copy_from_slice(&self.base);
         let tf = t as i32;
         // 列/行 LUT：避免 200 万次 sin
         self.col.clear();
@@ -223,30 +214,31 @@ impl Frames {
             let v = ((y as i32 * 17 - tf * 5) / 71 % 128) - 64;
             self.row.push(v);
         }
+        // 视频窗口区域（约占屏幕 40%），全帧变化
+        let (vx0, vy0) = (300usize, 120usize);
+        let (vx1, vy1) = ((vx0 + 1280).min(w), (vy0 + 720).min(h));
         let out = &mut self.out;
-        for y in 0..h {
+        for y in vy0..vy1 {
             let ry = self.row[y];
-            let base_g = 110 + ry;
-            for x in 0..w {
-                let v = ry * self.col[x] / 64; // -64..64
+            for x in vx0..vx1 {
+                let v = ry * self.col[x] / 64;
                 let i = (y * w + x) * 4;
                 out[i] = (100 + v).clamp(0, 255) as u8;
-                out[i + 1] = (base_g + v / 2).clamp(0, 255) as u8;
+                out[i + 1] = (110 + ry + v / 2).clamp(0, 255) as u8;
                 out[i + 2] = (140 + v / 3).clamp(0, 255) as u8;
-                out[i + 3] = 255;
             }
         }
-        // 几条移动的色块（模拟画面里的物体）
-        for k in 0..4usize {
-            let bx = ((t * (17 + k * 11) + k * 300) % w.saturating_sub(260).max(1)) as usize;
-            let by = ((t * (9 + k * 5) + k * 170) % h.saturating_sub(180).max(1)) as usize;
+        // 窗口里两条移动色块
+        for k in 0..2usize {
+            let bx = vx0 + ((t * (17 + k * 11) + k * 300) % (vx1 - vx0).saturating_sub(260).max(1));
+            let by = vy0 + ((t * (9 + k * 5) + k * 170) % (vy1 - vy0).saturating_sub(180).max(1));
             let col = [
                 (60 + k * 40) as u8,
                 (200 - k * 30) as u8,
                 (120 + k * 20) as u8,
             ];
-            for y in by..(by + 180).min(h) {
-                for x in bx..(bx + 260).min(w) {
+            for y in by..(by + 180).min(vy1) {
+                for x in bx..(bx + 260).min(vx1) {
                     let i = (y * w + x) * 4;
                     out[i] = col[0];
                     out[i + 1] = col[1];
@@ -341,6 +333,7 @@ fn avg(v: &[u64]) -> f64 {
 struct Row {
     scenario: &'static str,
     frames: usize,
+    #[allow(dead_code)]
     bytes: u64,
     kbps: f64,
     enc_avg: f64,
