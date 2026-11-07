@@ -65,6 +65,11 @@ scripts/verify-p2p-lossy.ps1  → 通过
 
 ### 2.0 先决条件：**安全组必须放行 UDP 7801**
 
+> **已确证（2026-11-07 重装后实测）**：这台腾讯云机器**入站 UDP 全部不通**，TCP 正常。
+> 证据：在 VPS 上用 `tcpdump` 抓包 + Python 监听多端口，从 Windows 各打 3–8 个 UDP 包到 **7801 / 3478 / 45000，三个端口全部 0 个到达**；
+> 同一时刻 **TCP 7800 从 Windows 连接成功**；VPS 内 `ufw inactive`、`iptables INPUT ACCEPT` 说明不是本机防火墙。
+> → 结论：**安全组里一条 UDP 入站规则都没有**，必须手动加。
+
 这是本次唯一没走通的一环，**务必先做**：
 
 - 腾讯云控制台 → 云服务器/轻量 → 防火墙/安全组 → **入站规则** → 添加：
@@ -233,27 +238,30 @@ target\release\lrc-client.exe --password 1234 --stats ^
 
 | 步骤 | 结果 |
 |---|---|
-| SSH 登录 | ✅ `ubuntu` 用户可登录（`root` 被拒）；ping 39 ms；Ubuntu 24.04.4 LTS / 2 vCPU / 3.7 GB / 69 GB |
+| SSH 登录 | ✅ `ubuntu` 用户可登录（`root` 被拒）；ping 38–40 ms；Ubuntu 24.04.4 LTS / 2 vCPU / 3.7 GB / 69 GB |
 | 安装 Rust | ✅ 1.99.1（中科大镜像）；**直连 crates.io 卡死 20 分钟，换 rsproxy 后正常** |
 | 上传 + 编译 | ✅ `cargo build --release -p lrc-relay` 29.17 s，产物 9,384,544 字节 |
 | 启动 relay | ✅ 监听 `0.0.0.0:7801`，日志正常，`ss -lunp` 可见 |
-| **Windows → VPS 信令** | ❌ **`REGISTER` 超时 10 s**，host 日志：`relay: IO REGISTER room=1 超时（relay 118.24.79.47:7801 没响应）`，随后回退 TCP |
-| UDP 可达性确认 | ⚠️ **未完成**（tcpdump 那次抓包时 relay 二进制已不存在，且 tcpdump 输出有缓冲，无法据此下结论） |
+| **Windows → VPS 信令（重装前）** | ❌ `REGISTER` 超时 10 s，host 回退 TCP |
+| **重装后完整部署** | ✅ Rust 1.99.1、源码上传、`cargo build --release -p lrc-relay` **28.35 s**、systemd 服务 `active`、`ss -lunp` 见 `0.0.0.0:7801` |
+| **UDP 入站可达性** | ❌ **确证不通**：tcpdump 抓包 + 多端口 Python 监听，从 Windows 打 UDP 到 7801/3478/45000 → **全部 0 个到达**；同时 **TCP 7800 连接成功**；VPS 内 `ufw inactive`、`iptables INPUT ACCEPT` |
+| 结论 | **只差安全组放行 UDP 入站**。代码/服务侧已完全就绪，加完规则即可做真实打洞测试 |
 
-### 一个未解释的现象
-
-最后一次检查时：
+### 重装后的最终状态（2026-11-07 20:30 左右）
 
 ```
-nohup: failed to run command '/home/ubuntu/lrc/relay-src/target/release/lrc-relay': No such file or directory
+systemctl is-active lrc-relay  → active（Restart=always，开机自启）
+ss -lunp | grep 7801           → UNCONN 0.0.0.0:7801 (lrc-relay, pid=14424)
+二进制                         → /home/ubuntu/lrc/relay-src/target/release/lrc-relay (9,384,544 B)
+日志                           → /home/ubuntu/relay.log（"lrc-relay 监听 0.0.0.0:7801（room_ttl=60s）"）
 ```
 
-即**之前编好的二进制不见了**。最可能是你已经开始重装 / 家目录被清空。若重装后还遇到"编好的文件消失"，请先确认不是在别的用户目录或别的 shell 会话里编的。
+**服务端已经全部就绪，唯一缺的是安全组放行 UDP 7801。**
 
 ### 结论
 
-**"能不能跑通"取决于安全组是否放行 UDP 7801，这一点本次没有验证成功。**
-新系统重装后，请严格按 §2.0 → §2.7 的顺序走，先确认 tcpdump 能看到包，再谈打洞。
+**"能不能跑通"完全取决于安全组是否放行 UDP 入站，这一点已确证是当前唯一的阻塞点。**
+放行后再按 §2.7 用 tcpdump 复核一次，然后跑 §2.8 的打洞测试。
 
 ---
 
