@@ -1,0 +1,21 @@
+[Unit]
+Description=lrc-relay (P2P 信令 + UDP 中继)
+Documentation=file:///home/ubuntu/lrc/relay-src/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+ExecStart=/home/ubuntu/lrc/relay-src/target/release/lrc-relay --udp 0.0.0.0:7801 --stats
+Restart=always
+RestartSec=2
+# 崩溃时把 backtrace 留下来，方便定位
+Environment=RUST_BACKTRACE=1
+Environment=RUST_LOG=info
+StandardOutput=append:/home/ubuntu/relay.log
+StandardError=append:/home/ubuntu/relay.log
+
+[Install]
+WantedBy=multi-user.target

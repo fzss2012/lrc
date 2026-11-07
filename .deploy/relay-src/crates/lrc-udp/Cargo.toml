@@ -1,0 +1,13 @@
+[package]
+name = "lrc-udp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+thiserror.workspace = true
+
+# Windows 下用 setsockopt 调大 socket 缓冲；Linux 走默认值（跨平台是为了让 lrc-relay 能跑在 Linux VPS 上）
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Networking_WinSock"] }

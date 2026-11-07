@@ -6,6 +6,8 @@
 #>
 param(
     [int]$RelayPort = 7801,
+    # relay 地址：本机自测填 127.0.0.1（脚本会自己起 relay）；跨公网填 VPS 公网 IP（脚本不起本地 relay）
+    [string]$RelayHost = "127.0.0.1",
     [int]$Room = 1,
     [int]$HostDisplay = 1,
     [int]$PatternTargetX = 1920,
@@ -30,13 +32,20 @@ function Run-Phase([string]$p2p, [string]$tag) {
     foreach ($f in @($relayOut, $hostOut, $clientOut)) { if (Test-Path $f) { Remove-Item $f -Force } }
 
     Write-Host ("== 阶段 [{0}] p2p={1} ==" -f $tag, $p2p) -ForegroundColor Cyan
-    $relay = Start-Process -FilePath (Join-Path $root 'target\release\lrc-relay.exe') -PassThru -WindowStyle Hidden -ArgumentList @('--udp', "127.0.0.1:$RelayPort", '--stats') -RedirectStandardOutput $relayOut -RedirectStandardError (Join-Path $cap "p2p-$tag-relay.err")
-    Start-Sleep -Milliseconds 800
+    $relay = $null
+    if ($RelayHost -eq '127.0.0.1' -or $RelayHost -eq 'localhost') {
+        $relay = Start-Process -FilePath (Join-Path $root 'target\release\lrc-relay.exe') -PassThru -WindowStyle Hidden -ArgumentList @('--udp', "127.0.0.1:$RelayPort", '--stats') -RedirectStandardOutput $relayOut -RedirectStandardError (Join-Path $cap "p2p-$tag-relay.err")
+        Start-Sleep -Milliseconds 800
+    } else {
+        Write-Host ("  使用远端 relay {0}:{1}（本地不起 relay）" -f $RelayHost, $RelayPort)
+        Set-Content -Path $relayOut -Value '' -Encoding UTF8
+    }
 
-    $hostProc = Start-Process -FilePath (Join-Path $root 'target\release\lrc-host.exe') -PassThru -WindowStyle Hidden -ArgumentList @('--password', $Password, '--display', "$HostDisplay", '--stats', '--audio', 'off', '--signal', "127.0.0.1:$RelayPort", '--room', "$Room", '--p2p', $p2p) -RedirectStandardOutput $hostOut -RedirectStandardError (Join-Path $cap "p2p-$tag-host.err")
+    $signalAddr = $RelayHost + ':' + $RelayPort
+    $hostProc = Start-Process -FilePath (Join-Path $root 'target\release\lrc-host.exe') -PassThru -WindowStyle Hidden -ArgumentList @('--password', $Password, '--display', "$HostDisplay", '--stats', '--audio', 'off', '--signal', $signalAddr, '--room', "$Room", '--p2p', $p2p) -RedirectStandardOutput $hostOut -RedirectStandardError (Join-Path $cap "p2p-$tag-host.err")
     Start-Sleep -Milliseconds 1200
     # --connect 仍要给（TCP 兜底地址），但 P2P 成功时不会用到
-    $clientProc = Start-Process -FilePath (Join-Path $root 'target\release\lrc-client.exe') -PassThru -ArgumentList @('--connect', "127.0.0.1:7800", '--password', $Password, '--stats', '--audio', 'off', '--signal', "127.0.0.1:$RelayPort", '--room', "$Room", '--p2p', $p2p, '--title', "p2p-$tag") -RedirectStandardOutput $clientOut -RedirectStandardError (Join-Path $cap "p2p-$tag-client.err")
+    $clientProc = Start-Process -FilePath (Join-Path $root 'target\release\lrc-client.exe') -PassThru -ArgumentList @('--connect', "127.0.0.1:7800", '--password', $Password, '--stats', '--audio', 'off', '--signal', $signalAddr, '--room', "$Room", '--p2p', $p2p, '--title', "p2p-$tag") -RedirectStandardOutput $clientOut -RedirectStandardError (Join-Path $cap "p2p-$tag-client.err")
 
     Start-Sleep -Seconds $Seconds
     Stop-All

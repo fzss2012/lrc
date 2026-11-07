@@ -30,7 +30,9 @@
 | `lrc-bench` | 离线带宽基准（真实桌面帧 + 五种场景） |
 | `lrc-video` | （M2）NVENC 视频通道 |
 
-设计与线格式见 `docs/DESIGN.md`，里程碑见 `docs/ROADMAP.md`。
+设计与线格式见 `docs/DESIGN.md`，里程碑见 `docs/ROADMAP.md`，
+使用手册见 `docs/USAGE.md`，实测数据见 `docs/MEASUREMENTS.md`，
+**VPS 部署（lrc-relay）见 `docs/VPS-DEPLOY.md`**（含本次腾讯云部署的真实记录与排障清单）。
 
 ## 快速开始
 

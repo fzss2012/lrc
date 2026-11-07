@@ -782,6 +782,7 @@ fn read_u16(b: &[u8]) -> u16 {
 ///
 /// 这不是"锦上添花"：1 MB 级别的突发在 64 KB 的接收缓冲上会直接被内核丢掉，
 /// 属于真丢包 —— 调大 RCVBUF 比改统计口径更能改善弱网/大帧体验。
+#[cfg(windows)]
 fn tune_socket_buffers(socket: &UdpSocket) {
     use std::os::windows::io::AsRawSocket;
     use windows::Win32::Networking::WinSock::{
@@ -796,6 +797,11 @@ fn tune_socket_buffers(socket: &UdpSocket) {
         }
     }
 }
+
+/// Linux/其他平台：std 没有暴露 setsockopt，保持系统默认缓冲（Linux 默认 rcvbuf 约 208 KB，
+/// relay 只转发控制流与中继包，够用；真要调就改 `net.core.rmem_max` + `net.core.rmem_default`）。
+#[cfg(not(windows))]
+fn tune_socket_buffers(_socket: &UdpSocket) {}
 
 /// 序号环形比较：a 是否在 b 之前。
 fn seq_lt(a: u32, b: u32) -> bool {
