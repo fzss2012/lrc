@@ -52,6 +52,25 @@ impl Default for VideoLine {
     }
 }
 
+/// 传输路径信息（M4）：TCP 时 udp_rtt/udp_loss 恒 0。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathLine {
+    /// "tcp" | "direct_udp" | "relay_udp"
+    pub path: &'static str,
+    pub rtt_ms: u32,
+    pub loss_permille: u16,
+}
+
+impl Default for PathLine {
+    fn default() -> Self {
+        Self {
+            path: "tcp",
+            rtt_ms: 0,
+            loss_permille: 0,
+        }
+    }
+}
+
 impl Stats {
     pub fn add(&mut self, other: &Stats) {
         self.frames += other.frames;
@@ -85,20 +104,26 @@ pub fn format_line(
     session_secs: f64,
     interval_secs: f64,
     video: &VideoLine,
+    path: &PathLine,
 ) -> String {
     let interval = if interval_secs > 0.0 { interval_secs } else { 1.0 };
     let t = if session_secs > 0.0 { session_secs } else { 0.0 };
     let fps = sec.frames as f64 / interval;
     let kbps = (sec.bytes as f64 * 8.0 / 1000.0) / interval;
-    line(t, fps, sec.blocks, total, kbps, sec.idle, sec.bytes, video)
+    line(t, fps, sec.blocks, total, kbps, sec.idle, sec.bytes, video, path)
 }
 
 /// 会话结束时的总结行（同一套字段，fps/kbps 用整场平均值）。
-pub fn format_summary(total: &Stats, session_secs: f64, video: &VideoLine) -> String {
+pub fn format_summary(
+    total: &Stats,
+    session_secs: f64,
+    video: &VideoLine,
+    path: &PathLine,
+) -> String {
     let t = if session_secs > 0.0 { session_secs } else { 1.0 };
     let fps = total.frames as f64 / t;
     let kbps = (total.bytes as f64 * 8.0 / 1000.0) / t;
-    line(t, fps, total.blocks, total, kbps, total.idle, total.bytes, video)
+    line(t, fps, total.blocks, total, kbps, total.idle, total.bytes, video, path)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -111,9 +136,10 @@ fn line(
     idle_frames: u64,
     sec_bytes: u64,
     video: &VideoLine,
+    path: &PathLine,
 ) -> String {
     format!(
-        "t={t:.1} fps={fps:.1} blocks={blocks} sent_frames={} bytes={} kbps={kbps:.1} idle_frames={idle_frames} dropped={} sec_bytes={sec_bytes} cursor_msgs={} full_resends={} mode={} video_kbps={:.1} video_fps={:.1} level={} stage={} scale={:.2}",
+        "t={t:.1} fps={fps:.1} blocks={blocks} sent_frames={} bytes={} kbps={kbps:.1} idle_frames={idle_frames} dropped={} sec_bytes={sec_bytes} cursor_msgs={} full_resends={} mode={} video_kbps={:.1} video_fps={:.1} level={} stage={} scale={:.2} path={} udp_rtt={} udp_loss={}",
         total.frames,
         total.bytes,
         total.dropped,
@@ -124,7 +150,10 @@ fn line(
         video.fps,
         video.level,
         video.stage,
-        video.scale
+        video.scale,
+        path.path,
+        path.rtt_ms,
+        path.loss_permille
     )
 }
 
@@ -151,8 +180,8 @@ mod tests {
         total.dropped = 2;
         let sec = sec_sample();
         assert_eq!(
-            format_line(&total, &sec, 1.0, 1.0, &VideoLine::default()),
-            "t=1.0 fps=30.0 blocks=120 sent_frames=30 bytes=100000 kbps=800.0 idle_frames=5 dropped=2 sec_bytes=100000 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00"
+            format_line(&total, &sec, 1.0, 1.0, &VideoLine::default(), &PathLine::default()),
+            "t=1.0 fps=30.0 blocks=120 sent_frames=30 bytes=100000 kbps=800.0 idle_frames=5 dropped=2 sec_bytes=100000 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00 path=tcp udp_rtt=0 udp_loss=0"
         );
     }
 
@@ -167,10 +196,10 @@ mod tests {
             idle: 490,
             ..Stats::default()
         };
-        let line = format_line(&total, &sec, 12.0, 1.0, &VideoLine::default());
+        let line = format_line(&total, &sec, 12.0, 1.0, &VideoLine::default(), &PathLine::default());
         assert_eq!(
             line,
-            "t=12.0 fps=0.0 blocks=0 sent_frames=220 bytes=1234567 kbps=0.0 idle_frames=490 dropped=0 sec_bytes=0 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00"
+            "t=12.0 fps=0.0 blocks=0 sent_frames=220 bytes=1234567 kbps=0.0 idle_frames=490 dropped=0 sec_bytes=0 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00 path=tcp udp_rtt=0 udp_loss=0"
         );
         // 验收脚本按 kbps= 抓数
         assert!(line.contains("kbps=0.0"));
@@ -184,10 +213,10 @@ mod tests {
             bytes: 1_000,
             ..Stats::default()
         };
-        let line = format_line(&total, &total, 2.0, 2.0, &VideoLine::default());
+        let line = format_line(&total, &total, 2.0, 2.0, &VideoLine::default(), &PathLine::default());
         assert_eq!(
             line,
-            "t=2.0 fps=15.0 blocks=0 sent_frames=30 bytes=1000 kbps=4.0 idle_frames=0 dropped=0 sec_bytes=1000 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00"
+            "t=2.0 fps=15.0 blocks=0 sent_frames=30 bytes=1000 kbps=4.0 idle_frames=0 dropped=0 sec_bytes=1000 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00 path=tcp udp_rtt=0 udp_loss=0"
         );
     }
 
@@ -203,17 +232,17 @@ mod tests {
             full_resends: 1,
             capture_ms_sum: 200.0,
         };
-        let line = format_summary(&total, 10.0, &VideoLine::default());
+        let line = format_summary(&total, 10.0, &VideoLine::default(), &PathLine::default());
         assert_eq!(
             line,
-            "t=10.0 fps=10.0 blocks=500 sent_frames=100 bytes=10000 kbps=8.0 idle_frames=50 dropped=1 sec_bytes=10000 cursor_msgs=3 full_resends=1 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00"
+            "t=10.0 fps=10.0 blocks=500 sent_frames=100 bytes=10000 kbps=8.0 idle_frames=50 dropped=1 sec_bytes=10000 cursor_msgs=3 full_resends=1 mode=blocks video_kbps=0.0 video_fps=0.0 level=0 stage=原生 scale=1.00 path=tcp udp_rtt=0 udp_loss=0"
         );
     }
 
     #[test]
     fn zero_elapsed_is_safe() {
         let s = Stats::default();
-        let line = format_line(&s, &s, 0.0, 0.0, &VideoLine::default());
+        let line = format_line(&s, &s, 0.0, 0.0, &VideoLine::default(), &PathLine::default());
         assert!(line.starts_with("t=0.0 fps=0.0 "), "{line}");
     }
 

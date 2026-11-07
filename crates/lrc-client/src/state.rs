@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use lrc_proto::{DisplayInfo, Grid};
+use lrc_udp::UdpStats;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 
 /// 音频通道状态（--stats 的 audio= 字段）。
@@ -169,6 +170,10 @@ pub struct Shared {
     audio_rms_n: AtomicU64,
     /// host 上报的显示输出列表（DisplayList）
     displays: Mutex<Vec<DisplayInfo>>,
+    /// 当前链路路径（tcp / direct_udp / relay_udp），--stats 的 path= 用
+    link_path: Mutex<&'static str>,
+    /// UDP 链路质量（TCP 路径为 None）
+    udp: Mutex<Option<UdpStats>>,
 }
 
 impl Shared {
@@ -207,6 +212,8 @@ impl Shared {
             audio_rms_acc: AtomicU64::new(0),
             audio_rms_n: AtomicU64::new(0),
             displays: Mutex::new(Vec::new()),
+            link_path: Mutex::new("tcp"),
+            udp: Mutex::new(None),
         }
     }
 
@@ -514,6 +521,28 @@ impl Shared {
         lock_or_recover(&self.displays).clone()
     }
 
+    // ---- 链路路径 / UDP 质量 ----
+
+    /// 更新当前链路路径；切回 TCP 时清掉旧的 UDP 统计。
+    pub fn set_link_path(&self, path: &'static str) {
+        *lock_or_recover(&self.link_path) = path;
+        if path == "tcp" {
+            *lock_or_recover(&self.udp) = None;
+        }
+    }
+
+    pub fn link_path(&self) -> &'static str {
+        *lock_or_recover(&self.link_path)
+    }
+
+    pub fn set_udp_stats(&self, stats: UdpStats) {
+        *lock_or_recover(&self.udp) = Some(stats);
+    }
+
+    pub fn udp_stats(&self) -> Option<UdpStats> {
+        *lock_or_recover(&self.udp)
+    }
+
     pub fn add_recv_bytes(&self, n: u64) {
         self.recv_bytes.fetch_add(n, Ordering::Relaxed);
     }
@@ -777,6 +806,29 @@ mod tests {
         shared.audio_drop.fetch_add(1, Ordering::Relaxed);
         assert_eq!(shared.audio_pkts.load(Ordering::Relaxed), 3);
         assert_eq!(shared.audio_drop.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn link_path_and_udp_stats() {
+        let shared = Shared::new();
+        assert_eq!(shared.link_path(), "tcp");
+        assert!(shared.udp_stats().is_none());
+
+        shared.set_link_path("direct_udp");
+        assert_eq!(shared.link_path(), "direct_udp");
+        shared.set_udp_stats(UdpStats {
+            rtt_ms: 12.5,
+            loss_permille: 3,
+            ..Default::default()
+        });
+        let stats = shared.udp_stats().expect("udp stats");
+        assert!((stats.rtt_ms - 12.5).abs() < 1e-6);
+        assert_eq!(stats.loss_permille, 3);
+
+        // 回退 TCP：路径变 tcp，旧的 UDP 统计要清掉
+        shared.set_link_path("tcp");
+        assert_eq!(shared.link_path(), "tcp");
+        assert!(shared.udp_stats().is_none());
     }
 
     #[test]

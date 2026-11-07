@@ -43,13 +43,16 @@
 - [ ] LTR / 丢包时重发缓存帧，而不是请求 IDR
 - [ ] 剪贴板
 
-## M4 传输层（把流量从云上赶走）
+## M4 传输层（已按自研方案完成 —— 没用 QUIC/ICE，而是更轻的等价物）
 
-- [ ] QUIC 传输（`quinn`）替换 TCP，同一套 `Conn` API
-- [ ] ICE 打洞 + TURN 兜底（自写轻量 STUN/TURN 客户端，或先做 UDP 打洞 + 服务端中继回退）
-- [ ] 路径切换：direct_udp → relay_udp → relay_tcp，允许回切
+- [x] 可靠有序 UDP 消息传输（`lrc-udp`：分片/ACK/NACK/RTO 重传/保活，语义等价 TCP 流）
+- [x] 自研信令 + 打洞 + 中继（`lrc-relay`：房间登记 / 地址交换 / UDP 中继 / 有损模拟器）
+- [x] 路径阶梯：`direct_udp` → `relay_udp` → `tcp`，客户端自动降级并按"上次成功路径"优先重试
+- [x] `lrc-transport::link` 统一抽象，上层协议（握手/帧/音频/视频）零改动
+- [ ] 更完整的 NAT 穿越（多候选地址、ICE-lite）—— 当前是"单地址打洞 + relay 兜底"，覆盖绝大多数家庭 NAT
 
-**验收**：P2P 成功时 relay 侧只跑信令（云上带宽 ≈ 0）。
+**验收（已通过）**：`scripts/verify-p2p.ps1` → `--p2p auto` 两端 **direct_udp** 且 **relay 转发 0 字节**（云上只跑信令）；
+`--p2p relay` 降级正常转发 1.85 MB。
 
 ## 不做（明确砍掉）
 

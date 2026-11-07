@@ -35,7 +35,8 @@ function Run-Phase([string]$p2p, [string]$tag) {
 
     $hostProc = Start-Process -FilePath (Join-Path $root 'target\release\lrc-host.exe') -PassThru -WindowStyle Hidden -ArgumentList @('--password', $Password, '--display', "$HostDisplay", '--stats', '--audio', 'off', '--signal', "127.0.0.1:$RelayPort", '--room', "$Room", '--p2p', $p2p) -RedirectStandardOutput $hostOut -RedirectStandardError (Join-Path $cap "p2p-$tag-host.err")
     Start-Sleep -Milliseconds 1200
-    $clientProc = Start-Process -FilePath (Join-Path $root 'target\release\lrc-client.exe') -PassThru -ArgumentList @('--password', $Password, '--stats', '--audio', 'off', '--signal', "127.0.0.1:$RelayPort", '--room', "$Room", '--p2p', $p2p, '--title', "p2p-$tag") -RedirectStandardOutput $clientOut -RedirectStandardError (Join-Path $cap "p2p-$tag-client.err")
+    # --connect 仍要给（TCP 兜底地址），但 P2P 成功时不会用到
+    $clientProc = Start-Process -FilePath (Join-Path $root 'target\release\lrc-client.exe') -PassThru -ArgumentList @('--connect', "127.0.0.1:7800", '--password', $Password, '--stats', '--audio', 'off', '--signal', "127.0.0.1:$RelayPort", '--room', "$Room", '--p2p', $p2p, '--title', "p2p-$tag") -RedirectStandardOutput $clientOut -RedirectStandardError (Join-Path $cap "p2p-$tag-client.err")
 
     Start-Sleep -Seconds $Seconds
     Stop-All

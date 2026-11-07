@@ -14,7 +14,8 @@ use lrc_proto::{
     auth_reason, frame_flags, AuthResult, BlockEntry, ClientHello, CursorPos, CursorShape,
     DisplayInfo, Grid, Message, Pong, Rect, ServerHello, VideoFrame, PROTO_VERSION,
 };
-use lrc_transport::{Conn, ConnReader, ConnWriter};
+use lrc_transport::link::{LinkReader, LinkWriter};
+use lrc_udp::UdpStats;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 
 use crate::auth;
@@ -33,6 +34,9 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_INFLIGHT_BYTES: u64 = 8 * 1024 * 1024;
 /// 没有新帧时的轮询间隔：Ok(None) 后睡一下再 grab（零发送 + 低 CPU 的来源）。
 const IDLE_POLL: Duration = Duration::from_millis(2);
+/// 读取线程的轮询粒度：TCP/UDP 统一用它做 recv_timeout，
+/// 既能让 UDP 内部状态机（重传/保活）按时跑，也能让停止标志及时生效。
+const READ_POLL: Duration = Duration::from_millis(200);
 /// 帧率节流时单次睡眠的上限，保证停止标志/光标能被及时处理。
 const MAX_THROTTLE_SLEEP: Duration = Duration::from_millis(20);
 /// 采集器连续重建失败的次数上限，超过就结束这条会话。
@@ -50,7 +54,9 @@ const MAX_CURSOR_SHAPE_DIM: u32 = 256;
 /// pub(crate) 是因为视频编码线程（crate::video）也要通过它写 socket。
 pub(crate) struct Shared {
     /// 收发线程共享同一个写端；一帧必须整条原子写入。
-    writer: Mutex<ConnWriter>,
+    writer: Mutex<LinkWriter>,
+    /// 累计发出的线上字节（含 4 字节长度前缀；UDP 分片开销不计）
+    sent_bytes: AtomicU64,
     /// 主线程要求结束（接收线程断开 / 发送失败）。
     stop: AtomicBool,
     /// 接收线程视角：客户端已断开。
@@ -72,6 +78,10 @@ pub(crate) struct Shared {
     rtt_ms: AtomicU32,
     /// 最近一次收到 ack 的时刻（会话内毫秒）
     last_ack_ms: AtomicU64,
+    /// UDP 路径的 RTT（毫秒 ×10，避免浮点原子；TCP 路径恒 0）
+    udp_rtt_x10: AtomicU32,
+    /// UDP 路径的丢包（千分比）
+    udp_loss_permille: AtomicU32,
     /// 客户端请求整帧。
     request_full: AtomicBool,
     /// 当前采集输出在虚拟桌面里的原点（输入坐标换算用）。
@@ -82,9 +92,10 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    fn new(writer: ConnWriter, origin: (i32, i32)) -> Self {
+    fn new(writer: LinkWriter, origin: (i32, i32)) -> Self {
         Self {
             writer: Mutex::new(writer),
+            sent_bytes: AtomicU64::new(0),
             stop: AtomicBool::new(false),
             peer_gone: AtomicBool::new(false),
             ack_seq: AtomicU32::new(0),
@@ -95,6 +106,8 @@ impl Shared {
             last_sent_seq: AtomicU32::new(0),
             rtt_ms: AtomicU32::new(0),
             last_ack_ms: AtomicU64::new(0),
+            udp_rtt_x10: AtomicU32::new(0),
+            udp_loss_permille: AtomicU32::new(0),
             request_full: AtomicBool::new(false),
             origin_x: AtomicI32::new(origin.0),
             origin_y: AtomicI32::new(origin.1),
@@ -103,16 +116,20 @@ impl Shared {
     }
 
     /// 锁中毒时照常取回：socket 还能用，没有理由因此断流。
-    fn writer_guard(&self) -> std::sync::MutexGuard<'_, ConnWriter> {
+    fn writer_guard(&self) -> std::sync::MutexGuard<'_, LinkWriter> {
         match self.writer.lock() {
             Ok(g) => g,
             Err(poison) => poison.into_inner(),
         }
     }
 
-    /// 写一条已编码消息。
+    /// 写一条已编码消息（同时累计线上字节，供流控用）。
     pub(crate) fn send(&self, payload: &[u8]) -> io::Result<()> {
-        self.writer_guard().send(payload)
+        self.writer_guard().send(payload)?;
+        // TCP 的 4 字节长度前缀也算；UDP 的分片头不精确统计（流控只需要量级）
+        self.sent_bytes
+            .fetch_add(payload.len() as u64 + 4, Ordering::Relaxed);
+        Ok(())
     }
 
     fn shutdown(&self) {
@@ -125,8 +142,9 @@ impl Shared {
 
     /// 已发出但客户端还没确认的字节数（估算，用于流控）。
     pub(crate) fn inflight_bytes(&self) -> u64 {
-        let sent = self.writer_guard().sent_bytes();
-        sent.saturating_sub(self.ack_bytes.load(Ordering::Relaxed))
+        self.sent_bytes
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.ack_bytes.load(Ordering::Relaxed))
     }
 
     fn ack_seq(&self) -> u32 {
@@ -178,6 +196,27 @@ impl Shared {
         self.rtt_ms.load(Ordering::Relaxed)
     }
 
+    /// 接收线程把 UDP 链路的 RTT/丢包发布出来（TCP 路径不会调用）。
+    fn set_udp_stats(&self, st: UdpStats) {
+        let rtt = if st.rtt_ms.is_finite() && st.rtt_ms > 0.0 {
+            (st.rtt_ms * 10.0).min(60_000.0) as u32
+        } else {
+            0
+        };
+        self.udp_rtt_x10.store(rtt, Ordering::Relaxed);
+        self.udp_loss_permille
+            .store(u32::from(st.loss_permille), Ordering::Relaxed);
+    }
+
+    /// UDP 链路 RTT（毫秒）；没有 UDP 或还没采样到就是 0。
+    fn udp_rtt_ms(&self) -> u32 {
+        self.udp_rtt_x10.load(Ordering::Relaxed) / 10
+    }
+
+    fn udp_loss_permille(&self) -> u16 {
+        u16::try_from(self.udp_loss_permille.load(Ordering::Relaxed)).unwrap_or(u16::MAX)
+    }
+
     /// 基于 ack 的流控是否可信：收到过 ack 且最近 2 秒内还有 ack。
     ///
     /// 客户端如果只 ack 块帧、不 ack 视频 AU，未确认字节会一直涨；这种情况下
@@ -222,7 +261,8 @@ impl Shared {
 #[derive(Debug)]
 enum Reject {
     Io(io::Error),
-    Closed,
+    /// 握手超时（连上但不说话；LinkReader 的 recv_timeout 分不出"超时"和"对端关闭"）
+    Timeout,
     Version(u16),
     Proto(String),
     BadMessage(String),
@@ -234,7 +274,7 @@ impl fmt::Display for Reject {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Reject::Io(e) => write!(f, "网络读写失败 {e}"),
-            Reject::Closed => write!(f, "对端直接关闭"),
+            Reject::Timeout => write!(f, "握手超时/对端未发消息"),
             Reject::Version(v) => write!(f, "协议版本不匹配 {v} != {PROTO_VERSION}"),
             Reject::Proto(m) => write!(f, "消息解析失败 {m}"),
             Reject::BadMessage(m) => write!(f, "握手顺序错误 {m}"),
@@ -246,10 +286,28 @@ impl fmt::Display for Reject {
 
 impl std::error::Error for Reject {}
 
-/// 处理一条已接受的连接，直到会话结束。返回 Ok(()) 表示可以继续 accept 下一条。
-pub fn run(conn: Conn, args: &Args, nonce_seq: u64) -> Result<(), String> {
-    let (mut writer, mut reader) = conn.split().map_err(|e| format!("拆分流失败: {e}"))?;
-    set_timeouts(&reader, &writer, Some(HANDSHAKE_TIMEOUT));
+/// 处理一条已就绪的链路（TCP 或可靠 UDP），直到会话结束。
+/// 返回 Ok(()) 表示可以继续接入下一条。
+pub fn run(link: crate::path::AcquiredLink, args: &Args, nonce_seq: u64) -> Result<(), String> {
+    let crate::path::AcquiredLink {
+        writer,
+        reader,
+        path,
+        udp,
+    } = link;
+    let (mut writer, mut reader) = (writer, reader);
+    log::info!("会话建立：path={path}");
+    if let Some(u) = udp.as_ref() {
+        log::info!(
+            "UDP 链路：local={:?} peer={:?} mode={:?}",
+            u.local_addr().ok(),
+            u.peer_addr(),
+            u.mode()
+        );
+    }
+    if let Err(e) = writer.set_write_timeout(Some(HANDSHAKE_TIMEOUT)) {
+        log::warn!("设置握手写超时失败：{e}");
+    }
 
     // 1) ClientHello：先看版本，便宜的检查放在建采集器之前
     let hello = match recv_client_hello(&mut reader) {
@@ -350,10 +408,8 @@ pub fn run(conn: Conn, args: &Args, nonce_seq: u64) -> Result<(), String> {
         Err(e) => log::warn!("枚举显示输出失败，跳过 DisplayList：{e}"),
     }
 
-    // 会话期间：读端永久阻塞（靠 shutdown 唤醒），写端保留超时
-    if let Err(e) = reader.set_read_timeout(None) {
-        log::warn!("清除读超时失败：{e}");
-    }
+    // 会话期间：写端保留超时（对端不读时不能永久阻塞）；
+    // 读端用 200ms 轮询式 recv_timeout（TCP/UDP 同一套语义，见 reader_loop）
     if let Err(e) = writer.set_write_timeout(Some(SEND_TIMEOUT)) {
         log::warn!("设置写超时失败：{e}");
     }
@@ -385,7 +441,14 @@ pub fn run(conn: Conn, args: &Args, nonce_seq: u64) -> Result<(), String> {
     };
 
     let session_clock = Instant::now();
-    let result = capture_loop(args, &mut capturer, &mut info, Arc::clone(&shared), pipeline);
+    let result = capture_loop(
+        args,
+        &mut capturer,
+        &mut info,
+        Arc::clone(&shared),
+        pipeline,
+        path,
+    );
 
     // 音频通道收尾 + 统计
     if let Some(a) = audio_pipe.as_mut() {
@@ -417,12 +480,12 @@ pub fn run(conn: Conn, args: &Args, nonce_seq: u64) -> Result<(), String> {
     result
 }
 
-fn set_timeouts(reader: &ConnReader, writer: &ConnWriter, timeout: Option<Duration>) {
-    if let Err(e) = reader.set_read_timeout(timeout) {
-        log::warn!("设置读超时失败：{e}");
-    }
-    if let Err(e) = writer.set_write_timeout(timeout) {
-        log::warn!("设置写超时失败：{e}");
+/// 握手阶段单条消息的读超时（TCP/UDP 通用：LinkReader::recv_timeout 超时返回 Ok(None)）。
+fn recv_msg_timeout(reader: &mut LinkReader, buf: &mut Vec<u8>, timeout: Duration) -> Result<usize, Reject> {
+    match reader.recv_timeout(buf, timeout).map_err(Reject::Io)? {
+        Some(n) => Ok(n),
+        // 超时 = 对端连上但不说话
+        None => Err(Reject::Timeout),
     }
 }
 
@@ -434,12 +497,9 @@ fn open_capturer(display: usize) -> Result<(Capturer, ScreenInfo), CaptureError>
 }
 
 /// 等 ClientHello 并检查协议版本。
-fn recv_client_hello(reader: &mut ConnReader) -> Result<ClientHello, Reject> {
+fn recv_client_hello(reader: &mut LinkReader) -> Result<ClientHello, Reject> {
     let mut buf = Vec::with_capacity(256);
-    reader
-        .recv(&mut buf)
-        .map_err(Reject::Io)?
-        .ok_or(Reject::Closed)?;
+    recv_msg_timeout(reader, &mut buf, HANDSHAKE_TIMEOUT)?;
     match Message::decode(&buf) {
         Ok(Message::ClientHello(hello)) => {
             if hello.version != PROTO_VERSION {
@@ -462,17 +522,14 @@ fn recv_client_hello(reader: &mut ConnReader) -> Result<ClientHello, Reject> {
 
 /// 等 AuthRequest、校验 HMAC、回 AuthResult。
 fn await_auth(
-    reader: &mut ConnReader,
-    writer: &mut ConnWriter,
+    reader: &mut LinkReader,
+    writer: &mut LinkWriter,
     password: &str,
     nonce_c: &[u8; auth::NONCE_LEN],
     nonce_s: &[u8; auth::NONCE_LEN],
 ) -> Result<(), Reject> {
     let mut buf = Vec::with_capacity(128);
-    reader
-        .recv(&mut buf)
-        .map_err(Reject::Io)?
-        .ok_or(Reject::Closed)?;
+    recv_msg_timeout(reader, &mut buf, HANDSHAKE_TIMEOUT)?;
     let mac = match Message::decode(&buf) {
         Ok(Message::AuthRequest(req)) => req.mac,
         Ok(other) => {
@@ -503,17 +560,26 @@ fn await_auth(
 }
 
 /// 接收线程：阻塞读，直到对端关闭或主线程 shutdown。
-fn reader_loop(mut reader: ConnReader, shared: Arc<Shared>) {
+fn reader_loop(mut reader: LinkReader, shared: Arc<Shared>) {
     let mut buf: Vec<u8> = Vec::with_capacity(16 * 1024);
     loop {
         if shared.stop() {
             break;
         }
-        match reader.recv(&mut buf) {
-            Ok(Some(n)) => handle_incoming(&buf[..n], &shared),
+        // 统一用 recv_timeout：TCP 下等价于原来的阻塞读（超时返回 None 再轮询），
+        // UDP 下还能顺便让 UdpConn 内部状态机（重传/保活）跑起来。
+        match reader.recv_timeout(&mut buf, READ_POLL) {
+            Ok(Some(n)) => {
+                if let Some(st) = reader.udp_stats() {
+                    shared.set_udp_stats(st);
+                }
+                handle_incoming(&buf[..n], &shared)
+            }
             Ok(None) => {
-                log::info!("客户端关闭了连接");
-                break;
+                if let Some(st) = reader.udp_stats() {
+                    shared.set_udp_stats(st);
+                }
+                continue;
             }
             Err(e) => {
                 // 对端断开的各种表现（含 wire-codec 强调的 UnexpectedEof）都算正常收尾
@@ -934,6 +1000,7 @@ fn capture_loop(
     info: &mut ScreenInfo,
     shared: Arc<Shared>,
     pipeline: Option<VideoPipeline>,
+    path: &'static str,
 ) -> Result<(), String> {
     let mut track = Track::new(info.width, info.height)
         .ok_or_else(|| format!("采集尺寸非法 {}x{}", info.width, info.height))?;
@@ -1110,6 +1177,11 @@ fn capture_loop(
             .as_ref()
             .map(|p| p.counters())
             .unwrap_or_default();
+        let path_line = stats::PathLine {
+            path,
+            rtt_ms: shared.udp_rtt_ms(),
+            loss_permille: shared.udp_loss_permille(),
+        };
         if let Some(sample) = report_if_due(
             args,
             &mut sec,
@@ -1120,6 +1192,7 @@ fn capture_loop(
             &adapt,
             video_now,
             &mut last_video,
+            &path_line,
         ) {
             // 每秒喂一次自适应控制器
             if let Some(ctrl) = controller.as_mut() {
@@ -1129,11 +1202,20 @@ fn capture_loop(
                     0.0
                 };
                 let ack_fresh = shared.ack_fresh();
+                // UDP 路径有链路层 RTT（含重传），比 ack 反算更准；TCP 用 ack 估算
+                let udp_rtt = shared.udp_rtt_ms();
+                let rtt_ms = if udp_rtt > 0 {
+                    udp_rtt
+                } else if ack_fresh {
+                    shared.rtt_ms()
+                } else {
+                    0
+                };
                 let link = LinkStats {
                     bytes_sent: sample.bytes,
                     // ack 停了就别把积压/延迟当拥塞信号（否则会一直降档到停发）
                     inflight_bytes: if ack_fresh { shared.inflight_bytes() } else { 0 },
-                    rtt_ms: if ack_fresh { shared.rtt_ms() } else { 0 },
+                    rtt_ms,
                     dropped_frames: sample.dropped,
                     changed_ratio: ratio.clamp(0.0, 1.0),
                     fps: sample.fps,
@@ -1737,9 +1819,14 @@ fn capture_loop(
             p.dropped_frames()
         );
     }
+    let final_path = stats::PathLine {
+        path,
+        rtt_ms: shared.udp_rtt_ms(),
+        loss_permille: shared.udp_loss_permille(),
+    };
     log::info!(
         "会话结束，总计 {} capture_ms_avg={capture_avg:.2}",
-        stats::format_summary(&total, session_secs, &video_summary)
+        stats::format_summary(&total, session_secs, &video_summary, &final_path)
     );
     Ok(())
 }
@@ -1765,6 +1852,7 @@ fn report_if_due(
     adapt: &AdaptState,
     video_now: VideoCounters,
     last_video: &mut VideoCounters,
+    path: &stats::PathLine,
 ) -> Option<SecondSample> {
     let now = Instant::now();
     let elapsed = now.saturating_duration_since(*last_report);
@@ -1801,7 +1889,7 @@ fn report_if_due(
         let session_secs = now.saturating_duration_since(session_start).as_secs_f64();
         println!(
             "{}",
-            stats::format_line(total, sec, session_secs, interval, &video_line)
+            stats::format_line(total, sec, session_secs, interval, &video_line, path)
         );
         let _ = io::stdout().flush();
     }
@@ -2232,6 +2320,9 @@ mod tests {
             video_max_fps: 30,
             budget_bps: 2_000_000,
             audio: false,
+            signal: None,
+            room: 1,
+            p2p: crate::cli::P2pMode::Auto,
         }
     }
 
@@ -2468,7 +2559,14 @@ mod tests {
     #[test]
     fn stats_line_has_all_keys() {
         let zero = Stats::default();
-        let line = stats::format_line(&zero, &zero, 1.0, 1.0, &stats::VideoLine::default());
+        let line = stats::format_line(
+            &zero,
+            &zero,
+            1.0,
+            1.0,
+            &stats::VideoLine::default(),
+            &stats::PathLine::default(),
+        );
         for key in [
             "t=",
             "fps=",
@@ -2482,6 +2580,9 @@ mod tests {
             "level=",
             "stage=",
             "scale=",
+            "path=",
+            "udp_rtt=",
+            "udp_loss=",
         ] {
             assert!(line.contains(key), "统计行缺少 {key}: {line}");
         }

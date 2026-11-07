@@ -1040,6 +1040,10 @@ impl AppState {
             Some(rms) => rms,
             None => self.stats.audio_rms,
         };
+        let (path, udp_rtt, udp_loss) = match self.shared.udp_stats() {
+            Some(stats) => (self.shared.link_path(), stats.rtt_ms, stats.loss_permille),
+            None => (self.shared.link_path(), 0.0, 0),
+        };
         self.stats = Stats {
             at: now,
             frames,
@@ -1062,7 +1066,8 @@ impl AppState {
         println!(
             "fps={fps:.0} recv_kbps={kbps:.1} decoded_blocks={blocks} rtt_ms={rtt_ms:.3} \
 mode={mode} video_fps={video_fps:.1} lat_ms={lat_ms:.1} reconnects={} audio={} \
-audio_rms={audio_rms:.4} audio_ms={} audio_pkts={audio_pkts} audio_drop={audio_drop} displays={}",
+audio_rms={audio_rms:.4} audio_ms={} audio_pkts={audio_pkts} audio_drop={audio_drop} displays={} \
+path={path} udp_rtt={udp_rtt:.1} udp_loss={udp_loss}",
             self.shared.reconnect_count(),
             self.shared.audio_state_name(),
             self.shared.audio_buffered_ms(),

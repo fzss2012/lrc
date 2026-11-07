@@ -17,13 +17,16 @@ use lrc_proto::{
     auth_reason, codec_tag, ClientHello, DisplayInfo, Message, Pong, VideoAu, VideoFrame,
     PROTO_VERSION,
 };
-use crate::audio::AudioSink;
-use lrc_transport::{Conn, ConnReader, ConnWriter};
+use lrc_transport::link::{self, LinkReader, LinkWriter};
+use lrc_transport::Conn;
+use lrc_udp::PeerMode;
 use lrc_video::{DecoderConfig, FfmpegDecoder, VideoDecoder};
 use sha2::Sha256;
+use std::net::SocketAddr;
 use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
 
-use crate::cli::Config;
+use crate::audio::AudioSink;
+use crate::cli::{Config, P2pMode};
 use crate::state::{
     backoff_delay, host_clock_ms, BlockUpdate, ConnStatus, CursorShapeOwned, Shared,
     VideoFrameUpdate,
@@ -47,28 +50,107 @@ enum HandshakeError {
     Transient(String),
 }
 
+/// 建连参数：TCP 兜底地址 + P2P 信令。
+struct ConnParams {
+    /// TCP 直连地址（--connect）
+    tcp_addr: String,
+    /// relay 信令地址（--signal；None = 不启用 P2P）
+    signal: Option<String>,
+    /// 房间号（--room）
+    room: u32,
+    /// P2P 模式（--p2p）
+    p2p: P2pMode,
+    /// 认证密码
+    password: String,
+}
+
+/// 连接路径类型（决定尝试顺序）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum P2pPath {
+    /// P2P / relay（lrc-udp 可靠 UDP）
+    Udp,
+    /// TCP 直连（最终兜底）
+    Tcp,
+}
+
+fn path_label(kind: P2pPath) -> &'static str {
+    match kind {
+        P2pPath::Udp => "p2p/udp",
+        P2pPath::Tcp => "tcp",
+    }
+}
+
+/// 本次连接的尝试顺序：优先上次成功的路径，失败再换另一条。
+fn attempt_order(p2p_enabled: bool, preferred: P2pPath) -> Vec<P2pPath> {
+    if !p2p_enabled {
+        return vec![P2pPath::Tcp];
+    }
+    match preferred {
+        P2pPath::Udp => vec![P2pPath::Udp, P2pPath::Tcp],
+        P2pPath::Tcp => vec![P2pPath::Tcp, P2pPath::Udp],
+    }
+}
+
 /// 启动接收线程：连接 → 握手 → 收流；断线自动退避重连，直到窗口关闭。
 pub fn spawn(cfg: &Config, shared: Arc<Shared>) -> io::Result<()> {
-    let addr = cfg.connect.clone();
-    let password = cfg.password.clone();
+    let params = ConnParams {
+        tcp_addr: cfg.connect.clone(),
+        signal: cfg.signal.clone(),
+        room: cfg.room,
+        p2p: cfg.p2p,
+        password: cfg.password.clone(),
+    };
     let audio_on = cfg.audio;
     let audio_dump = cfg.audio_dump.clone();
     std::thread::Builder::new()
         .name(String::from("lrc-client-net"))
-        .spawn(move || supervise(&addr, &password, audio_on, audio_dump, &shared))?;
+        .spawn(move || supervise(params, audio_on, audio_dump, &shared))?;
     Ok(())
 }
 
+/// 用 lrc-relay 建立 UDP 链路：打洞成功 = direct_udp，失败自动 relay_udp。
+fn open_udp(signal: &str, room: u32, mode: P2pMode) -> Result<(LinkWriter, LinkReader), String> {
+    let relay: SocketAddr = signal
+        .parse()
+        .map_err(|e| format!("--signal 地址非法（{signal}）：{e}"))?;
+    // --p2p relay：不打洞，直接让 establish 走 relay（punch 超时给 0）
+    let punch_timeout = match mode {
+        P2pMode::Relay => Duration::from_millis(0),
+        _ => Duration::from_secs(2),
+    };
+    let established =
+        lrc_relay::establish(false, relay, room, None, Duration::from_secs(2), punch_timeout)
+            .map_err(|e| format!("P2P 建立失败：{e}"))?;
+    if mode == P2pMode::Direct && established.mode != PeerMode::Direct {
+        return Err(String::from("--p2p direct 要求打洞成功，但已降级 relay"));
+    }
+    let peer = established.conn_peer();
+    let peer_mode = established.mode;
+    log::info!("UDP 链路建立：{}（peer={peer}）", peer_mode.kind());
+    let conn = lrc_udp::UdpConn::new(established.socket, peer, peer_mode)
+        .map_err(|e| format!("UdpConn 初始化失败：{e}"))?;
+    Ok(link::from_udp(conn))
+}
+
 /// 连接监管循环：断线不退出，指数退避重连；认证失败才终止（窗口保留）。
+///
+/// 路径优先级：上次成功的路径先试（P2P 成功过就继续 P2P），失败再降级；
+/// `--signal` 没给或 `--p2p off` 时只有 TCP。
 fn supervise(
-    addr: &str,
-    password: &str,
+    params: ConnParams,
     audio_on: bool,
     audio_dump: Option<String>,
     shared: &Arc<Shared>,
 ) {
+    let p2p_enabled = params.signal.is_some() && params.p2p.enabled();
     let mut attempt: u32 = 0;
     let mut ever_connected = false;
+    // 上次成功的路径：P2P 可用时先试 P2P
+    let mut preferred = if p2p_enabled {
+        P2pPath::Udp
+    } else {
+        P2pPath::Tcp
+    };
     // 音频线程跟进程同寿命（跨重连保留设备）；--audio off 时是 None
     let mut audio = AudioSink::start(audio_on, shared.clone(), audio_dump);
     loop {
@@ -76,23 +158,57 @@ fn supervise(
             return;
         }
 
-        // ---- 1) 建连 ----
-        let conn = match Conn::connect(addr) {
-            Ok(conn) => conn,
-            Err(e) => {
-                attempt = attempt.saturating_add(1);
-                shared.set_status(ConnStatus::Reconnecting { attempt });
-                let delay = backoff_delay(attempt);
-                log::warn!("连接 {addr} 失败（第 {attempt} 次）: {e}；{}s 后重试", delay.as_secs());
-                if !sleep_backoff(shared, attempt) {
-                    return;
-                }
-                continue;
+        // ---- 1) 建连：按优先级依次尝试（P2P/relay → TCP 兜底）----
+        let mut opened: Option<(LinkWriter, LinkReader, &'static str)> = None;
+        let mut last_error = String::new();
+        for kind in attempt_order(p2p_enabled, preferred) {
+            if shared.is_quit() {
+                return;
             }
+            let result = match kind {
+                P2pPath::Udp => match params.signal.as_deref() {
+                    Some(signal) => open_udp(signal, params.room, params.p2p),
+                    None => Err(String::from("未配置 --signal")),
+                },
+                P2pPath::Tcp => match Conn::connect(&params.tcp_addr) {
+                    Ok(conn) => match link::from_tcp(conn) {
+                        Ok(link) => Ok(link),
+                        Err(e) => Err(format!("TCP split 失败：{e}")),
+                    },
+                    Err(e) => Err(format!("TCP 连接 {} 失败：{e}", params.tcp_addr)),
+                },
+            };
+            match result {
+                Ok((writer, reader)) => {
+                    let path = writer.path();
+                    preferred = kind;
+                    opened = Some((writer, reader, path));
+                    break;
+                }
+                Err(e) => {
+                    log::warn!("路径 {} 不可用：{e}", path_label(kind));
+                    last_error = e;
+                }
+            }
+        }
+
+        let Some((writer, reader, path)) = opened else {
+            attempt = attempt.saturating_add(1);
+            shared.set_status(ConnStatus::Reconnecting { attempt });
+            let delay = backoff_delay(attempt);
+            log::warn!(
+                "连接失败（第 {attempt} 次）：{last_error}；{}s 后重试",
+                delay.as_secs()
+            );
+            if !sleep_backoff(shared, attempt) {
+                return;
+            }
+            continue;
         };
+        shared.set_link_path(path);
 
         // ---- 2) 握手 ----
-        match handshake(conn, password, shared) {
+        match handshake(writer, reader, &params.password, shared) {
             Ok((writer, mut reader)) => {
                 if ever_connected {
                     shared.bump_reconnects();
@@ -106,7 +222,7 @@ fn supervise(
                 shared.set_out_tx(Some(tx.clone()));
                 shared.set_connected(true);
                 shared.set_status(ConnStatus::Connected);
-                log::info!("已连接 {addr}，开始接收");
+                log::info!("已连接（{path}），开始接收");
                 // 首帧要整屏；被控端收到会回一整帧
                 send(&tx, Message::RequestFull.encode());
 
@@ -173,12 +289,76 @@ fn sleep_backoff(shared: &Shared, attempt: u32) -> bool {
     !shared.is_quit()
 }
 
-/// 握手：ClientHello → ServerHello → AuthRequest → AuthResult；成功后拆成读写两半。
+/// 把读错误翻译成断线原因；UDP 的保活超时单独说明，方便排查。
+fn disconnect_reason(err: &io::Error) -> String {
+    match err.kind() {
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+            String::from("链路保活超时（对端可能已离线，UDP 路径常见）")
+        }
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted => {
+            format!("连接被重置: {err}")
+        }
+        _ => format!("收包失败: {err}"),
+    }
+}
+
+/// 握手单条消息的等待上限（UDP 下对端可能刚打完洞，给宽一点）。
+const HANDSHAKE_MSG_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 在统一链路上发一条握手消息。
+fn send_link(writer: &mut LinkWriter, payload: &[u8]) -> Result<(), HandshakeError> {
+    writer
+        .send(payload)
+        .map_err(|e| HandshakeError::Transient(format!("发送失败: {e}")))
+}
+
+/// 在统一链路上读一条握手消息；超时返回 `Ok(None)`。
+///
+/// TCP 用阻塞读（语义和旧版一致）；UDP 用 200ms 轮询凑出总超时——
+/// 这样"对端还没准备好"不会把整个握手卡死，也避免在 TCP 上留下读超时残影。
+fn recv_link_msg<'a>(
+    reader: &mut LinkReader,
+    buf: &'a mut Vec<u8>,
+    timeout: Duration,
+) -> Result<Option<Message<'a>>, HandshakeError> {
+    let is_udp = matches!(reader, LinkReader::Udp(_));
+    let read = if is_udp {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if Instant::now() >= deadline {
+                break Ok(None);
+            }
+            match reader.recv_timeout(buf, Duration::from_millis(200)) {
+                Ok(Some(_)) => break Ok(Some(())),
+                Ok(None) => continue,
+                Err(e) => break Err(e),
+            }
+        }
+    } else {
+        match reader.recv(buf) {
+            Ok(Some(_)) => Ok(Some(())),
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
+    };
+    match read {
+        Ok(Some(())) => Message::decode(buf)
+            .map(Some)
+            .map_err(|e| HandshakeError::Transient(format!("握手消息解码失败: {e}"))),
+        Ok(None) => Ok(None),
+        Err(e) => Err(HandshakeError::Transient(format!("读握手消息失败: {e}"))),
+    }
+}
+
+/// 握手：ClientHello → ServerHello → AuthRequest → AuthResult。
+///
+/// 输入输出都是统一链路（TCP 或 UDP），上层协议不感知底层路径。
 fn handshake(
-    mut conn: Conn,
+    mut writer: LinkWriter,
+    mut reader: LinkReader,
     password: &str,
     shared: &Shared,
-) -> Result<(ConnWriter, ConnReader), HandshakeError> {
+) -> Result<(LinkWriter, LinkReader), HandshakeError> {
     let client_id = random_id().map_err(|e| HandshakeError::Transient(format!("{e:#}")))?;
     let nonce_c = random_id().map_err(|e| HandshakeError::Transient(format!("{e:#}")))?;
     let hello = Message::ClientHello(ClientHello {
@@ -186,11 +366,10 @@ fn handshake(
         client_id,
         nonce_c,
     });
-    conn.send(&hello.encode())
-        .map_err(|e| HandshakeError::Transient(format!("发 ClientHello 失败: {e}")))?;
+    send_link(&mut writer, &hello.encode())?;
 
     let mut buf = Vec::with_capacity(4096);
-    let server = match recv_msg(&mut conn, &mut buf) {
+    let server = match recv_link_msg(&mut reader, &mut buf, HANDSHAKE_MSG_TIMEOUT) {
         Ok(Some(Message::ServerHello(hello))) => hello,
         Ok(Some(other)) => {
             return Err(HandshakeError::Transient(format!(
@@ -200,10 +379,10 @@ fn handshake(
         }
         Ok(None) => {
             return Err(HandshakeError::Transient(String::from(
-                "对端在 ServerHello 之前关闭连接",
+                "对端在 ServerHello 之前关闭连接/超时",
             )))
         }
-        Err(e) => return Err(HandshakeError::Transient(format!("读 ServerHello 失败: {e}"))),
+        Err(e) => return Err(e),
     };
     if server.version != PROTO_VERSION {
         return Err(HandshakeError::Terminal(format!(
@@ -226,10 +405,12 @@ fn handshake(
     mac_input[16..].copy_from_slice(&server.nonce_s);
     let mac = hmac_sha256(password.as_bytes(), &mac_input)
         .map_err(|e| HandshakeError::Transient(format!("{e:#}")))?;
-    conn.send(&Message::AuthRequest(lrc_proto::AuthRequest { mac }).encode())
-        .map_err(|e| HandshakeError::Transient(format!("发 AuthRequest 失败: {e}")))?;
+    send_link(
+        &mut writer,
+        &Message::AuthRequest(lrc_proto::AuthRequest { mac }).encode(),
+    )?;
 
-    match recv_msg(&mut conn, &mut buf) {
+    match recv_link_msg(&mut reader, &mut buf, HANDSHAKE_MSG_TIMEOUT) {
         Ok(Some(Message::AuthResult(result))) => {
             if !result.ok {
                 return Err(HandshakeError::Terminal(format!(
@@ -249,17 +430,16 @@ fn handshake(
                 "对端在 AuthResult 之前关闭连接",
             )))
         }
-        Err(e) => return Err(HandshakeError::Transient(format!("读 AuthResult 失败: {e}"))),
+        Err(e) => return Err(e),
     }
     log::info!("认证通过");
 
-    conn.split()
-        .map_err(|e| HandshakeError::Transient(format!("split 失败: {e}")))
+    Ok((writer, reader))
 }
 
 /// 会话循环：收消息 → 解码。连接断了返回 Disconnected（由上层重连），窗口关了返回 Quit。
 fn session_loop(
-    reader: &mut ConnReader,
+    reader: &mut LinkReader,
     shared: &Arc<Shared>,
     tx: &Sender<Vec<u8>>,
     audio: &mut Option<AudioSink>,
@@ -284,10 +464,14 @@ fn session_loop(
                 if shared.is_quit() {
                     return SessionEnd::Quit;
                 }
-                return SessionEnd::Disconnected(format!("收包失败: {e}"));
+                return SessionEnd::Disconnected(disconnect_reason(&e));
             }
         };
         shared.add_recv_bytes(n as u64);
+        // UDP 路径：顺带把链路质量（rtt/丢包）报到共享状态，--stats 用
+        if let Some(stats) = reader.udp_stats() {
+            shared.set_udp_stats(stats);
+        }
 
         match Message::decode(&buf) {
             Ok(Message::VideoFrame(frame)) => {
@@ -633,7 +817,7 @@ fn handle_frame(frame: &VideoFrame<'_>, shared: &Shared) {
 }
 
 /// 发送线程：从 channel 取已编码 payload 写 socket，窗口关闭后自退。
-fn spawn_writer(mut writer: ConnWriter, rx: Receiver<Vec<u8>>, shared: Arc<Shared>) {
+fn spawn_writer(mut writer: LinkWriter, rx: Receiver<Vec<u8>>, shared: Arc<Shared>) {
     let spawned = std::thread::Builder::new()
         .name(String::from("lrc-client-send"))
         .spawn(move || {
@@ -665,14 +849,6 @@ fn spawn_writer(mut writer: ConnWriter, rx: Receiver<Vec<u8>>, shared: Arc<Share
 fn send(tx: &Sender<Vec<u8>>, payload: Vec<u8>) {
     // 发送线程退出（连接已断）时这里会失败，属于正常情况。
     let _ = tx.send(payload);
-}
-
-/// 阻塞读一条消息；`Ok(None)` 表示对端正常关闭。
-fn recv_msg<'a>(conn: &mut Conn, buf: &'a mut Vec<u8>) -> anyhow::Result<Option<Message<'a>>> {
-    match conn.recv(buf)? {
-        Some(_) => Ok(Some(Message::decode(buf)?)),
-        None => Ok(None),
-    }
 }
 
 fn random_id() -> anyhow::Result<[u8; 16]> {
@@ -717,6 +893,38 @@ mod tests {
             hex,
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
+    }
+
+    #[test]
+    fn attempt_order_prefers_previous_path() {
+        // 不启用 P2P：只有 TCP
+        assert_eq!(attempt_order(false, P2pPath::Udp), vec![P2pPath::Tcp]);
+        assert_eq!(attempt_order(false, P2pPath::Tcp), vec![P2pPath::Tcp]);
+        // 上次是 UDP 路径：先重试 P2P，失败再降级 TCP
+        assert_eq!(
+            attempt_order(true, P2pPath::Udp),
+            vec![P2pPath::Udp, P2pPath::Tcp]
+        );
+        // 上次是 TCP：先 TCP（快速恢复），失败再试 P2P
+        assert_eq!(
+            attempt_order(true, P2pPath::Tcp),
+            vec![P2pPath::Tcp, P2pPath::Udp]
+        );
+    }
+
+    #[test]
+    fn timed_out_read_is_disconnect_reason() {
+        // UDP 保活超时 = 对端离线，必须按断线处理（触发重连，而不是当成"对端正常关闭"）
+        let timeout = io::Error::from(io::ErrorKind::TimedOut);
+        let reason = disconnect_reason(&timeout);
+        assert!(reason.contains("保活超时"), "reason={reason}");
+
+        let reset = io::Error::from(io::ErrorKind::ConnectionReset);
+        let reason = disconnect_reason(&reset);
+        assert!(reason.contains("重置"), "reason={reason}");
+
+        let other = io::Error::from(io::ErrorKind::Other);
+        assert!(disconnect_reason(&other).contains("收包失败"));
     }
 
     #[test]

@@ -48,6 +48,17 @@
 [PASS] 停播后自动回块模式   — blocks 3/3
 ```
 
+### 1.4 M4 传输层（`scripts/verify-p2p.ps1`，本机 loopback + 真 relay）
+
+| 阶段 | host path | client path | relay 转发字节 | 说明 |
+|---|---|---|---|---|
+| `--p2p auto` | **direct_udp** | **direct_udp** | **0** | 打洞成功，**媒体完全不经过 relay**（云上只跑信令） |
+| `--p2p relay` | **relay_udp** | **relay_udp** | **1,854,501 B** | 强制降级，relay 正常转发 |
+
+- direct 路径实测：`udp_rtt 14–23 ms`、`udp_loss 0`、30 fps、3,117 块解码正常
+- relay 路径实测：`udp_rtt 2–12 ms`、`udp_loss 23–39‰`（relay 单线程转发在忙时会丢包，靠 `lrc-udp` 重传补回，画面不烂）
+- `lrc-udp` 自测：回环 1000 条消息 15.1 MB/s；**注入 10% 丢包仍 1000 条全量有序不重复**（重传 51.9%）
+
 ## 2. 采集（`capture-probe`）
 
 | 指标 | 数值 |

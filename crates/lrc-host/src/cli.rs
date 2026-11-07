@@ -17,6 +17,30 @@ pub const DEFAULT_VIDEO_MAX_FPS: u32 = 30;
 /// 视频码率的合理范围。
 pub const VIDEO_BITRATE_RANGE: std::ops::RangeInclusive<u32> = 100_000..=80_000_000;
 
+/// P2P / relay 路径选择（M4）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum P2pMode {
+    /// 先打洞，失败走 relay，relay 也不可用再回退 TCP
+    Auto,
+    /// 只用 TCP（= 没有 P2P 时的行为）
+    Off,
+    /// 打洞失败就报错退出（不降级）
+    Direct,
+    /// 跳过打洞，直接走 relay（relay 不可用报错，不回退 TCP）
+    Relay,
+}
+
+impl P2pMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            P2pMode::Auto => "auto",
+            P2pMode::Off => "off",
+            P2pMode::Direct => "direct",
+            P2pMode::Relay => "relay",
+        }
+    }
+}
+
 /// 视频通道选择。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VideoChoice {
@@ -44,7 +68,7 @@ impl VideoChoice {
     }
 }
 
-pub const USAGE: &str = "用法: lrc-host --password <PASS> [--listen <IP:PORT>] [--display N] [--fps N] [--quality N] [--stats] [--video auto|off|hevc|h264] [--video-bitrate B] [--video-max-fps N] [--budget-bps B] [--audio on|off]";
+pub const USAGE: &str = "用法: lrc-host --password <PASS> [--listen <IP:PORT>] [--display N] [--fps N] [--quality N] [--stats] [--video auto|off|hevc|h264] [--video-bitrate B] [--video-max-fps N] [--budget-bps B] [--audio on|off] [--signal IP:PORT --room N --p2p auto|off|direct|relay]";
 
 pub const HELP: &str = "\
 lrc-host — lrc 被控端（单流点对点）
@@ -67,6 +91,11 @@ lrc-host — lrc 被控端（单流点对点）
   --budget-bps <B>    链路预算 bit/s；>0 时启用自适应控制器（降帧率/抬QP/降分辨率/调码率），
                       默认 0 = 关闭（参数固定，行为与不加此参数前完全一致）
   --audio on|off      系统声音回环（Opus 32kbps），默认 on；设备不可用时自动永久关闭
+  --signal <IP:PORT>  relay 信令地址；不给则不启用 P2P（行为与 M3 完全一致）
+  --room <N>          房间号，默认 1
+  --p2p <MODE>        auto|off|direct|relay，默认 auto：
+                        off=只用 TCP；direct=打洞失败报错；relay=跳过打洞直接走 relay；
+                        auto=先打洞，失败走 relay，再失败回退 TCP
   -h, --help          显示本帮助
 
 统计行:
@@ -94,6 +123,12 @@ pub struct Args {
     pub budget_bps: u32,
     /// 是否启用系统声音回环（M3 音频通道），默认 true
     pub audio: bool,
+    /// relay 信令地址；None = 不启用 P2P（行为与 M3 完全一致）
+    pub signal: Option<std::net::SocketAddr>,
+    /// 房间号
+    pub room: u32,
+    /// P2P 路径选择
+    pub p2p: P2pMode,
 }
 
 /// 解析结果：要么是帮助，要么是运行参数。
@@ -151,6 +186,9 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
     let mut video_max_fps = DEFAULT_VIDEO_MAX_FPS;
     let mut budget_bps = 0u32;
     let mut audio = true;
+    let mut signal: Option<std::net::SocketAddr> = None;
+    let mut room: u32 = 1;
+    let mut p2p = P2pMode::Auto;
 
     let mut i = 0usize;
     while i < argv.len() {
@@ -166,7 +204,8 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
             }
             "--no-stats" => stats = false,
             "--listen" | "--password" | "--display" | "--fps" | "--quality" | "--video"
-            | "--video-bitrate" | "--video-max-fps" | "--budget-bps" | "--audio" => {
+            | "--video-bitrate" | "--video-max-fps" | "--budget-bps" | "--audio" | "--signal"
+            | "--room" | "--p2p" => {
                 let value = match inline {
                     Some(v) => v,
                     None => {
@@ -190,6 +229,38 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
                                 })
                             }
                         }
+                    }
+                    "--signal" => {
+                        signal = Some(value.parse::<std::net::SocketAddr>().map_err(|_| {
+                            CliError::BadValue {
+                                flag: name.to_string(),
+                                value,
+                                expect: "IP:PORT（例如 1.2.3.4:7801）",
+                            }
+                        })?);
+                    }
+                    "--room" => {
+                        let v = parse_usize(name, &value)?;
+                        room = u32::try_from(v).map_err(|_| CliError::BadValue {
+                            flag: name.to_string(),
+                            value,
+                            expect: "0..=4294967295",
+                        })?;
+                    }
+                    "--p2p" => {
+                        p2p = match value.as_str() {
+                            "auto" => P2pMode::Auto,
+                            "off" | "none" | "0" => P2pMode::Off,
+                            "direct" => P2pMode::Direct,
+                            "relay" => P2pMode::Relay,
+                            _ => {
+                                return Err(CliError::BadValue {
+                                    flag: name.to_string(),
+                                    value,
+                                    expect: "auto|off|direct|relay",
+                                })
+                            }
+                        };
                     }
                     "--listen" => {
                         if value.trim().is_empty() {
@@ -308,6 +379,9 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
         video_max_fps,
         budget_bps,
         audio,
+        signal,
+        room,
+        p2p,
     }))
 }
 
@@ -355,6 +429,36 @@ mod tests {
         assert_eq!(a.video_max_fps, DEFAULT_VIDEO_MAX_FPS);
         assert_eq!(a.budget_bps, 0);
         assert!(a.audio, "音频默认开启");
+    }
+
+    #[test]
+    fn p2p_flags() {
+        let a = run(&["--password", "1"]);
+        assert_eq!(a.signal, None, "不给 --signal 就不启用 P2P");
+        assert_eq!(a.room, 1);
+        assert_eq!(a.p2p, P2pMode::Auto);
+
+        let a = run(&[
+            "--password", "1", "--signal", "127.0.0.1:7801", "--room", "42", "--p2p", "relay",
+        ]);
+        assert_eq!(a.signal, Some("127.0.0.1:7801".parse().expect("addr")));
+        assert_eq!(a.room, 42);
+        assert_eq!(a.p2p, P2pMode::Relay);
+
+        // 别名 + equals 形式
+        assert_eq!(run(&["--password", "1", "--p2p=off"]).p2p, P2pMode::Off);
+        assert_eq!(run(&["--password", "1", "--p2p", "none"]).p2p, P2pMode::Off);
+        assert_eq!(run(&["--password", "1", "--p2p", "direct"]).p2p, P2pMode::Direct);
+
+        // 非法值
+        assert!(matches!(
+            parse(&argv(&["--password", "1", "--p2p", "holepunch"])),
+            Err(CliError::BadValue { .. })
+        ));
+        assert!(matches!(
+            parse(&argv(&["--password", "1", "--signal", "not-an-addr"])),
+            Err(CliError::BadValue { .. })
+        ));
     }
 
     #[test]

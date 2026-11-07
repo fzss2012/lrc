@@ -13,6 +13,7 @@ mod audio;
 mod auth;
 mod cli;
 mod input;
+mod path;
 mod session;
 mod stats;
 mod video;
@@ -65,41 +66,77 @@ fn init_logger() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 }
 
-/// 绑定监听并逐条服务连接（永不返回，除非绑定/监听彻底失败）。
+/// 接入链路并逐条服务会话（永不返回，除非配置要求失败即退出）。
+///
+/// 路径优先级：P2P 直连 → relay → TCP（具体取舍见 crate::path）。
 fn serve(args: &Args) -> Result<(), String> {
-    let listener =
-        TcpListener::bind(args.listen.as_str()).map_err(|e| format!("绑定 {} 失败：{e}", args.listen))?;
-    let local = match listener.local_addr() {
-        Ok(addr) => addr.to_string(),
-        Err(_) => args.listen.clone(),
+    // direct/relay 模式失败即报错，不需要 TCP 监听；auto/off 需要 TCP 兜底
+    let need_tcp = path::need_tcp_listener(args.p2p, args.signal);
+    let listener = if need_tcp {
+        Some(
+            TcpListener::bind(args.listen.as_str())
+                .map_err(|e| format!("绑定 {} 失败：{e}", args.listen))?,
+        )
+    } else {
+        None
     };
-    log::info!(
-        "lrc-host 监听 {local}（display={} fps={} quality={} stats={}）",
-        args.display,
-        args.fps,
-        args.quality,
-        args.stats
-    );
-    log::info!("等待客户端连接……");
+    if let Some(l) = listener.as_ref() {
+        let local = match l.local_addr() {
+            Ok(addr) => addr.to_string(),
+            Err(_) => args.listen.clone(),
+        };
+        log::info!(
+            "lrc-host 监听 TCP {local}（display={} fps={} quality={} stats={}，P2P 失败时的兜底）",
+            args.display,
+            args.fps,
+            args.quality,
+            args.stats
+        );
+    } else {
+        log::info!(
+            "lrc-host 不监听 TCP（--p2p {}）display={} fps={} quality={} stats={}",
+            args.p2p.label(),
+            args.display,
+            args.fps,
+            args.quality,
+            args.stats
+        );
+    }
+    match (args.signal, args.p2p) {
+        (Some(sig), mode) if mode != cli::P2pMode::Off => {
+            log::info!("P2P 打开：信令 {sig}，房间 {}，模式 {}", args.room, mode.label())
+        }
+        (Some(sig), _) => log::info!("给了 --signal {sig} 但 --p2p off：只走 TCP"),
+        (None, _) => log::info!("未配置 --signal：只走 TCP"),
+    }
 
     let mut nonce_seq: u64 = 0;
     let mut accepted: u64 = 0;
     loop {
-        let conn = match lrc_transport::Conn::accept(&listener) {
-            Ok(c) => c,
+        let link = match path::acquire_link(&path::LinkConfig {
+            listener: listener.as_ref(),
+            signal: args.signal,
+            room: args.room,
+            p2p: args.p2p,
+        }) {
+            Ok(l) => l,
             Err(e) => {
-                log::warn!("accept 失败：{e}");
-                std::thread::sleep(Duration::from_millis(200));
-                continue;
+                if path::can_retry(args.p2p) && listener.is_some() {
+                    log::warn!("接入失败（{e}），200ms 后重试");
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+                return Err(e);
             }
         };
         accepted += 1;
         nonce_seq = nonce_seq.wrapping_add(1);
-        log::info!("第 {accepted} 条连接接入");
+        let path_name = link.path;
+        log::info!("第 {accepted} 条链路接入：path={path_name}");
 
-        if let Err(e) = session::run(conn, args, nonce_seq) {
+        if let Err(e) = session::run(link, args, nonce_seq) {
             log::error!("会话异常结束：{e}");
         }
-        log::info!("第 {accepted} 条连接结束，继续监听");
+        log::info!("第 {accepted} 条链路结束（path={path_name}），继续接入");
     }
 }
