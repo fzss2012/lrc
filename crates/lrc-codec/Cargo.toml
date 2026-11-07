@@ -8,5 +8,6 @@ license.workspace = true
 lrc-proto.workspace = true
 zstd.workspace = true
 jpeg-encoder.workspace = true
+jpeg-decoder = { version = "0.3", default-features = false }
 log.workspace = true
 thiserror.workspace = true

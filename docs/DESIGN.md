@@ -69,6 +69,13 @@ codec: 0 = Lossless(zstd+left-predict), 1 = Jpeg, 2 = Raw BGRA。
 
 ### 2.3 InputEvent
 
+**坐标语义（钉死）**：`InputEvent` 里的 `x/y` 是**被采集那一路输出（display）的本地像素坐标**，
+左上角为该输出的 (0,0)。被控端注入时自己加上 `ScreenInfo.origin_x/origin_y` 得到虚拟桌面坐标，
+再按 `SM_XVIRTUALSCREEN/SM_CXVIRTUALSCREEN` 归一化成 0..65535 交给 `SendInput`。
+这样主控端只管"我看到的那块画面里的第几个像素"，不用关心多屏布局。
+
+### 2.3.1 InputEvent
+
 ```
 kind:u8
   0 = MouseMove { x:i32, y:i32 }            // 被控端屏幕像素坐标
