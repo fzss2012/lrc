@@ -8,11 +8,11 @@ use std::time::{Duration, Instant};
 
 use lrc_adapt::{Controller, ControllerConfig, LinkStats, Mode as AdaptMode, Target};
 use lrc_capture::cursor::CursorWatcher;
-use lrc_capture::{CaptureError, Capturer, Frame, ScreenInfo};
+use lrc_capture::{CaptureError, Capturer, Frame, FrameView, MoveRect, ScreenInfo};
 use lrc_codec::{self, Options};
 use lrc_proto::{
-    auth_reason, frame_flags, AuthResult, BlockEntry, ClientHello, CursorPos, CursorShape, Grid,
-    Message, Pong, Rect, ServerHello, VideoFrame, PROTO_VERSION,
+    auth_reason, frame_flags, AuthResult, BlockEntry, ClientHello, CursorPos, CursorShape,
+    DisplayInfo, Grid, Message, Pong, Rect, ServerHello, VideoFrame, PROTO_VERSION,
 };
 use lrc_transport::{Conn, ConnReader, ConnWriter};
 use windows::Win32::System::SystemInformation::GetTickCount64;
@@ -70,11 +70,15 @@ pub(crate) struct Shared {
     last_sent_seq: AtomicU32,
     /// ack 往返（毫秒，平滑值；没有 ack 时为 0）
     rtt_ms: AtomicU32,
+    /// 最近一次收到 ack 的时刻（会话内毫秒）
+    last_ack_ms: AtomicU64,
     /// 客户端请求整帧。
     request_full: AtomicBool,
     /// 当前采集输出在虚拟桌面里的原点（输入坐标换算用）。
     origin_x: AtomicI32,
     origin_y: AtomicI32,
+    /// 客户端请求切换显示输出（-1 = 无请求）
+    select_display: AtomicI32,
 }
 
 impl Shared {
@@ -90,9 +94,11 @@ impl Shared {
             last_send_ms: AtomicU64::new(0),
             last_sent_seq: AtomicU32::new(0),
             rtt_ms: AtomicU32::new(0),
+            last_ack_ms: AtomicU64::new(0),
             request_full: AtomicBool::new(false),
             origin_x: AtomicI32::new(origin.0),
             origin_y: AtomicI32::new(origin.1),
+            select_display: AtomicI32::new(-1),
         }
     }
 
@@ -118,7 +124,7 @@ impl Shared {
     }
 
     /// 已发出但客户端还没确认的字节数（估算，用于流控）。
-    fn inflight_bytes(&self) -> u64 {
+    pub(crate) fn inflight_bytes(&self) -> u64 {
         let sent = self.writer_guard().sent_bytes();
         sent.saturating_sub(self.ack_bytes.load(Ordering::Relaxed))
     }
@@ -144,6 +150,7 @@ impl Shared {
     /// 帧级 ack 反算——含义是"发出这一帧 → 收到它的 ack"，含客户端解码+回执时间。
     fn note_ack(&self, seq: u32) {
         self.ack_seq.store(seq, Ordering::Relaxed);
+        self.last_ack_ms.store(self.elapsed_ms(), Ordering::Relaxed);
         // 客户端 ack 的往往不是"最近一帧"（会滞后一两帧），所以用"收到 ack 时距上次发送的时间"
         // 作为往返代理；这比只匹配 last_sent_seq 稳健得多（后者会长期采不到样）。
         let sent = self.last_send_ms.load(Ordering::Relaxed);
@@ -151,7 +158,12 @@ impl Shared {
             return;
         }
         let now = self.elapsed_ms();
-        let sample = now.saturating_sub(sent).min(5_000) as u32;
+        let sample = now.saturating_sub(sent);
+        // 空闲期后的第一个 ack 距上次发送很远，那不是 RTT，丢掉这种样本
+        if sample > 500 {
+            return;
+        }
+        let sample = sample as u32;
         let prev = self.rtt_ms.load(Ordering::Relaxed);
         let smoothed = if prev == 0 {
             sample
@@ -166,9 +178,16 @@ impl Shared {
         self.rtt_ms.load(Ordering::Relaxed)
     }
 
-    /// 已经收到过 ack，才启用基于未确认字节的流控。
-    fn ack_seen(&self) -> bool {
-        self.ack_seen.load(Ordering::Relaxed)
+    /// 基于 ack 的流控是否可信：收到过 ack 且最近 2 秒内还有 ack。
+    ///
+    /// 客户端如果只 ack 块帧、不 ack 视频 AU，未确认字节会一直涨；这种情况下
+    /// 不能按它丢帧，改由 TCP 背压 + 写超时兜底。
+    pub(crate) fn ack_fresh(&self) -> bool {
+        if !self.ack_seen.load(Ordering::Relaxed) {
+            return false;
+        }
+        let last = self.last_ack_ms.load(Ordering::Relaxed);
+        last != 0 && self.elapsed_ms().saturating_sub(last) <= 2_000
     }
 
     fn set_origin(&self, origin: (i32, i32)) {
@@ -181,6 +200,21 @@ impl Shared {
             self.origin_x.load(Ordering::Relaxed),
             self.origin_y.load(Ordering::Relaxed),
         )
+    }
+
+    /// 接收线程登记"客户端要切显示输出"。
+    fn request_display(&self, index: u8) {
+        self.select_display.store(i32::from(index), Ordering::Relaxed);
+    }
+
+    /// 采集线程取走切换请求（-1 = 无）。
+    fn take_display_request(&self) -> Option<u8> {
+        let v = self.select_display.swap(-1, Ordering::Relaxed);
+        if v < 0 {
+            None
+        } else {
+            u8::try_from(v).ok()
+        }
     }
 }
 
@@ -291,6 +325,31 @@ pub fn run(conn: Conn, args: &Args, nonce_seq: u64) -> Result<(), String> {
         args.video_max_fps
     );
 
+    // 显示输出列表：客户端据此做"切换显示器"菜单（之后会回 SelectDisplay）
+    match lrc_capture::list_outputs() {
+        Ok(list) => {
+            let infos: Vec<DisplayInfo> = list
+                .iter()
+                .enumerate()
+                .map(|(i, s)| DisplayInfo {
+                    index: u8::try_from(i).unwrap_or(u8::MAX),
+                    width: s.width,
+                    height: s.height,
+                    origin_x: s.origin_x,
+                    origin_y: s.origin_y,
+                    // 主显示器在虚拟桌面里恒为 (0,0)
+                    primary: s.origin_x == 0 && s.origin_y == 0,
+                })
+                .collect();
+            let payload = Message::DisplayList(infos).encode();
+            match writer.send(&payload) {
+                Ok(()) => log::info!("已下发 DisplayList（{} 个输出）", list.len()),
+                Err(e) => log::warn!("发送 DisplayList 失败：{e}"),
+            }
+        }
+        Err(e) => log::warn!("枚举显示输出失败，跳过 DisplayList：{e}"),
+    }
+
     // 会话期间：读端永久阻塞（靠 shutdown 唤醒），写端保留超时
     if let Err(e) = reader.set_read_timeout(None) {
         log::warn!("清除读超时失败：{e}");
@@ -302,6 +361,13 @@ pub fn run(conn: Conn, args: &Args, nonce_seq: u64) -> Result<(), String> {
     let shared = Arc::new(Shared::new(writer, (info.origin_x, info.origin_y)));
     // 视频通道：会话建立时创建编码器 + 预热探测（失败就一直用块模式，不重试）
     let pipeline = crate::video::start(args, info.width, info.height, Arc::clone(&shared));
+    // 音频通道（M3）：独立线程；设备/编码器不可用就告警一次并永久关闭
+    let mut audio_pipe = if args.audio {
+        crate::audio::start(Arc::clone(&shared))
+    } else {
+        log::info!("音频通道被 --audio off 关闭");
+        None
+    };
 
     let spawned = {
         let sh = Arc::clone(&shared);
@@ -318,7 +384,24 @@ pub fn run(conn: Conn, args: &Args, nonce_seq: u64) -> Result<(), String> {
         }
     };
 
+    let session_clock = Instant::now();
     let result = capture_loop(args, &mut capturer, &mut info, Arc::clone(&shared), pipeline);
+
+    // 音频通道收尾 + 统计
+    if let Some(a) = audio_pipe.as_mut() {
+        let (packets, bytes, fmt) = a.stats();
+        let secs = session_clock.elapsed().as_secs_f64().max(0.001);
+        let kbps = (bytes as f64 * 8.0 / 1000.0) / secs;
+        log::info!(
+            "音频通道：{} 包 / {} 字节（实测 {:.1} kbps，{}Hz/{}ch）",
+            packets,
+            bytes,
+            kbps,
+            fmt.sample_rate,
+            fmt.channels
+        );
+        a.stop();
+    }
 
     // 收尾：先让接收线程的阻塞读返回，再等它退出
     shared.stop.store(true, Ordering::Relaxed);
@@ -481,6 +564,10 @@ fn handle_incoming(payload: &[u8], shared: &Shared) {
         Message::RequestFull => {
             shared.request_full.store(true, Ordering::Relaxed);
             log::info!("客户端请求整帧");
+        }
+        Message::SelectDisplay(sel) => {
+            log::info!("客户端请求切换显示输出 → #{}", sel.index);
+            shared.request_display(sel.index);
         }
         Message::Ping(ping) => {
             let pong = Message::Pong(Pong { ts_ms: ping.ts_ms }).encode();
@@ -684,8 +771,129 @@ fn downscale_bgra(
     true
 }
 
+/// 当前采集输出的映射口径：输入注入和光标反算都用它（切换显示器后就换它）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisplayMapping {
+    index: usize,
+    /// 该输出在虚拟桌面里的原点
+    origin: (i32, i32),
+    /// 该输出的原生尺寸
+    size: (u32, u32),
+}
+
+impl DisplayMapping {
+    fn from_screen(index: usize, info: &ScreenInfo) -> Self {
+        Self {
+            index,
+            origin: (info.origin_x, info.origin_y),
+            size: (info.width, info.height),
+        }
+    }
+
+    /// 客户端本地坐标 → 虚拟桌面绝对坐标（0..=65535），给 SendInput 用。
+    ///
+    /// 生产路径上输入注入在接收线程里按 Shared::origin 算（那边只存 origin），
+    /// 这里保留给单测验证"切显示输出后同一本地坐标落到不同屏"。
+    #[cfg(test)]
+    fn to_absolute(self, local: (i32, i32), vd: input::VirtualDesktop) -> (i32, i32) {
+        input::local_to_absolute(local.0, local.1, self.origin, vd)
+    }
+
+    /// 桌面光标坐标 → 画面本地坐标 + 是否在画面内。
+    fn to_local(self, desk: (i32, i32), scale: f32) -> ((i32, i32), bool) {
+        map_cursor_pos(desk, self.origin, self.size, scale)
+    }
+}
+
+/// 一帧像素的统一视图：既可以是零拷贝借用的 FrameView，也可以是拥有的 Frame。
+/// 块路径只认这个类型，所以"零拷贝/拷贝"两种来源走同一套差分+编码代码。
+#[derive(Clone, Copy, Debug)]
+struct Pixels<'a> {
+    width: u32,
+    height: u32,
+    stride: usize,
+    bgra: &'a [u8],
+    dirty: &'a [Rect],
+    moves: &'a [MoveRect],
+    full: bool,
+    ts_ms: u64,
+}
+
+impl<'a> Pixels<'a> {
+    fn from_frame(f: &'a Frame) -> Self {
+        Self {
+            width: f.width,
+            height: f.height,
+            stride: f.stride,
+            bgra: &f.bgra,
+            dirty: &f.dirty,
+            moves: &f.moves,
+            full: f.full,
+            ts_ms: f.ts_ms,
+        }
+    }
+
+    fn from_view(v: &'a FrameView<'a>) -> Self {
+        Self {
+            width: v.width,
+            height: v.height,
+            stride: v.stride,
+            bgra: v.bgra,
+            dirty: v.dirty,
+            moves: v.moves,
+            full: v.full,
+            ts_ms: v.ts_ms,
+        }
+    }
+}
+
+/// 这一轮抓到的东西：视频模式要跨线程送编码器，所以必须拥有数据（grab() 会复制 8MB）；
+/// 块模式只在借用期内做差分+编码，用 grab_view() 零拷贝。
+enum Grabbed<'a> {
+    Owned(Frame),
+    Borrowed(FrameView<'a>),
+    Idle,
+}
+
+/// 整帧缓存刷新间隔：RequestFull 在静止桌面需要一帧拥有数据的副本，但**不能每帧都拷**。
+/// 每 500ms 拷一份 8MB 约等于 16MB/s，占用可以忽略；静止桌面下这份副本就是当前画面。
+const CACHE_REFRESH: Duration = Duration::from_millis(500);
+
+/// 把一帧零拷贝视图拷进"整帧缓存"（供静止桌面的 RequestFull 兜底）。
+fn refresh_cache_from_view(cached: &mut Option<Arc<Frame>>, view: &FrameView<'_>) {
+    let need = view.stride.saturating_mul(view.height as usize);
+    if need == 0 || view.bgra.len() < need {
+        return;
+    }
+    if let Some(arc) = cached.as_mut() {
+        if let Some(f) = Arc::get_mut(arc) {
+            if f.bgra.len() == need {
+                f.bgra.copy_from_slice(&view.bgra[..need]);
+                f.width = view.width;
+                f.height = view.height;
+                f.stride = view.stride;
+                f.full = view.full;
+                f.ts_ms = view.ts_ms;
+                f.dirty.clear();
+                f.moves.clear();
+                return;
+            }
+        }
+    }
+    *cached = Some(Arc::new(Frame {
+        width: view.width,
+        height: view.height,
+        stride: view.stride,
+        bgra: view.bgra[..need].to_vec(),
+        dirty: Vec::new(),
+        moves: Vec::new(),
+        full: view.full,
+        ts_ms: view.ts_ms,
+    }));
+}
+
 /// 把缩放结果放进一个可复用的 Frame（避免每帧重新分配几 MB）。
-fn prepare_scaled_frame(scaled: &mut Option<Frame>, src: &Frame, scale: f32) -> Option<(u32, u32)> {
+fn prepare_scaled_frame(scaled: &mut Option<Frame>, src: &Pixels<'_>, scale: f32) -> Option<(u32, u32)> {
     let (sw, sh) = scaled_dims(src.width, src.height, scale);
     let slot = scaled.get_or_insert_with(|| Frame {
         width: 0,
@@ -698,7 +906,7 @@ fn prepare_scaled_frame(scaled: &mut Option<Frame>, src: &Frame, scale: f32) -> 
         ts_ms: 0,
     });
     if !downscale_bgra(
-        &src.bgra,
+        src.bgra,
         src.stride,
         src.width,
         src.height,
@@ -742,7 +950,7 @@ fn capture_loop(
     let mut seq: u32 = 0;
     let mut force_full = true;
     let mut next_grab_at = Instant::now();
-    let mut cursor = CursorTracker::new((info.origin_x, info.origin_y), (info.width, info.height));
+    let mut cursor = CursorTracker::new(DisplayMapping::from_screen(args.display, info));
     // 最近一帧像素：RequestFull 在静止桌面时靠它补整帧。
     // 用 Arc 是为了视频模式能零拷贝地把同一帧交给编码线程（cached 自己还要留着补帧）。
     let mut cached: Option<Arc<Frame>> = None;
@@ -784,6 +992,14 @@ fn capture_loop(
     let mut sec = Stats::default();
     let mut last_report = Instant::now();
     let mut reopen_failures: u32 = 0;
+    // 当前采集的显示输出序号（会被 SelectDisplay 改）
+    let mut cur_display = args.display;
+    // 采集失败要重建采集器，但崩溃点那里还借用着 capturer（grab_view 的帧视图），
+    // 所以记下来到下一轮开头（借用已结束）再重建。
+    let mut pending_reopen: Option<CaptureError> = None;
+    // 整帧缓存上次刷新的时刻（RequestFull 静止兜底用，别每帧都拷）
+    let mut last_cache_copy = Instant::now() - CACHE_REFRESH;
+
 
     log::info!(
         "推流 {}x{} = {}x{} 块（{}px），上限 {}fps，JPEG q{}",
@@ -800,6 +1016,96 @@ fn capture_loop(
         if shared.stop() {
             break;
         }
+        // 上一轮采集失败：在这里重建采集器（此时没有任何帧借用存活）
+        if let Some(err) = pending_reopen.take() {
+            reopen_failures += 1;
+            if reopen_failures > CAPTURE_REOPEN_TRIES {
+                return Err(format!("采集器连续 {reopen_failures} 次重建失败，放弃会话"));
+            }
+            log::warn!("采集出错（{err}），重建采集器（第 {} 次）", reopen_failures);
+            let backoff = u64::from(reopen_failures).min(10) * 100;
+            std::thread::sleep(Duration::from_millis(backoff));
+            match open_capturer(cur_display) {
+                Ok((fresh, fresh_info)) => {
+                    *capturer = fresh;
+                    *info = fresh_info;
+                    track = Track::new(fresh_info.width, fresh_info.height).ok_or_else(|| {
+                        format!("重建后尺寸非法 {}x{}", fresh_info.width, fresh_info.height)
+                    })?;
+                    cached = None;
+                    scaled = None;
+                    let mapping = DisplayMapping::from_screen(cur_display, &fresh_info);
+                    cursor.set_mapping(mapping, 1.0);
+                    shared.set_origin(mapping.origin);
+                    reopen_failures = 0;
+                    log::info!(
+                        "采集器已重建 {}x{} origin=({}, {})",
+                        fresh_info.width,
+                        fresh_info.height,
+                        fresh_info.origin_x,
+                        fresh_info.origin_y
+                    );
+                }
+                Err(e2) => log::warn!("重建采集器失败：{e2}"),
+            }
+            next_grab_at = Instant::now() + frame_interval;
+            continue;
+        }
+        // 客户端请求切换显示输出：重建 Capturer + 更新 origin + 下一帧整帧重同步
+        if let Some(idx) = shared.take_display_request() {
+            log::info!("处理显示输出切换请求：#{} → #{}", cur_display, idx);
+            let exists = lrc_capture::list_outputs()
+                .map(|v| usize::from(idx) < v.len())
+                .unwrap_or(true);
+            if !exists {
+                log::warn!("显示输出 #{} 不存在，忽略切换请求", idx);
+            } else {
+                match open_capturer(usize::from(idx)) {
+                    Ok((fresh, fresh_info)) => {
+                        let mapping = DisplayMapping::from_screen(usize::from(idx), &fresh_info);
+                        *capturer = fresh;
+                        *info = fresh_info;
+                        cur_display = mapping.index;
+                        track = Track::new(fresh_info.width, fresh_info.height).ok_or_else(|| {
+                            format!("切换后尺寸非法 {}x{}", fresh_info.width, fresh_info.height)
+                        })?;
+                        cached = None;
+                        scaled = None;
+                        last_cache_copy = Instant::now();
+                        cursor.set_mapping(mapping, adapt.scale);
+                        shared.set_origin(mapping.origin);
+                        // 视频编码器是按旧尺寸建的：尺寸不一致就本会话禁用视频，否则回块模式重同步
+                        if let Some(p) = pipeline.as_ref() {
+                            if p.frame_size() != mapping.size {
+                                log::warn!(
+                                    "新显示 {}x{} 与视频编码器 {}x{} 尺寸不一致 → 本会话禁用视频通道",
+                                    mapping.size.0,
+                                    mapping.size.1,
+                                    p.frame_size().0,
+                                    p.frame_size().1
+                                );
+                                mode_switch.disable_video();
+                            } else {
+                                mode_switch.force_blocks();
+                            }
+                        }
+                        force_full = true;
+                        log::info!(
+                            "已切换到显示输出 #{}：{}x{} origin=({}, {})，下一帧发整帧重同步",
+                            mapping.index,
+                            mapping.size.0,
+                            mapping.size.1,
+                            mapping.origin.0,
+                            mapping.origin.1
+                        );
+                    }
+                    Err(e) => log::warn!("切换显示输出 #{} 失败：{e}", idx),
+                }
+            }
+            next_grab_at = Instant::now();
+            continue;
+        }
+
         let video_now = pipeline
             .as_ref()
             .map(|p| p.counters())
@@ -822,10 +1128,12 @@ fn capture_loop(
                 } else {
                     0.0
                 };
+                let ack_fresh = shared.ack_fresh();
                 let link = LinkStats {
                     bytes_sent: sample.bytes,
-                    inflight_bytes: shared.inflight_bytes(),
-                    rtt_ms: shared.rtt_ms(),
+                    // ack 停了就别把积压/延迟当拥塞信号（否则会一直降档到停发）
+                    inflight_bytes: if ack_fresh { shared.inflight_bytes() } else { 0 },
+                    rtt_ms: if ack_fresh { shared.rtt_ms() } else { 0 },
                     dropped_frames: sample.dropped,
                     changed_ratio: ratio.clamp(0.0, 1.0),
                     fps: sample.fps,
@@ -881,8 +1189,7 @@ fn capture_loop(
                     track = Track::new(sw, sh)
                         .ok_or_else(|| format!("缩放尺寸非法 {sw}x{sh}"))?;
                     cursor.set_mapping(
-                        (info.origin_x, info.origin_y),
-                        (info.width, info.height),
+                        DisplayMapping::from_screen(cur_display, info),
                         adapt.scale,
                     );
                     force_full = true;
@@ -939,62 +1246,62 @@ fn capture_loop(
         }
 
         let t_cap = Instant::now();
-        let grabbed = capturer.grab();
+        // 视频模式要把整帧交给编码线程（跨线程）→ 必须拥有数据，走 grab()（复制 8MB）；
+        // 块模式只在本轮借用期内做差分+编码 → 走 grab_view()（零拷贝，省 ~2.7ms/帧）。
+        let want_owned = mode_switch.mode() == Mode::Video;
+        let grabbed: Result<Grabbed<'_>, CaptureError> = if want_owned {
+            capturer.grab().map(|o| match o {
+                Some(f) => Grabbed::Owned(f),
+                None => Grabbed::Idle,
+            })
+        } else {
+            capturer.grab_view().map(|o| match o {
+                Some(v) => Grabbed::Borrowed(v),
+                None => Grabbed::Idle,
+            })
+        };
         let capture_ms = t_cap.elapsed().as_secs_f64() * 1000.0;
 
         let mut has_new_frame = false;
+        let mut owned_frame: Option<Frame> = None;
+        let mut view_frame: Option<FrameView<'_>> = None;
         // 抓帧完成时刻（视频 AU 的 ts_ms 用它）：GetTickCount64 低 32 位。
         // 和客户端 lat_ms 的 now 同源，**只在同机测试时有效**，跨机只能作参考。
         let capture_tick = unsafe { GetTickCount64() } as u32;
         match grabbed {
-            Ok(Some(f)) => {
+            Ok(Grabbed::Owned(f)) => {
                 has_new_frame = true;
-                // 缓存最近一帧像素（整体换出，不 clone）；RequestFull 静止时用它重发
-                cached = Some(Arc::new(f));
+                owned_frame = Some(f);
             }
-            Ok(None) => {
+            Ok(Grabbed::Borrowed(v)) => {
+                has_new_frame = true;
+                view_frame = Some(v);
+            }
+            Ok(Grabbed::Idle) => {
                 // 没有任何像素变化：一个字节的画面数据都不发（零变化零发送的源头）
                 sec.idle += 1;
             }
             Err(e @ (CaptureError::Lost | CaptureError::Runtime(_))) => {
+                // 此刻帧视图还借用着 capturer，不能直接重建：记下来下一轮开头建
                 log::warn!("采集出错：{e}");
-                reopen_failures += 1;
-                if reopen_failures > CAPTURE_REOPEN_TRIES {
-                    return Err(format!("采集器连续 {reopen_failures} 次重建失败，放弃会话"));
-                }
-                let backoff = u64::from(reopen_failures).min(10) * 100;
-                std::thread::sleep(Duration::from_millis(backoff));
-                match open_capturer(args.display) {
-                    Ok((fresh, fresh_info)) => {
-                        *capturer = fresh;
-                        *info = fresh_info;
-                        track = Track::new(fresh_info.width, fresh_info.height).ok_or_else(|| {
-                            format!("重建后尺寸非法 {}x{}", fresh_info.width, fresh_info.height)
-                        })?;
-                        cached = None;
-                        cursor.set_mapping(
-                            (fresh_info.origin_x, fresh_info.origin_y),
-                            (fresh_info.width, fresh_info.height),
-                            1.0,
-                        );
-                        shared.set_origin((fresh_info.origin_x, fresh_info.origin_y));
-                        reopen_failures = 0;
-                        log::info!(
-                            "采集器已重建 {}x{} origin=({}, {})",
-                            fresh_info.width,
-                            fresh_info.height,
-                            fresh_info.origin_x,
-                            fresh_info.origin_y
-                        );
-                    }
-                    Err(e2) => log::warn!("重建采集器失败：{e2}"),
-                }
-                next_grab_at = Instant::now() + frame_interval;
+                pending_reopen = Some(e);
                 continue;
             }
             Err(CaptureError::Unsupported(m)) => return Err(format!("采集不支持：{m}")),
             Err(CaptureError::Init(m)) => return Err(format!("采集初始化失败：{m}")),
-        };
+        }
+
+        // 视频模式：owned 帧直接进缓存（Arc 复用，编码线程零拷贝拿同一份）
+        if let Some(f) = owned_frame.take() {
+            cached = Some(Arc::new(f));
+        }
+        // 块模式：维护"整帧缓存"（RequestFull 静止时兜底），每 500ms 拷一份，不每帧拷
+        if let Some(v) = view_frame.as_ref() {
+            if cached.is_none() || last_cache_copy.elapsed() >= CACHE_REFRESH {
+                refresh_cache_from_view(&mut cached, v);
+                last_cache_copy = Instant::now();
+            }
+        }
 
         let request_full_now = shared.request_full.swap(false, Ordering::Relaxed);
 
@@ -1052,7 +1359,7 @@ fn capture_loop(
                                 }
                                 ModeEvent::EnterVideo => {}
                                 ModeEvent::None => {
-                                    if shared.ack_seen()
+                                    if shared.ack_fresh()
                                         && shared.inflight_bytes() > MAX_INFLIGHT_BYTES
                                     {
                                         sec.dropped += 1;
@@ -1115,7 +1422,14 @@ fn capture_loop(
             continue;
         }
 
-        let Some(frame) = cached.as_deref() else {
+        // 像素来源：有新帧 → 零拷贝视图（块模式）或拥有帧（视频模式回退时进 cached）；
+        // 没有新帧的补帧 → 整帧缓存。
+        let mut px = match view_frame.as_ref() {
+            Some(v) => Some(Pixels::from_view(v)),
+            None => cached.as_deref().map(Pixels::from_frame),
+        };
+
+        let Some(mut px) = px.take() else {
             // 还没有抓到过任何像素：把整帧请求放回去，抓到帧之后再补
             if request_full_now {
                 shared.request_full.store(true, Ordering::Relaxed);
@@ -1132,8 +1446,12 @@ fn capture_loop(
         // 自适应降分辨率：编码前把整帧缩到 scale 尺寸。
         // 缩放帧一律当整帧处理（网格按缩放后尺寸重建、光标坐标按 scale 换算、客户端画面也变小）。
         if adapt.scale_active() {
-            match prepare_scaled_frame(&mut scaled, frame, adapt.scale) {
-                Some(_) => {}
+            match prepare_scaled_frame(&mut scaled, &px, adapt.scale) {
+                Some(_) => {
+                    if let Some(f) = scaled.as_ref() {
+                        px = Pixels::from_frame(f);
+                    }
+                }
                 None => {
                     log::warn!("降分辨率失败（帧缓冲异常），本帧跳过");
                     if let Err(e) = cursor.poll_and_send(&shared, &mut sec) {
@@ -1145,18 +1463,10 @@ fn capture_loop(
                 }
             }
         }
-        let frame: &Frame = if adapt.scale_active() {
-            match scaled.as_ref() {
-                Some(f) => f,
-                None => frame,
-            }
-        } else {
-            frame
-        };
 
         // 流控：客户端没确认的字节太多 → 丢这一帧、不排队。
         // 这一帧的 dirty rect 已经消费掉了，所以下一帧必须全盘重扫（否则变化块永久丢失）。
-        if shared.ack_seen() && shared.inflight_bytes() > MAX_INFLIGHT_BYTES {
+        if shared.ack_fresh() && shared.inflight_bytes() > MAX_INFLIGHT_BYTES {
             sec.dropped += 1;
             track.scan_all = true;
             if request_full_now {
@@ -1169,34 +1479,33 @@ fn capture_loop(
         }
 
         // 分辨率 / 显示切换（只会发生在新帧上：缓存帧的尺寸就是 track 的尺寸）
-        if frame.width != track.width || frame.height != track.height {
+        if px.width != track.width || px.height != track.height {
             log::info!(
                 "采集尺寸变化 {}x{} → {}x{}，重建块网格",
                 track.width,
                 track.height,
-                frame.width,
-                frame.height
+                px.width,
+                px.height
             );
-            track = Track::new(frame.width, frame.height)
-                .ok_or_else(|| format!("帧尺寸非法 {}x{}", frame.width, frame.height))?;
+            track = Track::new(px.width, px.height)
+                .ok_or_else(|| format!("帧尺寸非法 {}x{}", px.width, px.height))?;
             cursor.set_mapping(
-                (info.origin_x, info.origin_y),
-                (info.width, info.height),
+                DisplayMapping::from_screen(cur_display, info),
                 adapt.scale,
             );
         }
 
         // 首帧 / 客户端请求整帧 / 刚重建过 → 整帧发，flags 带 FULL|KEY
         let send_full = force_full || !track.have_prev;
-        let scan_all = send_full || track.scan_all || frame.full;
+        let scan_all = send_full || track.scan_all || px.full;
 
         if scan_all {
             cand.clear();
             cand.extend(0..track.grid.count());
         } else {
             rects.clear();
-            rects.extend_from_slice(&frame.dirty);
-            for mv in &frame.moves {
+            rects.extend_from_slice(px.dirty);
+            for mv in px.moves {
                 rects.push(mv.dst);
                 rects.push(mv.src);
             }
@@ -1209,15 +1518,15 @@ fn capture_loop(
             let Some(rect) = track.grid.block_rect(idx, track.width, track.height) else {
                 continue;
             };
-            let Some(offset) = pixel_offset(&rect, frame.stride) else {
+            let Some(offset) = pixel_offset(&rect, px.stride) else {
                 continue;
             };
-            if offset >= frame.bgra.len() {
+            if offset >= px.bgra.len() {
                 continue;
             }
             let hash = norm_hash(lrc_capture::hash_block(
-                &frame.bgra[offset..],
-                frame.stride,
+                &px.bgra[offset..],
+                px.stride,
                 rect.w,
                 rect.h,
             ));
@@ -1283,10 +1592,10 @@ fn capture_loop(
             let Some(rect) = track.grid.block_rect(idx, track.width, track.height) else {
                 continue;
             };
-            let Some(offset) = pixel_offset(&rect, frame.stride) else {
+            let Some(offset) = pixel_offset(&rect, px.stride) else {
                 continue;
             };
-            if offset >= frame.bgra.len() {
+            if offset >= px.bgra.len() {
                 continue;
             }
             while slots.len() <= used {
@@ -1294,8 +1603,8 @@ fn capture_loop(
             }
             let slot = &mut slots[used];
             match lrc_codec::encode_block(
-                &frame.bgra[offset..],
-                frame.stride,
+                &px.bgra[offset..],
+                px.stride,
                 rect.w,
                 rect.h,
                 &opts,
@@ -1599,22 +1908,19 @@ struct CursorTracker {
     watcher: CursorWatcher,
     last_pos: Option<(i16, i16, bool)>,
     last_shape: Option<Arc<lrc_capture::CursorShape>>,
-    /// 采集输出在虚拟桌面里的原点
-    origin: (i32, i32),
-    /// 原生采集尺寸（判断光标是否在采集区域内）
-    native: (u32, u32),
-    /// 自适应降分辨率时的坐标缩放（1.0 = 原生）；客户端画面 = native × scale
+    /// 当前显示输出的映射口径（原点 + 原生尺寸）
+    mapping: DisplayMapping,
+    /// 自适应降分辨率时的坐标缩放（1.0 = 原生）；客户端画面 = size × scale
     scale: f32,
 }
 
 impl CursorTracker {
-    fn new(origin: (i32, i32), region: (u32, u32)) -> Self {
+    fn new(mapping: DisplayMapping) -> Self {
         Self {
             watcher: CursorWatcher::new(),
             last_pos: None,
             last_shape: None,
-            origin,
-            native: region,
+            mapping,
             scale: 1.0,
         }
     }
@@ -1624,9 +1930,8 @@ impl CursorTracker {
     }
 
     /// 采集器重建 / 分辨率变化 / 自适应缩放变化时更新映射口径。
-    fn set_mapping(&mut self, origin: (i32, i32), native: (u32, u32), scale: f32) {
-        self.origin = origin;
-        self.native = native;
+    fn set_mapping(&mut self, mapping: DisplayMapping, scale: f32) {
+        self.mapping = mapping;
         self.scale = if scale.is_finite() && scale > 0.0 {
             scale
         } else {
@@ -1643,8 +1948,7 @@ impl CursorTracker {
             return Ok(());
         };
 
-        let ((sx, sy), inside) =
-            map_cursor_pos((state.x, state.y), self.origin, self.native, self.scale);
+        let ((sx, sy), inside) = self.mapping.to_local((state.x, state.y), self.scale);
         let pos = (clamp_i16(sx), clamp_i16(sy), state.visible && inside);
         if self.last_pos != Some(pos) {
             let payload = Message::CursorPos(CursorPos {
@@ -1927,6 +2231,7 @@ mod tests {
             video_bitrate: 4_000_000,
             video_max_fps: 30,
             budget_bps: 2_000_000,
+            audio: false,
         }
     }
 
@@ -2045,6 +2350,49 @@ mod tests {
         assert_eq!(adapt.block_quality, args.quality);
         assert_eq!(adapt.scale, 1.0);
         assert_eq!(adapt.video_bitrate, args.video_bitrate);
+    }
+
+    fn screen(index_origin: (i32, i32)) -> ScreenInfo {
+        ScreenInfo {
+            width: 1920,
+            height: 1080,
+            rotation: 0,
+            origin_x: index_origin.0,
+            origin_y: index_origin.1,
+        }
+    }
+
+    #[test]
+    fn display_switch_updates_origin_for_input_and_cursor() {
+        // 双屏并排：display0 origin=(0,0)，display1 origin=(1920,0)
+        let d0 = DisplayMapping::from_screen(0, &screen((0, 0)));
+        let d1 = DisplayMapping::from_screen(1, &screen((1920, 0)));
+        let vd = input::VirtualDesktop {
+            x: 0,
+            y: 0,
+            w: 3840,
+            h: 1080,
+        };
+        // 同一本地坐标在不同显示输出上落到不同桌面位置
+        let (ax0, _) = d0.to_absolute((100, 50), vd);
+        let (ax1, ay1) = d1.to_absolute((100, 50), vd);
+        assert!(ax0 < 10_000, "display0 应在左半屏: ax0={ax0}");
+        assert!(ax1 > 32_000, "display1 应在右半屏: ax1={ax1}");
+        assert!(ay1 < 10_000);
+        // 光标反算：桌面 (2020,50) 在 display1 上是本地 (100,50)，在 display0 上不在画面内
+        let ((lx, ly), inside) = d1.to_local((2020, 50), 1.0);
+        assert_eq!((lx, ly), (100, 50));
+        assert!(inside);
+        let ((_, _), inside) = d0.to_local((2020, 50), 1.0);
+        assert!(!inside, "display0 上不应包含 display1 的坐标");
+        // 切回 display0 也一致
+        let ((lx, ly), inside) = d0.to_local((100, 50), 1.0);
+        assert_eq!((lx, ly), (100, 50));
+        assert!(inside);
+        assert_eq!(d0.index, 0);
+        assert_eq!(d1.index, 1);
+        assert_eq!(d1.origin, (1920, 0));
+        assert_eq!(d1.size, (1920, 1080));
     }
 
     #[test]

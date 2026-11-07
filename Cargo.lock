@@ -382,6 +382,7 @@ dependencies = [
  "hmac",
  "log",
  "lrc-adapt",
+ "lrc-audio",
  "lrc-capture",
  "lrc-codec",
  "lrc-proto",

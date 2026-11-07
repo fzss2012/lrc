@@ -327,6 +327,8 @@ struct Stats {
     video_frames: u64,
     /// 上一次的管线延迟（这一秒没有视频帧时沿用）
     lat_ms: f64,
+    /// 上一次的音频 RMS（这一秒没有音频包时沿用）
+    audio_rms: f32,
 }
 
 impl Stats {
@@ -337,6 +339,7 @@ impl Stats {
             bytes: 0,
             video_frames: 0,
             lat_ms: 0.0,
+            audio_rms: 0.0,
         }
     }
 }
@@ -594,6 +597,12 @@ impl AppState {
         if stride < clean_stride {
             log::warn!("视频帧 stride 非法: {stride} < {clean_stride}");
             return;
+        }
+        // 视频帧尺寸就是实际画面尺寸（服务端降分辨率时和 ServerHello 不同）：
+        // 让 remote_size 跟上，鼠标映射/光标 bbox 才不会点偏
+        if self.shared.remote_size() != Some((width, height)) {
+            log::info!("按视频帧尺寸校正画布：{width}x{height}");
+            self.shared.set_remote_size(width, height);
         }
         // 尺寸变了（被控端分辨率切换）：重建呈现面 + clean
         self.ensure_surface_for(width, height);
@@ -1013,12 +1022,18 @@ impl AppState {
             Some(avg) => avg,
             None => self.stats.lat_ms,
         };
+        // 最近一秒解码 PCM 的 RMS 平均（没有音频包就沿用上一次）
+        let audio_rms = match self.shared.take_audio_rms() {
+            Some(rms) => rms,
+            None => self.stats.audio_rms,
+        };
         self.stats = Stats {
             at: now,
             frames,
             bytes,
             video_frames,
             lat_ms,
+            audio_rms,
         };
         if !self.stats_enabled || dt <= 0.0 {
             return;
@@ -1034,7 +1049,7 @@ impl AppState {
         println!(
             "fps={fps:.0} recv_kbps={kbps:.1} decoded_blocks={blocks} rtt_ms={rtt_ms:.3} \
 mode={mode} video_fps={video_fps:.1} lat_ms={lat_ms:.1} reconnects={} audio={} \
-audio_ms={} audio_pkts={audio_pkts} audio_drop={audio_drop} displays={}",
+audio_rms={audio_rms:.4} audio_ms={} audio_pkts={audio_pkts} audio_drop={audio_drop} displays={}",
             self.shared.reconnect_count(),
             self.shared.audio_state_name(),
             self.shared.audio_buffered_ms(),

@@ -14,18 +14,129 @@ use crate::{AudioError, AudioResult};
 /// 不弹控制台窗口。
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// 找 ffmpeg：显式覆盖 > 本机默认安装路径 > PATH。
-pub(crate) fn resolve_ffmpeg(configured: Option<&str>) -> String {
-    if let Some(p) = configured {
-        if !p.trim().is_empty() {
-            return p.to_string();
+/// 本机已知的 ffmpeg 安装路径（与 lrc-video 的 KNOWN_FFMPEG 保持一致）。
+pub(crate) const KNOWN_FFMPEG: &str =
+    r"C:\Program Files\ffmpeg-8.0.1-essentials_build\bin\ffmpeg.exe";
+
+/// 环境变量名（与 lrc-video 一致）。
+pub(crate) const FFMPEG_ENV: &str = "LRC_FFMPEG";
+
+/// 解析逻辑本体（纯函数，方便单测）：显式参数 > 环境变量 > 已知安装路径。
+///
+/// 三步都拿不到返回 None，调用方用 "ffmpeg" 交给 PATH。
+fn resolve_from(
+    configured: Option<&str>,
+    from_env: Option<&str>,
+    known: Option<&str>,
+) -> Option<String> {
+    for candidate in [configured, from_env] {
+        if let Some(p) = candidate {
+            let p = p.trim();
+            if !p.is_empty() {
+                return Some(p.to_string());
+            }
         }
     }
-    const DEFAULT: &str = r"C:\Program Files\ffmpeg-8.0.1-essentials_build\bin\ffmpeg.exe";
-    if std::path::Path::new(DEFAULT).is_file() {
-        return DEFAULT.to_string();
+    known.map(str::to_string)
+}
+
+/// 找 ffmpeg：显式参数 > 环境变量 LRC_FFMPEG > 已知安装路径 >（调用方）PATH。
+///
+/// 与 lrc-video 的解析顺序完全一致；前三步都没有时返回 None。
+pub(crate) fn resolve_ffmpeg(configured: Option<&str>) -> Option<String> {
+    let from_env = std::env::var(FFMPEG_ENV).ok();
+    let known = if std::path::Path::new(KNOWN_FFMPEG).is_file() {
+        Some(KNOWN_FFMPEG)
+    } else {
+        None
+    };
+    resolve_from(configured, from_env.as_deref(), known)
+}
+
+/// 取一个能直接交给 Command::new 的路径：解析结果，否则用 PATH 上的 ffmpeg。
+pub(crate) fn ffmpeg_command(configured: Option<&str>) -> String {
+    resolve_ffmpeg(configured).unwrap_or_else(|| String::from("ffmpeg"))
+}
+
+#[cfg(test)]
+pub(crate) static FFMPEG_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lock() -> std::sync::MutexGuard<'static, ()> {
+        FFMPEG_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
-    "ffmpeg".to_string()
+
+    #[test]
+    fn explicit_argument_wins_over_everything() {
+        assert_eq!(
+            resolve_from(Some(r"D:\a\ffmpeg.exe"), Some(r"D:\b"), Some("c")).as_deref(),
+            Some(r"D:\a\ffmpeg.exe")
+        );
+    }
+
+    #[test]
+    fn env_beats_known_path() {
+        assert_eq!(
+            resolve_from(None, Some(r"D:\env\ffmpeg.exe"), Some("known")).as_deref(),
+            Some(r"D:\env\ffmpeg.exe")
+        );
+    }
+
+    #[test]
+    fn known_path_is_last_resort() {
+        assert_eq!(
+            resolve_from(None, None, Some("known")).as_deref(),
+            Some("known")
+        );
+        // 三步都空 → None，调用方走 PATH
+        assert_eq!(resolve_from(None, None, None), None);
+        // 空串/纯空格当作没给
+        assert_eq!(
+            resolve_from(Some("   "), Some(""), Some("known")).as_deref(),
+            Some("known")
+        );
+        assert_eq!(resolve_from(Some(""), None, None), None);
+    }
+
+    /// 设 LRC_FFMPEG → 解析出该路径；清掉 → 不再是它（回到已知路径或 None）。
+    #[test]
+    fn env_var_is_honored() {
+        let _guard = lock();
+        let saved = std::env::var(FFMPEG_ENV).ok();
+        let probe = r"D:\tmp\ffmpeg-env-probe.exe";
+
+        std::env::set_var(FFMPEG_ENV, probe);
+        let with_env = resolve_ffmpeg(None);
+        std::env::remove_var(FFMPEG_ENV);
+        let without_env = resolve_ffmpeg(None);
+
+        if let Some(p) = saved {
+            std::env::set_var(FFMPEG_ENV, p);
+        }
+
+        assert_eq!(with_env.as_deref(), Some(probe), "设了环境变量就该用它");
+        assert_ne!(
+            without_env.as_deref(),
+            Some(probe),
+            "清掉环境变量后不该再解析到它"
+        );
+        // 清掉之后要么回到已知安装路径，要么 None（交给 PATH）
+        assert!(
+            without_env.is_none() || without_env.as_deref() == Some(KNOWN_FFMPEG),
+            "兜底只可能是已知路径或 None"
+        );
+    }
+
+    #[test]
+    fn explicit_path_is_used_for_command() {
+        let _guard = lock();
+        assert_eq!(ffmpeg_command(Some(r"D:\x\ffmpeg.exe")), r"D:\x\ffmpeg.exe");
+    }
 }
 
 /// 一个 ffmpeg 子进程（stdin 灌数据、stdout 取数据）。
@@ -96,6 +207,7 @@ impl FfmpegChild {
         self.stdout
             .read_exact(&mut self.pending[start..])
             .map_err(|e| AudioError::Io(format!("读 ffmpeg stdout: {e}")))?;
+        self.resync_ogg();
         Ok(n)
     }
 
@@ -106,34 +218,6 @@ impl FfmpegChild {
                 log::warn!("audio: ffmpeg 输出里混进 {pos} 字节垃圾，已丢弃");
                 self.pending.drain(..pos);
             }
-        }
-    }
-
-    /// 等到 pending 里能切出至少一页 Ogg，最多等 wait_ms。
-    pub fn wait_page(&mut self, wait_ms: u32) -> AudioResult<()> {
-        let deadline = Instant::now() + Duration::from_millis(u64::from(wait_ms));
-        loop {
-            self.pump()?;
-            self.resync_ogg();
-            if crate::ogg::page_len(&self.pending).is_some() {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    }
-
-    /// 等到 pending 里至少有 at_least 字节，最多等 wait_ms。
-    pub fn wait_bytes(&mut self, wait_ms: u32, at_least: usize) -> AudioResult<()> {
-        let deadline = Instant::now() + Duration::from_millis(u64::from(wait_ms));
-        loop {
-            self.pump()?;
-            if self.pending.len() >= at_least || Instant::now() >= deadline {
-                return Ok(());
-            }
-            std::thread::sleep(Duration::from_millis(2));
         }
     }
 

@@ -191,11 +191,18 @@ pub struct VideoPipeline {
     pipe: Arc<Pipe>,
     handle: Option<std::thread::JoinHandle<()>>,
     codec_name: String,
+    /// 编码器创建时的画面尺寸（切显示输出后尺寸不一致就不能再用）
+    frame_size: (u32, u32),
 }
 
 impl VideoPipeline {
     pub fn codec_name(&self) -> &str {
         &self.codec_name
+    }
+
+    /// 编码器创建时的画面尺寸。
+    pub fn frame_size(&self) -> (u32, u32) {
+        self.frame_size
     }
 
     /// 请求改视频码率（编码线程在下一帧前用 set_bitrate 应用；会重启编码进程 ~100-300ms，
@@ -355,6 +362,7 @@ pub fn start(args: &Args, width: u32, height: u32, shared: Arc<Shared>) -> Optio
         pipe,
         handle: Some(handle),
         codec_name: ffmpeg_codec.to_string(),
+        frame_size: (width, height),
     })
 }
 

@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
-use lrc_audio::{AudioFormat, OpusDecoder, Player};
+use lrc_audio::{pcm_stats, AudioFormat, OpusDecoder, Player};
 use lrc_proto::AudioFrame;
 
 use crate::state::{audio_state, Shared};
@@ -105,7 +105,7 @@ pub struct AudioSink {
 
 impl AudioSink {
     /// 启动音频线程。\`enabled=false\`（--audio off）时不建线程，返回 None。
-    pub fn start(enabled: bool, shared: Arc<Shared>) -> Option<Self> {
+    pub fn start(enabled: bool, shared: Arc<Shared>, dump_path: Option<String>) -> Option<Self> {
         if !enabled {
             shared.set_audio_state(audio_state::OFF);
             return None;
@@ -115,7 +115,7 @@ impl AudioSink {
         let worker_shared = shared.clone();
         let spawned = std::thread::Builder::new()
             .name(String::from("lrc-client-audio"))
-            .spawn(move || worker(worker_shared, worker_queue));
+            .spawn(move || worker(worker_shared, worker_queue, dump_path));
         match spawned {
             Ok(_) => Some(Self {
                 queue,
@@ -174,11 +174,31 @@ impl Drop for AudioSink {
 }
 
 /// 音频线程：解码 + 播放，失败就关闭通道（不重试）。
-fn worker(shared: Arc<Shared>, queue: Arc<AudioQueue>) {
+///
+/// 每解出一个 20ms 的 PCM 块都会算 RMS 汇报给窗口线程（--stats 的 audio_rms），
+/// 这样同机回环自激时也能用数字证明"真的收到/解码/播放了声音"。
+fn worker(shared: Arc<Shared>, queue: Arc<AudioQueue>, dump_path: Option<String>) {
     let mut decoder: Option<OpusDecoder> = None;
     let mut player: Option<Player> = None;
     let mut format = AudioFormat::default();
     let mut pcm: Vec<u8> = Vec::new();
+    let mut dump = match dump_path.as_deref() {
+        Some(path) => match std::fs::File::create(path) {
+            Ok(file) => {
+                log::info!("音频 PCM 将写到 {path}（s16le 48k/2ch）");
+                Some(file)
+            }
+            Err(e) => {
+                log::warn!("音频 PCM 落盘失败（{path}）：{e}");
+                None
+            }
+        },
+        None => None,
+    };
+    if let Some(file) = dump.as_mut() {
+        use std::io::Write as _;
+        let _ = file.flush();
+    }
 
     while let Some(packet) = queue.pop() {
         if shared.audio_state() == audio_state::ERR {
@@ -199,6 +219,13 @@ fn worker(shared: Arc<Shared>, queue: Arc<AudioQueue>) {
             }
             match OpusDecoder::new(next, None) {
                 Ok(dec) => {
+                    if format != next {
+                        log::info!(
+                            "音频格式变化（{} Hz / {} ch）：重建解码器与播放器",
+                            next.sample_rate,
+                            next.channels
+                        );
+                    }
                     format = next;
                     decoder = Some(dec);
                     player = None;
@@ -220,6 +247,16 @@ fn worker(shared: Arc<Shared>, queue: Arc<AudioQueue>) {
         }
         if pcm.is_empty() {
             continue;
+        }
+        // 每个 20ms 包算一次 RMS：验收看 audio_rms > 0.01 就说明真的解出声音了
+        let (rms, _peak, _nonzero) = pcm_stats(&pcm);
+        shared.add_audio_rms(rms);
+        if let Some(file) = dump.as_mut() {
+            use std::io::Write as _;
+            if let Err(e) = file.write_all(&pcm) {
+                log::warn!("音频 PCM 落盘失败：{e}");
+                dump = None;
+            }
         }
         if player.is_none() {
             match Player::new(format) {
@@ -289,7 +326,8 @@ mod tests {
             }
         }
         assert_eq!(dropped, 5, "超出深度的 5 个包应丢最旧");
-        // 剩下的应该是最新的 10 个
+        // 剩下的应该是最新的 10 个；先 close 再 drain（否则 pop 会一直等新包）
+        queue.close();
         let mut seqs = Vec::new();
         while let Some(p) = queue.pop() {
             seqs.push(p.seq);

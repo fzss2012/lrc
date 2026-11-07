@@ -8,7 +8,7 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use lrc_proto::DisplayInfo;
+use lrc_proto::{DisplayInfo, Grid};
 use windows::Win32::System::SystemInformation::GetTickCount64;
 
 /// 音频通道状态（--stats 的 audio= 字段）。
@@ -164,6 +164,9 @@ pub struct Shared {
     pub audio_drop: AtomicU64,
     /// 最近一次播放器水位（毫秒）
     audio_ms: AtomicU32,
+    /// 解码 PCM 的 RMS 累加（rms×1e6）与样本数，窗口线程每秒取一次平均
+    audio_rms_acc: AtomicU64,
+    audio_rms_n: AtomicU64,
     /// host 上报的显示输出列表（DisplayList）
     displays: Mutex<Vec<DisplayInfo>>,
 }
@@ -201,6 +204,8 @@ impl Shared {
             audio_pkts: AtomicU64::new(0),
             audio_drop: AtomicU64::new(0),
             audio_ms: AtomicU32::new(0),
+            audio_rms_acc: AtomicU64::new(0),
+            audio_rms_n: AtomicU64::new(0),
             displays: Mutex::new(Vec::new()),
         }
     }
@@ -256,6 +261,24 @@ impl Shared {
         let old_w = self.remote_w.swap(w, Ordering::SeqCst);
         let old_h = self.remote_h.swap(h, Ordering::SeqCst);
         old_w != w || old_h != h
+    }
+
+    /// 用块帧网格校正画布尺寸（服务端降分辨率时 ServerHello 的宽高不再等于实际帧）。
+    ///
+    /// 网格尺寸是**向上取整到整块**的（1080 高 → 17×64 = 1088），所以只有
+    /// "帧网格比宣布的画布**小**"才认为服务端降分辨率了；正常 1080p 的网格
+    /// （1920x1088）不会被误改成 1088 高（否则末行块尺寸和 host 编码对不上）。
+    /// 返回是否真的改了。
+    pub fn reconcile_canvas_from_grid(&self, grid: Grid) -> bool {
+        let width = u32::from(grid.blocks_x) * u32::from(grid.block_size);
+        let height = u32::from(grid.blocks_y) * u32::from(grid.block_size);
+        if width == 0 || height == 0 {
+            return false;
+        }
+        match self.remote_size() {
+            Some((sw, sh)) if width >= sw && height >= sh => false,
+            _ => self.set_remote_size(width, height),
+        }
     }
 
     /// 被控端尺寸；未知返回 `None`。
@@ -461,6 +484,24 @@ impl Shared {
 
     pub fn audio_buffered_ms(&self) -> u32 {
         self.audio_ms.load(Ordering::Relaxed)
+    }
+
+    /// 记一次解码 PCM 的 RMS（每个 20ms 包一次），进每秒滑窗。
+    pub fn add_audio_rms(&self, rms: f32) {
+        let scaled = (f64::from(rms.max(0.0)) * 1_000_000.0) as u64;
+        self.audio_rms_acc.fetch_add(scaled, Ordering::Relaxed);
+        self.audio_rms_n.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 取走最近一秒的 RMS 平均；这一秒没有样本返回 None。
+    pub fn take_audio_rms(&self) -> Option<f32> {
+        let samples = self.audio_rms_n.swap(0, Ordering::Relaxed);
+        let sum = self.audio_rms_acc.swap(0, Ordering::Relaxed);
+        if samples == 0 {
+            None
+        } else {
+            Some((sum as f64 / samples as f64 / 1_000_000.0) as f32)
+        }
     }
 
     // ---- 显示输出列表 ----
@@ -696,6 +737,33 @@ mod tests {
     }
 
     #[test]
+    fn full_frame_grid_corrects_downscaled_canvas() {
+        // 服务端降分辨率：ServerHello 仍说 1920x1080，但实际帧网格 25x14 = 1600x896
+        let shared = Shared::new();
+        shared.set_remote_size(1920, 1080);
+        let grid = Grid {
+            block_size: 64,
+            blocks_x: 25,
+            blocks_y: 14,
+        };
+        assert!(shared.reconcile_canvas_from_grid(grid));
+        assert_eq!(shared.remote_size(), Some((1600, 896)));
+        // 再来一次同样的帧：已经一致，不该再动
+        assert!(!shared.reconcile_canvas_from_grid(grid));
+
+        // 正常 1080p：网格 30x17 向上取整成 1920x1088，比宣布的大 → 不能改
+        let shared2 = Shared::new();
+        shared2.set_remote_size(1920, 1080);
+        let normal = Grid {
+            block_size: 64,
+            blocks_x: 30,
+            blocks_y: 17,
+        };
+        assert!(!shared2.reconcile_canvas_from_grid(normal));
+        assert_eq!(shared2.remote_size(), Some((1920, 1080)));
+    }
+
+    #[test]
     fn audio_state_and_counters() {
         let shared = Shared::new();
         assert_eq!(shared.audio_state_name(), "off");
@@ -709,6 +777,17 @@ mod tests {
         shared.audio_drop.fetch_add(1, Ordering::Relaxed);
         assert_eq!(shared.audio_pkts.load(Ordering::Relaxed), 3);
         assert_eq!(shared.audio_drop.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn audio_rms_window() {
+        let shared = Shared::new();
+        assert!(shared.take_audio_rms().is_none());
+        shared.add_audio_rms(0.1);
+        shared.add_audio_rms(0.3);
+        let avg = shared.take_audio_rms().expect("rms");
+        assert!((avg - 0.2).abs() < 1e-4, "avg={avg}");
+        assert!(shared.take_audio_rms().is_none(), "取走后窗口应清空");
     }
 
     #[test]

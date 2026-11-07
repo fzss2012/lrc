@@ -32,6 +32,8 @@ struct Opts {
     request_full_at: Option<f64>,
     /// 把视频 AU 裸流写到这里，方便事后用 ffmpeg 验证可解码
     dump_video: Option<String>,
+    /// 第几秒发 SelectDisplay{index}
+    select_display: Option<u8>,
 }
 
 impl Default for Opts {
@@ -46,6 +48,7 @@ impl Default for Opts {
             wiggle: false,
             request_full_at: None,
             dump_video: None,
+            select_display: None,
         }
     }
 }
@@ -71,6 +74,7 @@ fn parse_args() -> Result<Opts, Box<dyn std::error::Error>> {
             "--wiggle" => opts.wiggle = true,
             "--request-full-at" => opts.request_full_at = Some(value()?.parse::<f64>()?),
             "--dump-video" => opts.dump_video = Some(value()?),
+            "--select-display" => opts.select_display = Some(value()?.parse::<u8>()?),
             "--move" => {
                 let raw = value()?;
                 let (x, y) = raw
@@ -203,6 +207,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cursor_at_settle: Option<usize> = None;
     let mut request_full_sent_at: Option<f64> = None;
     let mut full_frames_after_request = 0usize;
+    // 显示切换 / 音频
+    let mut select_sent_at: Option<f64> = None;
+    let mut display_list: Option<usize> = None;
+    let mut audio_packets = 0u64;
+    let mut audio_bytes = 0u64;
+    let mut audio_first: Option<(u32, u32, u8, u16, u8, usize)> = None;
     // 视频通道
     let mut video_aus = 0u64;
     let mut video_bytes = 0u64;
@@ -244,6 +254,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 writer.send(&Message::RequestFull.encode())?;
                 request_full_sent_at = Some(elapsed);
                 println!("REQUEST_FULL sent at t={elapsed:.2}");
+            }
+        }
+        if let Some(idx) = opts.select_display {
+            if select_sent_at.is_none() && elapsed >= 2.5 {
+                writer.send(&Message::SelectDisplay(lrc_proto::SelectDisplay { index: idx }).encode())?;
+                select_sent_at = Some(elapsed);
+                println!("SELECT_DISPLAY sent index={idx} at t={elapsed:.2}");
             }
         }
         match reader.recv(&mut buf) {
@@ -339,6 +356,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(f) = dump.as_mut() {
                             use std::io::Write as _;
                             f.write_all(au.data)?;
+                        }
+                        // 视频 AU 也要 ack（proto 里 VideoAu.seq 与 VideoFrame 同一 seq 语义），
+                        // 否则 host 侧"未确认字节"会一直涨、流控/RTT 全部失真。
+                        writer.send(
+                            &Message::VideoAck(FrameAck {
+                                seq: au.seq,
+                                recv_bytes: recv_total,
+                            })
+                            .encode(),
+                        )?;
+                    }
+                    Message::DisplayList(list) => {
+                        display_list = Some(list.len());
+                        println!("DISPLAY_LIST {} 个输出:", list.len());
+                        for d in &list {
+                            println!(
+                                "  #{} {}x{} origin=({},{}) primary={}",
+                                d.index, d.width, d.height, d.origin_x, d.origin_y, d.primary
+                            );
+                        }
+                    }
+                    Message::AudioFrame(af) => {
+                        audio_packets += 1;
+                        audio_bytes += n as u64;
+                        if audio_first.is_none() {
+                            audio_first = Some((
+                                af.ts_ms,
+                                af.seq,
+                                af.flags,
+                                af.sample_rate,
+                                af.channels,
+                                af.data.len(),
+                            ));
+                            println!(
+                                "AUDIO_FRAME first ts={} seq={} flags={} {}Hz {}ch {} bytes",
+                                af.ts_ms,
+                                af.seq,
+                                af.flags,
+                                af.sample_rate,
+                                af.channels,
+                                af.data.len()
+                            );
                         }
                     }
                     Message::Pong(_) => {}
@@ -436,6 +495,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "REQUEST_FULL sent_at={t:.2} full_frames_after_request={full_frames_after_request}"
         );
     }
+    println!(
+        "DISPLAY list_count={display_list:?} select_sent_at={select_sent_at:?}"
+    );
+    let secs = started.elapsed().as_secs_f64().max(0.001);
+    println!(
+        "AUDIO packets={audio_packets} bytes={audio_bytes} kbps={:.1} first={audio_first:?}",
+        (audio_bytes as f64 * 8.0 / 1000.0) / secs
+    );
     writer.shutdown();
     Ok(())
 }

@@ -1,6 +1,6 @@
 //! Opus 编解码：包装 ffmpeg 子进程（Ogg 页直通，见 crate 顶部说明）。
 
-use crate::proc::{resolve_ffmpeg, FfmpegChild};
+use crate::proc::{ffmpeg_command, FfmpegChild};
 use crate::{AudioError, AudioFormat, AudioResult};
 
 /// Opus 编码器（ffmpeg 子进程）。
@@ -18,7 +18,8 @@ impl OpusEncoder {
         if !(6_000..=512_000).contains(&bitrate_bps) {
             return Err(AudioError::Unsupported("Opus 码率请给 6k..512k"));
         }
-        let ff = resolve_ffmpeg(ffmpeg);
+        // 显式参数 > LRC_FFMPEG > 已知安装路径 > PATH（与 lrc-video 一致）
+        let ff = ffmpeg_command(ffmpeg);
         let args: Vec<String> = vec![
             "-hide_banner".into(),
             "-loglevel".into(),
@@ -100,7 +101,23 @@ impl OpusEncoder {
             )));
         }
         self.child.write(pcm)?;
-        self.child.wait_page(40)?;
+        // 非阻塞：只把"已经产出的"取走。ffmpeg 的 Ogg 输出是 ~85ms 攒一批，
+        // 所以大约每 4 次调用才有数据；主机把空包跳过即可。
+        self.child.pump()?;
+        self.child.take_pages(out);
+        Ok(())
+    }
+
+    /// 把内部还没交出去的包取出来（空闲时也该调一次，别把尾巴丢掉）。
+    ///
+    /// 抽尾巴失败（ffmpeg 已退出、管道关了）只记日志，不报错——这条路径不该让
+    /// 整条音频链路挂掉。
+    pub fn flush(&mut self, out: &mut Vec<u8>) -> AudioResult<()> {
+        out.clear();
+        if let Err(e) = self.child.pump() {
+            log::warn!("audio: 编码器 flush 失败（按空处理）: {e}");
+            return Ok(());
+        }
         self.child.take_pages(out);
         Ok(())
     }
@@ -115,7 +132,8 @@ pub struct OpusDecoder {
 impl OpusDecoder {
     pub fn new(format: AudioFormat, ffmpeg: Option<&str>) -> AudioResult<Self> {
         format.ensure_supported()?;
-        let ff = resolve_ffmpeg(ffmpeg);
+        // 显式参数 > LRC_FFMPEG > 已知安装路径 > PATH（与 lrc-video 一致）
+        let ff = ffmpeg_command(ffmpeg);
         let args: Vec<String> = vec![
             "-hide_banner".into(),
             "-loglevel".into(),
@@ -161,12 +179,22 @@ impl OpusDecoder {
     /// 解码器还在攒帧时 out 可能为空。
     pub fn decode(&mut self, packet: &[u8], out: &mut Vec<u8>) -> AudioResult<()> {
         out.clear();
-        if packet.is_empty() {
+        if !packet.is_empty() {
+            self.child.write(packet)?;
+        }
+        // 非阻塞：取走当前可用的 PCM，剩下的下次再取
+        self.child.pump()?;
+        self.child.take_all(out);
+        Ok(())
+    }
+
+    /// 把内部还没交出去的 PCM 取出来（失败只记日志，不当致命错误）。
+    pub fn flush(&mut self, out: &mut Vec<u8>) -> AudioResult<()> {
+        out.clear();
+        if let Err(e) = self.child.pump() {
+            log::warn!("audio: 解码器 flush 失败（按空处理）: {e}");
             return Ok(());
         }
-        self.child.write(packet)?;
-        // 等一帧 PCM（20ms）出来；首包会因为 pre-skip 少几个采样，等不到就下次再取
-        self.child.wait_bytes(40, self.format.bytes_per_20ms())?;
         self.child.take_all(out);
         Ok(())
     }

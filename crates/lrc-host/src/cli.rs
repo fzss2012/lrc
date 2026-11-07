@@ -44,7 +44,7 @@ impl VideoChoice {
     }
 }
 
-pub const USAGE: &str = "用法: lrc-host --password <PASS> [--listen <IP:PORT>] [--display N] [--fps N] [--quality N] [--stats] [--video auto|off|hevc|h264] [--video-bitrate B] [--video-max-fps N] [--budget-bps B]";
+pub const USAGE: &str = "用法: lrc-host --password <PASS> [--listen <IP:PORT>] [--display N] [--fps N] [--quality N] [--stats] [--video auto|off|hevc|h264] [--video-bitrate B] [--video-max-fps N] [--budget-bps B] [--audio on|off]";
 
 pub const HELP: &str = "\
 lrc-host — lrc 被控端（单流点对点）
@@ -66,6 +66,7 @@ lrc-host — lrc 被控端（单流点对点）
   --video-max-fps <N> 视频模式帧率上限 1..=240，默认 30
   --budget-bps <B>    链路预算 bit/s；>0 时启用自适应控制器（降帧率/抬QP/降分辨率/调码率），
                       默认 0 = 关闭（参数固定，行为与不加此参数前完全一致）
+  --audio on|off      系统声音回环（Opus 32kbps），默认 on；设备不可用时自动永久关闭
   -h, --help          显示本帮助
 
 统计行:
@@ -91,6 +92,8 @@ pub struct Args {
     pub video_max_fps: u32,
     /// 链路预算（bit/s）；0 = 不使用自适应控制器（保持固定参数）
     pub budget_bps: u32,
+    /// 是否启用系统声音回环（M3 音频通道），默认 true
+    pub audio: bool,
 }
 
 /// 解析结果：要么是帮助，要么是运行参数。
@@ -147,6 +150,7 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
     let mut video_bitrate = DEFAULT_VIDEO_BITRATE;
     let mut video_max_fps = DEFAULT_VIDEO_MAX_FPS;
     let mut budget_bps = 0u32;
+    let mut audio = true;
 
     let mut i = 0usize;
     while i < argv.len() {
@@ -162,7 +166,7 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
             }
             "--no-stats" => stats = false,
             "--listen" | "--password" | "--display" | "--fps" | "--quality" | "--video"
-            | "--video-bitrate" | "--video-max-fps" | "--budget-bps" => {
+            | "--video-bitrate" | "--video-max-fps" | "--budget-bps" | "--audio" => {
                 let value = match inline {
                     Some(v) => v,
                     None => {
@@ -174,6 +178,19 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
                     }
                 };
                 match name {
+                    "--audio" => {
+                        audio = match value.as_str() {
+                            "on" | "1" | "true" | "yes" => true,
+                            "off" | "0" | "false" | "no" => false,
+                            _ => {
+                                return Err(CliError::BadValue {
+                                    flag: name.to_string(),
+                                    value,
+                                    expect: "on|off",
+                                })
+                            }
+                        }
+                    }
                     "--listen" => {
                         if value.trim().is_empty() {
                             return Err(CliError::BadValue {
@@ -290,6 +307,7 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
         video_bitrate,
         video_max_fps,
         budget_bps,
+        audio,
     }))
 }
 
@@ -336,6 +354,18 @@ mod tests {
         assert_eq!(a.video_bitrate, DEFAULT_VIDEO_BITRATE);
         assert_eq!(a.video_max_fps, DEFAULT_VIDEO_MAX_FPS);
         assert_eq!(a.budget_bps, 0);
+        assert!(a.audio, "音频默认开启");
+    }
+
+    #[test]
+    fn audio_flag() {
+        assert!(!run(&["--password", "1", "--audio", "off"]).audio);
+        assert!(!run(&["--password", "1", "--audio=off"]).audio);
+        assert!(run(&["--password", "1", "--audio", "on"]).audio);
+        assert!(matches!(
+            parse(&argv(&["--password", "1", "--audio", "loud"])),
+            Err(CliError::BadValue { .. })
+        ));
     }
 
     #[test]

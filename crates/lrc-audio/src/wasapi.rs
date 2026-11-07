@@ -389,9 +389,9 @@ impl Player {
                 return Err(e);
             }
         };
-        // 40ms 设备缓冲：加上抖动缓冲，稳态总水位落在 30-60ms
+        // 30ms 设备缓冲 + 抖动缓冲，稳态总水位落在 30-60ms
         let init =
-            unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 400_000, 0, mix_ptr, None) };
+            unsafe { client.Initialize(AUDCLNT_SHAREMODE_SHARED, 0, 300_000, 0, mix_ptr, None) };
         unsafe { CoTaskMemFree(Some(mix_ptr as *const core::ffi::c_void)) };
         init.map_err(|e| AudioError::Device(format!("Initialize(render): {e}")))?;
         let buffer_frames = unsafe { client.GetBufferSize() }

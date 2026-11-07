@@ -18,6 +18,19 @@
 //! 64kbps 约 +17%）。要省掉它得在两端自己拆/拼 Ogg 页（页头 + CRC + 序号），
 //! 属于 M3 之后的优化，先把链路跑通。
 //!
+//! # ffmpeg 依赖
+//!
+//! Opus 编解码全部交给 ffmpeg 子进程（本机没有 cmake，不引 libopus 绑定）。
+//! ffmpeg 路径解析顺序**与 lrc-video 完全一致**：
+//!
+//! 1. 显式参数（OpusEncoder::new / OpusDecoder::new 的 ffmpeg 参数）；
+//! 2. 环境变量 LRC_FFMPEG；
+//! 3. 本机已知安装路径
+//!    C:\Program Files\ffmpeg-8.0.1-essentials_build\bin\ffmpeg.exe；
+//! 4. PATH 上的 ffmpeg。
+//!
+//! 前三步都拿不到才走 PATH，所以 "设了 LRC_FFMPEG 但装在别处" 这种情况不会再有歧义。
+//!
 //! # 设备
 //!
 //! 采集/播放都走 WASAPI 共享模式，使用设备的**混音格式**（通常是 48kHz 立体声
@@ -258,6 +271,19 @@ mod tests {
             }
         }
         let enc_total_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
+        // 把编码器尾巴抽干净（非阻塞 API，最后一批页要 flush 才出来）
+        let mut idle = 0;
+        while idle < 20 {
+            let mut tail = Vec::new();
+            enc.flush(&mut tail).expect("flush");
+            if tail.is_empty() {
+                idle += 1;
+            } else {
+                idle = 0;
+                packets.push(tail);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
 
         let mut dec = OpusDecoder::new(format, None).expect("创建解码器");
         let mut decoded: Vec<u8> = Vec::new();
@@ -268,6 +294,19 @@ mod tests {
             decoded.extend_from_slice(&out);
         }
         let dec_total_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
+        // 解码器同样抽尾巴
+        let mut idle = 0;
+        while idle < 20 {
+            let mut tail = Vec::new();
+            dec.flush(&mut tail).expect("flush");
+            if tail.is_empty() {
+                idle += 1;
+            } else {
+                idle = 0;
+                decoded.extend_from_slice(&tail);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
 
         let wire_total: usize = packets.iter().map(|p| p.len()).sum();
         let wire_data: usize =
@@ -305,9 +344,19 @@ mod tests {
             dec_total_ms / packets.len().max(1) as f64
         );
 
-        // ffmpeg 的 Ogg 输出是 ~85ms 一批（不是每 20ms 一包），所以包数远少于 150；
-        // 只要总字节数对得上、解码长度和相关性正常即可。
-        assert!(packets.len() >= 25, "3 秒至少应该有 25 个包，实际 {}", packets.len());
+        // 数一下真正的 Ogg 页数（顺便验证分帧）：3 秒 20ms 一页应该 ~150 页
+        let mut page_count = 0usize;
+        let mut pending = Vec::new();
+        for p in &packets {
+            pending.extend_from_slice(p);
+            while let Some(len) = ogg::page_len(&pending) {
+                pending.drain(..len);
+                page_count += 1;
+            }
+        }
+        println!("           共 {page_count} 个 Ogg 页（{} 余字节）", pending.len());
+        assert!(page_count >= 140, "3 秒应该有 ~150 个 Ogg 页，实际 {page_count}");
+        assert_eq!(pending.len(), 0, "不该有半页残留");
         assert!(
             decoded.len() as f64 >= pcm.len() as f64 * 0.9,
             "解码长度应 >= 输入的 90%"
@@ -455,21 +504,28 @@ mod tests {
             }
         };
         let block = format.bytes_per_20ms();
-        let tone = synth_tone(format, 2.0);
+        let tone = synth_tone(format, 2.5);
+        // 先灌 2 块（40ms）把设备缓冲垫起来，像真实客户端那样预先缓冲
+        let mut offset = 0usize;
+        for _ in 0..2 {
+            if offset + block > tone.len() {
+                break;
+            }
+            let _ = player.write(&tone[offset..offset + block]);
+            offset += block;
+        }
         let mut levels = Vec::new();
         let t0 = Instant::now();
         let mut next = Instant::now();
-        let mut offset = 0usize;
         while t0.elapsed().as_secs_f32() < 1.5 && offset + block <= tone.len() {
-            if Instant::now() >= next {
-                let _ = player.write(&tone[offset..offset + block]);
-                offset += block;
-                next += std::time::Duration::from_millis(20);
+            // 严格按 20ms 节奏喂，避免把水位测成"喂得比播得慢"
+            while Instant::now() < next {
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            if t0.elapsed().as_millis() > 500 {
-                levels.push(player.buffered_ms());
-            }
+            let _ = player.write(&tone[offset..offset + block]);
+            offset += block;
+            next += std::time::Duration::from_millis(20);
+            levels.push(player.buffered_ms());
         }
         let min = levels.iter().copied().min().unwrap_or(0);
         let max = levels.iter().copied().max().unwrap_or(0);

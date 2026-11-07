@@ -52,18 +52,25 @@ pub fn spawn(cfg: &Config, shared: Arc<Shared>) -> io::Result<()> {
     let addr = cfg.connect.clone();
     let password = cfg.password.clone();
     let audio_on = cfg.audio;
+    let audio_dump = cfg.audio_dump.clone();
     std::thread::Builder::new()
         .name(String::from("lrc-client-net"))
-        .spawn(move || supervise(&addr, &password, audio_on, &shared))?;
+        .spawn(move || supervise(&addr, &password, audio_on, audio_dump, &shared))?;
     Ok(())
 }
 
 /// 连接监管循环：断线不退出，指数退避重连；认证失败才终止（窗口保留）。
-fn supervise(addr: &str, password: &str, audio_on: bool, shared: &Arc<Shared>) {
+fn supervise(
+    addr: &str,
+    password: &str,
+    audio_on: bool,
+    audio_dump: Option<String>,
+    shared: &Arc<Shared>,
+) {
     let mut attempt: u32 = 0;
     let mut ever_connected = false;
     // 音频线程跟进程同寿命（跨重连保留设备）；--audio off 时是 None
-    let mut audio = AudioSink::start(audio_on, shared.clone());
+    let mut audio = AudioSink::start(audio_on, shared.clone(), audio_dump);
     loop {
         if shared.is_quit() {
             return;
@@ -544,6 +551,16 @@ fn handle_frame(frame: &VideoFrame<'_>, shared: &Shared) {
     };
     if frame.is_full() {
         shared.mark_first_full_frame();
+        // 服务端降分辨率时 ServerHello 的宽高不再等于实际帧：以 FULL 帧网格为准
+        if let Some(grid) = frame.grid() {
+            if shared.reconcile_canvas_from_grid(grid) {
+                log::info!(
+                    "按 FULL 帧网格校正画布（grid={:?}）→ {:?}",
+                    grid,
+                    shared.remote_size()
+                );
+            }
+        }
     }
     let (screen_w, screen_h) = match shared.remote_size() {
         Some(size) => size,

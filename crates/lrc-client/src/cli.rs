@@ -7,6 +7,7 @@ pub const USAGE: &str = "\
   --password <pwd>   认证密码，作为 HMAC-SHA256 的 key
   --title <text>     窗口标题，默认 \"lrc viewer\"
   --audio on|off     音频通道，默认 on（设备不可用会自动降级为 off，不影响视频）
+  --audio-dump <path> 把解码后的 PCM(s16le 48k/2ch) 追加写到文件，调试用
   --stats            每秒打印一行 fps= recv_kbps= decoded_blocks= ...
   -h, --help         显示本帮助
 ";
@@ -20,6 +21,8 @@ pub struct Config {
     pub stats: bool,
     /// 音频通道开关（--audio on|off，默认 on）
     pub audio: bool,
+    /// 解码 PCM 落盘路径（--audio-dump，调试用）
+    pub audio_dump: Option<String>,
     /// 窗口客户区默认宽度（物理像素）
     pub width: u32,
     /// 窗口客户区默认高度（物理像素）
@@ -34,6 +37,7 @@ impl Default for Config {
             title: String::from("lrc viewer"),
             stats: false,
             audio: true,
+            audio_dump: None,
             width: 1280,
             height: 720,
         }
@@ -90,6 +94,9 @@ impl Config {
                         "off" | "0" | "false" => false,
                         other => return Err(format!("--audio 只接受 on|off（收到 {other}）")),
                     };
+                }
+                "--audio-dump" => {
+                    cfg.audio_dump = Some(take_value(inline, &mut it, "--audio-dump")?);
                 }
                 other => return Err(format!("未知参数 {other}")),
             }

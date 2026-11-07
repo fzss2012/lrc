@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use lrc_audio::{pcm_stats, AudioFormat, LoopbackCapturer, OpusEncoder};
 use lrc_proto::{
-    auth_reason, AudioFrame, AuthResult, DisplayInfo, Message, Pong, SelectDisplay, ServerHello,
-    PROTO_VERSION,
+    auth_reason, AudioFrame, AuthResult, DisplayInfo, InputEvent, Message, Pong, SelectDisplay,
+    ServerHello, PROTO_VERSION,
 };
 use lrc_transport::{Conn, ConnReader, ConnWriter};
 
@@ -84,7 +84,13 @@ fn spawn_writer(mut writer: ConnWriter, rx: Receiver<Vec<u8>>) {
     });
 }
 
-fn spawn_reader(mut reader: ConnReader, tx: Sender<Vec<u8>>, markers: Option<String>, shared_rx: Arc<AtomicBool>) {
+fn spawn_reader(
+    mut reader: ConnReader,
+    tx: Sender<Vec<u8>>,
+    markers: Option<String>,
+    shared_rx: Arc<AtomicBool>,
+    input_keys: Arc<std::sync::atomic::AtomicU64>,
+) {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
         loop {
@@ -97,6 +103,10 @@ fn spawn_reader(mut reader: ConnReader, tx: Sender<Vec<u8>>, markers: Option<Str
                         mark(&markers, &format!("MARK select_display={index}"));
                     }
                     Ok(Message::RequestFull) => mark(&markers, "MARK request_full"),
+                    // 快捷键被客户端吃掉的话，这里不该看到对应按键
+                    Ok(Message::Input(InputEvent::Key { .. })) => {
+                        input_keys.fetch_add(1, Ordering::Relaxed);
+                    }
                     Ok(_) | Err(_) => {}
                 },
                 Ok(None) => break,
@@ -144,7 +154,6 @@ fn handshake(conn: &mut Conn) -> Result<(), String> {
 fn synth_tone(format: AudioFormat, seconds: f32) -> Vec<u8> {
     let frames = (format.sample_rate as f32 * seconds) as usize;
     let mut out = Vec::with_capacity(frames * format.channels as usize * 2);
-    let mut phase = 0.0f32;
     for i in 0..frames {
         let t = i as f32 / format.sample_rate as f32;
         for c in 0..format.channels {
@@ -153,8 +162,6 @@ fn synth_tone(format: AudioFormat, seconds: f32) -> Vec<u8> {
             let s = (v.clamp(-1.0, 1.0) * 32767.0) as i16;
             out.extend_from_slice(&s.to_le_bytes());
         }
-        phase += 1.0;
-        let _ = phase;
     }
     out
 }
@@ -179,7 +186,14 @@ fn run() -> Result<(), String> {
     let (tx, rx) = channel::<Vec<u8>>();
     spawn_writer(writer, rx);
     let disconnected = Arc::new(AtomicBool::new(false));
-    spawn_reader(reader, tx.clone(), args.markers.clone(), disconnected.clone());
+    let input_keys = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    spawn_reader(
+        reader,
+        tx.clone(),
+        args.markers.clone(),
+        disconnected.clone(),
+        input_keys.clone(),
+    );
 
     // 可选门控：外部脚本先摆好窗口再放行
     if let Some(start) = &args.start {
@@ -242,29 +256,17 @@ fn run() -> Result<(), String> {
         None
     };
 
-    // 3) Opus 编码 + 按 20ms 节奏发
+    // 3) Opus 编码：**边编边发**（一次性灌太多会把 ffmpeg 编码子进程的管道写崩）
     let format = AudioFormat::default();
-    let tone = synth_tone(format, 8.0);
+    let tone = synth_tone(format, 12.0);
     let block = format.bytes_per_20ms();
     let mut encoder = OpusEncoder::new(format, 32_000, None)
         .map_err(|e| format!("创建 Opus 编码器失败: {e}"))?;
     let mut seq: u32 = 1;
-    let mut aus: Vec<Vec<u8>> = Vec::new();
+    let mut saved: Vec<Vec<u8>> = Vec::new();
     let mut out = Vec::new();
-    for chunk in tone.chunks(block) {
-        out.clear();
-        encoder
-            .encode(chunk, &mut out)
-            .map_err(|e| format!("编码失败: {e}"))?;
-        if !out.is_empty() {
-            aus.push(out.clone());
-        }
-    }
-    println!("编码得到 {} 个 Opus 包", aus.len());
-    mark(&args.markers, "MARK audio_start");
-    let ts0 = Instant::now();
-
-    let mut send_packet = |tx: &Sender<Vec<u8>>, seq: &mut u32, data: &[u8]| {
+    let mut chunks = tone.chunks(block);
+    let send_packet = |tx: &Sender<Vec<u8>>, seq: &mut u32, data: &[u8]| {
         let frame = Message::AudioFrame(AudioFrame {
             ts_ms: 0,
             seq: *seq,
@@ -277,53 +279,84 @@ fn run() -> Result<(), String> {
         *seq = seq.wrapping_add(1);
     };
 
-    // 前 100 包：正常 20ms 节奏（2 秒）
-    let normal = aus.len().min(100);
-    for (i, au) in aus.iter().take(normal).enumerate() {
+    mark(&args.markers, "MARK audio_start");
+    let ts0 = Instant::now();
+
+    // 3.1 正常 20ms 节奏 100 块（≈2 秒）
+    let mut sent = 0u32;
+    for i in 0..100usize {
+        let Some(chunk) = chunks.next() else {
+            break;
+        };
+        out.clear();
+        encoder
+            .encode(chunk, &mut out)
+            .map_err(|e| format!("编码失败: {e}"))?;
+        if !out.is_empty() {
+            send_packet(&tx, &mut seq, &out);
+            if saved.len() < 40 {
+                saved.push(out.clone());
+            }
+            sent += 1;
+        }
         let target = ts0 + Duration::from_millis(20 * (i as u64 + 1));
         let now = Instant::now();
         if target > now {
             std::thread::sleep(target - now);
         }
-        send_packet(&tx, &mut seq, au);
     }
+    println!("实时发送 {sent} 个 Opus 包");
 
-    // 4) seq 跳变：故意丢一个（客户端应丢当前包并重新对齐）
-    if aus.len() > normal {
-        seq = seq.wrapping_add(1); // 制造一个空洞
-        send_packet(&tx, &mut seq, &aus[normal]);
-        mark(&args.markers, "MARK gap_sent");
-        std::thread::sleep(Duration::from_millis(40));
+    // 3.2 seq 空洞：跳过一个序号（客户端应丢当前包并重新对齐）
+    seq = seq.wrapping_add(1);
+    if let Some(chunk) = chunks.next() {
+        out.clear();
+        encoder
+            .encode(chunk, &mut out)
+            .map_err(|e| format!("编码失败: {e}"))?;
+        if !out.is_empty() {
+            send_packet(&tx, &mut seq, &out);
+        }
     }
+    mark(&args.markers, "MARK gap_sent");
+    std::thread::sleep(Duration::from_millis(60));
 
-    // 5) 突发：一次灌 40 包（验证客户端有界队列丢最旧）
-    let burst_start = normal.wrapping_add(1) as usize;
-    let burst: Vec<Vec<u8>> = aus
-        .iter()
-        .skip(burst_start)
-        .take(40)
-        .cloned()
-        .collect();
-    for au in &burst {
+    // 3.3 突发：把攒下的 40 个包一口气灌进去（验证客户端有界队列丢最旧）
+    let mut burst = 0usize;
+    for au in &saved {
         send_packet(&tx, &mut seq, au);
+        burst += 1;
     }
     mark(
         &args.markers,
-        &format!("MARK burst_sent count={}", burst.len()),
+        &format!("MARK burst_sent count={burst}"),
     );
 
-    // 6) 再按正常节奏发 1 秒，确认通道没被打挂
-    let after = burst_start + burst.len();
+    // 3.4 再按实时节奏发 ~1 秒，确认通道没被打挂
     let loop_start = Instant::now();
-    for (i, au) in aus.iter().skip(after).take(50).enumerate() {
+    let mut after = 0u32;
+    for i in 0..50usize {
+        let Some(chunk) = chunks.next() else {
+            break;
+        };
+        out.clear();
+        encoder
+            .encode(chunk, &mut out)
+            .map_err(|e| format!("编码失败: {e}"))?;
+        if !out.is_empty() {
+            send_packet(&tx, &mut seq, &out);
+            after += 1;
+        }
         let target = loop_start + Duration::from_millis(20 * (i as u64 + 1));
         let now = Instant::now();
         if target > now {
             std::thread::sleep(target - now);
         }
-        send_packet(&tx, &mut seq, au);
     }
-    mark(&args.markers, &format!("MARK audio_done sent={seq}"));
+    mark(
+        &args.markers,
+        &format!("MARK audio_done sent={after}"),
+    );
 
     // 7) 收尾：等外部按快捷键 / 采集结束
     std::thread::sleep(Duration::from_millis(1500));
@@ -342,6 +375,13 @@ fn run() -> Result<(), String> {
             Err(_) => mark(&args.markers, "MARK loopback_join_failed"),
         }
     }
+    mark(
+        &args.markers,
+        &format!(
+            "MARK input_keys_forwarded={}",
+            input_keys.load(Ordering::Relaxed)
+        ),
+    );
     mark(&args.markers, "MARK done");
     std::thread::sleep(Duration::from_millis(500));
     let _ = disconnected.load(Ordering::SeqCst);

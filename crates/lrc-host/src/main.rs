@@ -9,6 +9,7 @@
 //!
 //! 单流点对点：同一时刻只服务一个观看者，断开后再接受下一条连接。
 
+mod audio;
 mod auth;
 mod cli;
 mod input;

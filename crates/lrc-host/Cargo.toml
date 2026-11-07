@@ -15,6 +15,7 @@ lrc-capture.workspace = true
 lrc-transport.workspace = true
 lrc-video.workspace = true
 lrc-adapt.workspace = true
+lrc-audio.workspace = true
 windows.workspace = true
 anyhow.workspace = true
 log.workspace = true
