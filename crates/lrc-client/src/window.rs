@@ -79,7 +79,10 @@ pub fn run(cfg: &Config) -> anyhow::Result<()> {
         log::error!("接收线程启动失败: {e}");
         let _ = unsafe { DestroyWindow(hwnd) };
     }
-    log::info!("窗口已就绪（hwnd={hwnd:?}），连接 {} ...", cfg.connect);
+    log::info!(
+        "窗口已就绪（hwnd={hwnd:?}），连接 {} ...",
+        cfg.connect.as_deref().unwrap_or("（P2P，无 --connect）")
+    );
 
     unsafe {
         let mut msg = MSG::default();

@@ -37,7 +37,7 @@
 //!
 //! - `send` 只负责把消息分片入队并尽力发出，返回时**不保证出网**；重传由 `tick` /
 //!   `recv_timeout` 内部驱动，所以**上层只要持续调 recv_timeout 就够**（不需要额外线程）。
-//! - 空闲 1s 发一次 PING，对端回 PONG；连续 `DEAD_AFTER`（10s）没收到对方任何包
+//! - 空闲 1s 发一次 PING，对端回 PONG；连续 `DEAD_AFTER`（默认 6s，可用 `LRC_UDP_DEAD_MS` 覆盖）没收到对方任何包
 //!   → `recv_timeout` 返回 `io::ErrorKind::TimedOut`（P2P 下 NAT 映射会过期，这条是断线信号）。
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -84,8 +84,34 @@ const MAX_NACK: usize = 64;
 
 /// 空闲多久发一次保活探测。
 pub const PING_IDLE: Duration = Duration::from_secs(1);
-/// 多久没收到对方任何包就判死（recv_timeout 返回 TimedOut）。
-pub const DEAD_AFTER: Duration = Duration::from_secs(10);
+/// 多久没收到对方任何包就判死（recv_timeout 返回 TimedOut）的**默认值**。
+///
+/// 6 秒：全丢场景下 10 秒才判死链，用户感知是"卡住不动"；6 秒更接近 RDP/ToDesk 的手感。
+/// 需要更激进/更宽松可以用环境变量 [`DEAD_ENV`]（毫秒）覆盖。
+pub const DEAD_AFTER: Duration = Duration::from_secs(6);
+/// 覆盖判死时长的环境变量名（毫秒，正整数；非法值忽略，用默认值）。
+pub const DEAD_ENV: &str = "LRC_UDP_DEAD_MS";
+
+/// 解析判死时长：`None`/非法/0 一律回落到默认 [`DEAD_AFTER`]（纯函数，方便单测）。
+fn parse_dead_ms(raw: Option<&str>) -> Duration {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(DEAD_AFTER)
+}
+
+/// 运行期的判死时长（读一次 `LRC_UDP_DEAD_MS` 并缓存）。
+pub fn dead_after() -> Duration {
+    static CACHE: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let raw = std::env::var(DEAD_ENV).ok();
+        let value = parse_dead_ms(raw.as_deref());
+        if value != DEAD_AFTER {
+            log::info!("lrc-udp: 判死时长由环境变量 {DEAD_ENV} 覆盖为 {} ms", value.as_millis());
+        }
+        value
+    })
+}
 /// 最小 RTO。
 const MIN_RTO: Duration = Duration::from_millis(100);
 /// RTO 指数退避上限。
@@ -111,6 +137,8 @@ const FLUSH_BURST: usize = 8;
 const RTO_BURST: usize = 32;
 /// 待发包队列上限（超了丢最旧；丢掉的会被 RTO 重传补上）。
 const OUT_QUEUE_MAX: usize = 16384;
+/// socket 收发缓冲目标值（Windows 默认可能只有 64 KB，视频大帧突发会被内核直接丢掉）。
+const SOCKET_BUFFER: i32 = 4 * 1024 * 1024;
 
 /// 下行路径。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +207,7 @@ struct SendMsg {
     resend_cursor: usize,
     /// 入队时发送队列是空的（= 立即出网），这样算出的 RTT 才没有排队时间
     timely: bool,
+
 }
 
 /// 接收中的一条消息。
@@ -189,6 +218,8 @@ struct RecvMsg {
     last_seen: Instant,
     /// 已见到的最高分片下标 + 1（NACK 只报它之前的缺口）
     max_frag: usize,
+    /// 该分片是否已经被 NACK 报过一次（丢包统计只数唯一缺口，避免同一片每轮 ACK 重复计数）
+    notified: Vec<bool>,
 }
 
 impl RecvMsg {
@@ -199,6 +230,7 @@ impl RecvMsg {
             total,
             last_seen: now,
             max_frag: 0,
+            notified: vec![false; total as usize],
         }
     }
 
@@ -416,9 +448,8 @@ impl Inner {
         if fcnt == 0 || fcnt > MAX_FRAGS || frag >= fcnt || p.len() < DATA_HDR + len {
             return;
         }
-        self.recv_frags += 1;
-
         // 已经交付过的消息：只回 ACK，不再入缓冲
+        let mut is_new = false;
         if !seq_lt(seq, self.expect_seq) {
             let entry = self
                 .recv_msgs
@@ -429,7 +460,12 @@ impl Inner {
                 entry.frags[frag] = Some(p[DATA_HDR..DATA_HDR + len].to_vec());
                 entry.got += 1;
                 entry.last_seen = now;
+                is_new = true;
             }
+        }
+        if is_new {
+            // 只数"唯一的"分片：重复/迟到分片不进损失率分母
+            self.recv_frags += 1;
         }
         let before = self.expect_seq;
         self.deliver_ready();
@@ -492,7 +528,8 @@ impl Inner {
             };
             if due {
                 self.nack_times.insert(nack_seq, now);
-                self.nack_missing += missing.len() as u64;
+                let newly = self.mark_notified(nack_seq, &missing);
+                self.nack_missing += newly;
             } else {
                 missing.clear();
             }
@@ -538,6 +575,8 @@ impl Inner {
                 let miss = m.missing(now);
                 if !miss.is_empty() {
                     self.nack_times.insert(seq, now);
+                    let newly = self.mark_notified(seq, &miss);
+                    self.nack_missing += newly;
                     extras.push((seq, miss));
                 }
             }
@@ -547,6 +586,23 @@ impl Inner {
             let p = self.ack_packet(bits, seq, &miss);
             self.emit_inner(p);
         }
+    }
+
+    /// 标记这些缺口已经报过，返回**本次新增**的缺口数（丢包统计只数唯一缺口）。
+    fn mark_notified(&mut self, seq: u32, missing: &[u16]) -> u64 {
+        let Some(m) = self.recv_msgs.get_mut(&seq) else {
+            return 0;
+        };
+        let mut newly = 0u64;
+        for &f in missing {
+            if let Some(slot) = m.notified.get_mut(f as usize) {
+                if !*slot {
+                    *slot = true;
+                    newly += 1;
+                }
+            }
+        }
+        newly
     }
 
     /// 组一个 ACK 包（ack/ack_bits 始终是当前累积值，nack_seq 指本条要报告的消息）。
@@ -614,6 +670,7 @@ impl Inner {
                         resend.push(msg.frags[f].clone());
                     }
                 }
+
             }
             if !resend.is_empty() {
                 self.retransmits += resend.len() as u64;
@@ -652,7 +709,7 @@ impl Inner {
         // 超时重传：只处理最老的几条（避免重传风暴），且只补缺失分片。
         // 队列里还有没发出去的数据时先不动：它们只是"还没发"，不是"丢了"。
         if !self.out_queue.is_empty() {
-            if now.saturating_duration_since(self.last_recv_any) > DEAD_AFTER {
+            if now.saturating_duration_since(self.last_recv_any) > dead_after() {
                 self.dead = true;
             }
             self.flush();
@@ -674,6 +731,7 @@ impl Inner {
             let Some(msg) = self.unacked.get_mut(&seq) else {
                 continue;
             };
+
             // 每轮最多补 RTO_BURST 片，并且从上次停下的位置继续（轮转补洞）
             let mut pkts: Vec<Vec<u8>> = Vec::new();
             let total = msg.frags.len();
@@ -704,7 +762,7 @@ impl Inner {
         }
 
         // 死链判定
-        if now.saturating_duration_since(self.last_recv_any) > DEAD_AFTER {
+        if now.saturating_duration_since(self.last_recv_any) > dead_after() {
             self.dead = true;
         }
         self.prune_fully_acked();
@@ -718,6 +776,25 @@ fn read_u32(b: &[u8]) -> u32 {
 
 fn read_u16(b: &[u8]) -> u16 {
     u16::from_be_bytes([b[0], b[1]])
+}
+
+/// 把 socket 收发缓冲调大（Linux/Windows 都会把请求值砍到 sysctl/winsock 上限）。
+///
+/// 这不是"锦上添花"：1 MB 级别的突发在 64 KB 的接收缓冲上会直接被内核丢掉，
+/// 属于真丢包 —— 调大 RCVBUF 比改统计口径更能改善弱网/大帧体验。
+fn tune_socket_buffers(socket: &UdpSocket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{
+        setsockopt, SOCKET, SO_RCVBUF, SO_SNDBUF, SOL_SOCKET,
+    };
+    let raw = socket.as_raw_socket() as usize;
+    let bytes = SOCKET_BUFFER.to_ne_bytes();
+    for (opt, name) in [(SO_RCVBUF, "SO_RCVBUF"), (SO_SNDBUF, "SO_SNDBUF")] {
+        let rc = unsafe { setsockopt(SOCKET(raw), SOL_SOCKET, opt, Some(&bytes)) };
+        if rc != 0 {
+            log::debug!("lrc-udp: 设置 {name} 失败（继续用系统默认值）");
+        }
+    }
 }
 
 /// 序号环形比较：a 是否在 b 之前。
@@ -743,8 +820,9 @@ impl UdpConn {
     /// 注意：内部会把 socket 设为非阻塞。
     pub fn new(socket: UdpSocket, peer: SocketAddr, mode: PeerMode) -> io::Result<Self> {
         socket.set_nonblocking(true)?;
-        // 说明：std 的 UdpSocket 没有 set_send/recv_buffer_size（那是 TcpStream 的），
-        // 这里就用系统默认的 socket 缓冲；发送侧靠 out_queue + RTO 重传兜住突发。
+        // std 的 UdpSocket 没有 set_recv/send_buffer_size（那是 TcpStream 的），
+        // 走 setsockopt 把缓冲调大：大帧突发时内核接收缓冲太小会直接丢包。
+        tune_socket_buffers(&socket);
         let now = Instant::now();
         let conn_id = now.elapsed().subsec_nanos()
             ^ (socket.local_addr().map_or(0, |a| u32::from(a.port())) << 16);
@@ -852,6 +930,7 @@ impl UdpConn {
                 retries: 0,
                 resend_cursor: 0,
                 timely,
+
             },
         );
         Ok(())
@@ -861,7 +940,7 @@ impl UdpConn {
     ///
     /// - Ok(Some(n)) 拿到一条（out 已被清空并填好）
     /// - Ok(None) 超时，没有完整消息
-    /// - Err(TimedOut) 连续 DEAD_AFTER（10s）没收到对端任何包（当成断线）
+    /// - Err(TimedOut) 连续 DEAD_AFTER（默认 6s，`LRC_UDP_DEAD_MS` 可覆盖）没收到对端任何包（当成断线）
     /// - Err 其它致命 IO 错误
     pub fn recv_timeout(&self, out: &mut Vec<u8>, timeout: Duration) -> io::Result<Option<usize>> {
         let deadline = Instant::now() + timeout;
@@ -879,9 +958,10 @@ impl UdpConn {
                 return Ok(Some(n));
             }
             if dead {
+                let secs = dead_after().as_millis() as f64 / 1000.0;
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    "udp: 对端 10 秒无响应（NAT 映射可能已过期）",
+                    format!("udp: 对端 {secs:.1} 秒无响应（NAT 映射可能已过期）"),
                 ));
             }
             if Instant::now() >= deadline {
@@ -1116,7 +1196,7 @@ mod tests {
         // 回环上 1MB 突发仍可能撑爆 socket 缓冲（UDP 没有背压），允许少量重传
         let retrans_ratio = sa.retransmits as f64 / sa.sent_frags.max(1) as f64;
         println!("[1 回环无丢包] 重传 {} / {} = {:.2}%", sa.retransmits, sa.sent_frags, retrans_ratio * 100.0);
-        assert!(retrans_ratio < 0.15, "回环重传率不该超过 15%: {:.2}%", retrans_ratio * 100.0);
+        assert!(retrans_ratio < 0.05, "回环重传率不该超过 5%: {:.2}%", retrans_ratio * 100.0);
     }
 
     // ---------------------------------------------------------------- 2) 注入 10% 丢包
@@ -1454,6 +1534,103 @@ mod tests {
         println!(
             "[7 relay dst_tag=0] 信封按 0 原样发出；入站 0x90+src_tag 剥壳后正常交付 {} 字节",
             n
+        );
+    }
+
+    // ---------------------------------------------------------------- 8) 判死时长
+
+    #[test]
+    fn dead_after_defaults_to_6s_and_env_parses() {
+        assert_eq!(DEAD_AFTER, Duration::from_secs(6), "默认判死时长应为 6 秒");
+        // 没设 / 非法 / 0 → 一律回落默认值
+        assert_eq!(parse_dead_ms(None), Duration::from_secs(6));
+        assert_eq!(parse_dead_ms(Some("")), Duration::from_secs(6));
+        assert_eq!(parse_dead_ms(Some("   ")), Duration::from_secs(6));
+        assert_eq!(parse_dead_ms(Some("abc")), Duration::from_secs(6));
+        assert_eq!(parse_dead_ms(Some("0")), Duration::from_secs(6));
+        assert_eq!(parse_dead_ms(Some("-5")), Duration::from_secs(6));
+        // 合法值毫米级生效
+        assert_eq!(parse_dead_ms(Some("3000")), Duration::from_millis(3000));
+        assert_eq!(parse_dead_ms(Some(" 4500 ")), Duration::from_millis(4500));
+        println!(
+            "[8 判死时长] 默认 {}ms；LRC_UDP_DEAD_MS=3000 → {}ms（非法值回默认）",
+            DEAD_AFTER.as_millis(),
+            parse_dead_ms(Some("3000")).as_millis()
+        );
+    }
+
+    /// 对端完全不回包时，应该在 ~6 秒（不是 10 秒）判死链。
+    #[test]
+    fn dead_peer_is_detected_after_6s() {
+        let mine = bind();
+        // 一个"哑巴"对端：绑上端口但从不读、从不回包
+        let silent = bind();
+        let peer = silent.local_addr().expect("silent addr");
+        let conn = UdpConn::new(mine, peer, PeerMode::Direct).expect("conn");
+
+        let started = Instant::now();
+        let mut out = Vec::new();
+        let mut msg = String::new();
+        let mut dead_ms = 0u128;
+        while started.elapsed() < Duration::from_secs(12) {
+            match conn.recv_timeout(&mut out, Duration::from_millis(100)) {
+                Ok(None) => {}
+                Ok(Some(_)) => panic!("哑巴对端不该有消息"),
+                Err(e) if e.kind() == io::ErrorKind::TimedOut => {
+                    dead_ms = started.elapsed().as_millis();
+                    msg = e.to_string();
+                    break;
+                }
+                Err(e) => panic!("意外的错误: {e}"),
+            }
+        }
+        assert!(dead_ms > 0, "12 秒内都没判死链");
+        println!("[9 判死] {dead_ms}ms 后返回 TimedOut：{msg}");
+        assert!(
+            dead_ms >= 5_500 && dead_ms <= 9_000,
+            "判死时刻应在 6 秒附近（5.5~9s），实际 {dead_ms}ms"
+        );
+        assert!(msg.contains("6.0"), "错误信息应写明 6.0 秒，实际: {msg}");
+    }
+
+    // ---------------------------------------------------------------- 10) 丢包统计口径
+
+    /// 干净 loopback 上不该报出明显丢包（视频帧大小的消息也不该）。
+    #[test]
+    fn clean_loopback_reports_no_loss() {
+        let (a, b) = pair();
+        let a = Arc::new(a);
+        let b = Arc::new(b);
+        let a_tx = Arc::clone(&a);
+        let sender = thread::spawn(move || {
+            for i in 0..200u32 {
+                a_tx.send(&make_msg(i, 300)).expect("send");
+            }
+            // 视频帧量级：32 KB ≈ 28 个分片
+            a_tx.send(&make_msg(200, 32 * 1024)).expect("send 32KB");
+            drive_until_drained(&a_tx, Duration::from_secs(15))
+        });
+        let got = drain(&b, 201, Duration::from_secs(20));
+        let settle = Instant::now() + Duration::from_secs(15);
+        while a.stats().inflight > 0 && Instant::now() < settle {
+            b.tick().expect("tick b");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(sender.join().expect("join"), "还有未确认消息");
+        assert_eq!(got.len(), 201, "少收了消息");
+        for (i, msg) in got.iter().take(200).enumerate() {
+            check_msg(msg, i as u32);
+        }
+        let sb = b.stats();
+        let sa = a.stats();
+        println!(
+            "[10 丢包统计] 干净 loopback：B recv_frags={} loss_permille={}‰；A sent_frags={} 重传={}",
+            sb.recv_frags, sb.loss_permille, sa.sent_frags, sa.retransmits
+        );
+        assert!(
+            sb.loss_permille <= 5,
+            "干净链路 loss 应接近 0，实际 {}‰（口径又算歪了）",
+            sb.loss_permille
         );
     }
 }

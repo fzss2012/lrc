@@ -241,6 +241,19 @@ impl Shared {
         )
     }
 
+    /// 连续发多条消息（一次持锁，中间不会插进音频/视频线程的消息）。
+    /// 大帧拆条用：保证同一条逻辑帧的分片在线上是连续的。
+    pub(crate) fn send_batch(&self, payloads: &[Vec<u8>]) -> io::Result<()> {
+        let mut w = self.writer_guard();
+        let mut total = 0u64;
+        for p in payloads {
+            w.send(p)?;
+            total = total.saturating_add(p.len() as u64 + 4);
+        }
+        self.sent_bytes.fetch_add(total, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// 接收线程登记"客户端要切显示输出"。
     fn request_display(&self, index: u8) {
         self.select_display.store(i32::from(index), Ordering::Relaxed);
@@ -993,6 +1006,50 @@ fn prepare_scaled_frame(scaled: &mut Option<Frame>, src: &Pixels<'_>, scale: f32
     Some((sw, sh))
 }
 
+/// 单条 VideoFrame 的 payload 预算：UDP 一个分片约 1.2 KB，32 KB ≈ 26 个分片。
+///
+/// 超过就拆成多条消息发：lrc-udp 是**有序交付**，一条大消息里只要丢一个分片，
+/// 整条就得等重传补齐（消息级队头阻塞）。首帧几 MB 时会被拖到 10 秒以上。
+const VIDEO_FRAME_CHUNK_BYTES: usize = 32 * 1024;
+/// VideoFrame 固定头：type(1)+seq(4)+flags(1)+base_seq(4)+block_size(2)+blocks_x(2)+blocks_y(2)+count(2)
+const VIDEO_FRAME_HEAD_BYTES: usize = 18;
+/// 每个块条目的固定开销：idx(4)+codec(1)+len(4)
+const BLOCK_ENTRY_BYTES: usize = 9;
+
+/// 把已编码块按"单条消息 payload ≤ budget"切成若干组（返回 blocks 的下标区间）。
+///
+/// - 区间按顺序拼起来正好覆盖 0..n，**不重不漏**（客户端按块覆盖写，拼回去就是整帧）；
+/// - 单块自己就超预算时独占一条（块不可再拆；64×64 BGRA 最大也才 16 KB）。
+fn split_block_ranges(block_lens: &[usize], budget: usize) -> Vec<std::ops::Range<usize>> {
+    let budget = budget.max(VIDEO_FRAME_HEAD_BYTES + BLOCK_ENTRY_BYTES + 1);
+    let mut out = Vec::new();
+    if block_lens.is_empty() {
+        return out;
+    }
+    let mut start = 0usize;
+    let mut used = VIDEO_FRAME_HEAD_BYTES;
+    for (i, len) in block_lens.iter().enumerate() {
+        let need = BLOCK_ENTRY_BYTES.saturating_add(*len);
+        if i > start && used.saturating_add(need) > budget {
+            out.push(start..i);
+            start = i;
+            used = VIDEO_FRAME_HEAD_BYTES;
+        }
+        used = used.saturating_add(need);
+    }
+    out.push(start..block_lens.len());
+    out
+}
+
+/// 第 index 条分片消息的 flags：**FULL|KEY 只在第一条带**，否则客户端会反复整屏重建。
+fn chunk_flags(index: usize, send_full: bool) -> u8 {
+    if index == 0 && send_full {
+        frame_flags::FULL | frame_flags::KEY
+    } else {
+        0
+    }
+}
+
 /// 采集/差分/编码/发送主循环。
 fn capture_loop(
     args: &Args,
@@ -1055,6 +1112,8 @@ fn capture_loop(
     let mut cand: Vec<u32> = Vec::new();
     let mut rects: Vec<Rect> = Vec::new();
     let mut changed: Vec<(u32, u64)> = Vec::new();
+    // 一条逻辑帧拆出来的多条消息（复用，避免每帧重新分配）
+    let mut frame_chunks: Vec<Vec<u8>> = Vec::new();
     let mut total = Stats::default();
     let mut sec = Stats::default();
     let mut last_report = Instant::now();
@@ -1707,73 +1766,95 @@ fn capture_loop(
             continue;
         }
 
-        let entries: Vec<BlockEntry<'_>> = slots[..used]
-            .iter()
-            .map(|s| BlockEntry {
-                idx: s.idx,
-                codec: s.codec,
-                data: s.data.as_slice(),
-            })
-            .collect();
-        let flags = if send_full {
-            frame_flags::FULL | frame_flags::KEY
-        } else {
-            0
-        };
-        let msg = Message::VideoFrame(VideoFrame {
-            seq,
-            flags,
-            base_seq: shared.ack_seq(),
-            block_size: BLOCK_SIZE,
-            blocks_x: track.grid.blocks_x,
-            blocks_y: track.grid.blocks_y,
-            entries,
-        });
-        let payload = msg.encode();
-        // 传输层单条消息硬上限 32 MiB（4K 全屏 + 不可压块才可能撞上）：宁可整帧不发也不能发半条
-        if payload.len() > lrc_proto::MAX_PAYLOAD {
-            log::warn!(
-                "整帧过大 {} 字节 > 上限 {}，本帧丢弃（降低 --quality 或换更小分辨率）",
-                payload.len(),
-                lrc_proto::MAX_PAYLOAD
-            );
+        // 大帧分片发送：变化块编码总字节超过预算就拆成多条 VideoFrame，**连续发**（中间不插别的消息）。
+        // 目的：把 UDP 有序交付下的"消息级队头阻塞"单位从"整帧"缩小到 32 KB。
+        let lens: Vec<usize> = slots[..used].iter().map(|s| s.data.len()).collect();
+        let ranges = split_block_ranges(&lens, VIDEO_FRAME_CHUNK_BYTES);
+        frame_chunks.clear();
+        let mut frame_ok = true;
+        for (ci, range) in ranges.iter().enumerate() {
+            if range.is_empty() {
+                continue;
+            }
+            let entries: Vec<BlockEntry<'_>> = slots[range.clone()]
+                .iter()
+                .map(|s| BlockEntry {
+                    idx: s.idx,
+                    codec: s.codec,
+                    data: s.data.as_slice(),
+                })
+                .collect();
+            let msg = Message::VideoFrame(VideoFrame {
+                seq,
+                flags: chunk_flags(ci, send_full),
+                base_seq: shared.ack_seq(),
+                block_size: BLOCK_SIZE,
+                blocks_x: track.grid.blocks_x,
+                blocks_y: track.grid.blocks_y,
+                entries,
+            });
+            let payload = msg.encode();
+            // 分片后单条不可能撞传输层上限；留个保护防止将来预算被改大
+            if payload.len() > lrc_proto::MAX_PAYLOAD {
+                log::warn!(
+                    "分片仍过大 {} > {}，本帧丢弃",
+                    payload.len(),
+                    lrc_proto::MAX_PAYLOAD
+                );
+                frame_ok = false;
+                break;
+            }
+            frame_chunks.push(payload);
+        }
+        let chunks_sent = frame_chunks.len();
+        let payload_total: usize = frame_chunks.iter().map(|p| p.len()).sum();
+        if chunks_sent == 0 {
+            frame_ok = false;
+        }
+        // 一次持锁把这一帧的所有分片连续发出去（中间不会插别的消息）
+        if frame_ok {
+            if let Err(e) = shared.send_batch(&frame_chunks) {
+                log_send_failure(&shared, "发送帧", &e);
+                break;
+            }
+        }
+        if !frame_ok {
+            // 一条都没发成/发一半：不推进客户端已知状态，下一帧整盘重扫自愈
             track.scan_all = true;
             next_grab_at = t_cap + frame_interval;
             continue;
         }
-        match shared.send(&payload) {
-            Ok(()) => {
-                seq = seq.wrapping_add(1);
-                sec.frames += 1;
-                sec.blocks += used as u64;
-                sec.bytes += payload.len() as u64 + 4;
-                sec.capture_ms_sum += capture_ms;
-                // 只有真正发出去，才把"客户端已知状态"推进到当前
-                for slot in &slots[..used] {
-                    if let Some(h) = track.hashes.get_mut(slot.idx as usize) {
-                        *h = slot.hash;
-                    }
-                }
-                track.have_prev = true;
-                track.scan_all = false;
-                force_full = false;
-                if request_full_now {
-                    sec.full_resends += 1;
-                    log::debug!(
-                        "已响应整帧请求（{}，{} 块）",
-                        if resend_from_cache {
-                            "静止桌面用缓存帧"
-                        } else {
-                            "新帧"
-                        },
-                        used
-                    );
-                }
+        seq = seq.wrapping_add(1);
+        sec.frames += 1;
+        sec.blocks += used as u64;
+        sec.bytes += payload_total as u64 + 4 * chunks_sent as u64;
+        sec.capture_ms_sum += capture_ms;
+        // 只有真正发出去，才把"客户端已知状态"推进到当前
+        for slot in &slots[..used] {
+            if let Some(h) = track.hashes.get_mut(slot.idx as usize) {
+                *h = slot.hash;
             }
-            Err(e) => {
-                log_send_failure(&shared, "发送帧", &e);
-                break;
-            }
+        }
+        track.have_prev = true;
+        track.scan_all = false;
+        force_full = false;
+        if chunks_sent > 1 {
+            log::debug!(
+                "大帧拆成 {chunks_sent} 条发（{used} 块 / {payload_total} 字节 / 预算 {VIDEO_FRAME_CHUNK_BYTES}）"
+            );
+        }
+        if request_full_now {
+            sec.full_resends += 1;
+            log::debug!(
+                "已响应整帧请求（{}，{} 块，{} 条）",
+                if resend_from_cache {
+                    "静止桌面用缓存帧"
+                } else {
+                    "新帧"
+                },
+                used,
+                chunks_sent
+            );
         }
 
         if let Err(e) = cursor.poll_and_send(&shared, &mut sec) {
@@ -2450,6 +2531,76 @@ mod tests {
             rotation: 0,
             origin_x: index_origin.0,
             origin_y: index_origin.1,
+        }
+    }
+
+    /// 把若干块长度按区间算成"这条消息的 payload 字节数"
+    fn chunk_payload(len: &[usize], r: &std::ops::Range<usize>) -> usize {
+        VIDEO_FRAME_HEAD_BYTES
+            + len[r.clone()]
+                .iter()
+                .map(|l| BLOCK_ENTRY_BYTES + l)
+                .sum::<usize>()
+    }
+
+    #[test]
+    fn split_big_frame_into_bounded_chunks() {
+        // 1080p 整帧的典型规模：500 块 × 8 KB ≈ 4 MB
+        let lens = vec![8 * 1024usize; 500];
+        let ranges = split_block_ranges(&lens, VIDEO_FRAME_CHUNK_BYTES);
+        assert!(ranges.len() > 50, "4MB 应拆成多条，实际 {}", ranges.len());
+        // 1) 区间连续、不重不漏：拼起来正好是 0..n（客户端按块覆盖写，拼回去就是整帧）
+        assert_eq!(ranges[0].start, 0);
+        assert_eq!(ranges[ranges.len() - 1].end, lens.len());
+        for w in ranges.windows(2) {
+            assert_eq!(w[0].end, w[1].start, "区间必须首尾相接");
+        }
+        let covered: usize = ranges.iter().map(|r| r.len()).sum();
+        assert_eq!(covered, lens.len(), "块集合必须完整");
+        // 2) 每条 payload 不超预算
+        for r in &ranges {
+            let bytes = chunk_payload(&lens, r);
+            assert!(
+                bytes <= VIDEO_FRAME_CHUNK_BYTES,
+                "区间 {r:?} 的 payload {bytes} 超预算 {VIDEO_FRAME_CHUNK_BYTES}"
+            );
+        }
+    }
+
+    #[test]
+    fn small_frame_is_a_single_chunk() {
+        // 打字的日常规模：几块、每块几百字节 → 不该拆
+        let lens = vec![120usize, 300, 80];
+        let ranges = split_block_ranges(&lens, VIDEO_FRAME_CHUNK_BYTES);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0], 0..3);
+    }
+
+    #[test]
+    fn oversized_block_gets_its_own_chunk() {
+        // 单块就超过预算（理论上块最大 16KB，这里故意造 64KB 验证不会死循环/丢块）
+        let lens = vec![100usize, 64 * 1024, 100];
+        let ranges = split_block_ranges(&lens, VIDEO_FRAME_CHUNK_BYTES);
+        assert_eq!(ranges.len(), 3, "超预算的块要独占一条: {ranges:?}");
+        assert_eq!(ranges[0], 0..1);
+        assert_eq!(ranges[1], 1..2);
+        assert_eq!(ranges[2], 2..3);
+    }
+
+    #[test]
+    fn full_flag_only_on_first_chunk() {
+        let first = chunk_flags(0, true);
+        assert_eq!(
+            first,
+            frame_flags::FULL | frame_flags::KEY,
+            "首帧第一条必须带 FULL|KEY"
+        );
+        for i in 1..5 {
+            assert_eq!(chunk_flags(i, true), 0, "第 {i} 条不能再带 FULL，否则客户端反复整屏重建");
+        }
+        // 非整帧：哪一条都不带 FULL
+        for i in 0..3 {
+            assert_eq!(chunk_flags(i, false), 0);
         }
     }
 

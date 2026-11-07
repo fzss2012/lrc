@@ -1,14 +1,15 @@
 //! 命令行解析（手写，不引 clap）。
 
 pub const USAGE: &str = "\
-用法: lrc-client --connect <host:port> --password <密码> [--title <标题>] [--stats]
+用法: lrc-client --password <密码> [--connect <host:port> | --signal <IP:PORT>] [--title <标题>] [--stats]
 
-  --connect <addr>   被控端地址，例如 127.0.0.1:7800（连不上会每秒重试，窗口保持打开）
+  --connect <addr>   被控端 TCP 地址，例如 127.0.0.1:7800（连不上会每秒重试，窗口保持打开）；
+                     给了 --signal 且 --p2p != off 时可省略——但省略后 P2P 失败无法回退 TCP
   --password <pwd>   认证密码，作为 HMAC-SHA256 的 key
   --title <text>     窗口标题，默认 \"lrc viewer\"
   --audio on|off     音频通道，默认 on（设备不可用会自动降级为 off，不影响视频）
   --audio-dump <path> 把解码后的 PCM(s16le 48k/2ch) 追加写到文件，调试用
-  --signal <IP:PORT> relay 信令地址（不给 = 不启用 P2P，只走 TCP）
+  --signal <IP:PORT> relay 信令地址（不给 = 不启用 P2P，只走 TCP；给了就 P2P 优先）
   --room <N>         房间号（host/client 相同），默认 1
   --p2p auto|off|direct|relay  P2P 模式
   --stats            每秒打印一行 fps= recv_kbps= decoded_blocks= ...
@@ -39,7 +40,8 @@ impl P2pMode {
 /// 主控端运行参数。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Config {
-    pub connect: String,
+    /// TCP 直连地址（--connect）；给了 --signal 且 --p2p != off 时可以不给（P2P 优先）
+    pub connect: Option<String>,
     pub password: String,
     pub title: String,
     pub stats: bool,
@@ -62,7 +64,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            connect: String::new(),
+            connect: None,
             password: String::new(),
             title: String::from("lrc viewer"),
             stats: false,
@@ -104,7 +106,7 @@ impl Config {
             match key.as_str() {
                 "-h" | "--help" => return Ok(Parsed::Help),
                 "--connect" => {
-                    cfg.connect = take_value(inline, &mut it, "--connect")?;
+                    cfg.connect = Some(take_value(inline, &mut it, "--connect")?);
                     has_connect = true;
                 }
                 "--password" => {
@@ -156,13 +158,17 @@ impl Config {
             }
         }
 
-        if !has_connect {
-            return Err(String::from("缺少 --connect <host:port>"));
-        }
         if !has_password {
             return Err(String::from("缺少 --password <密码>"));
         }
-        if cfg.connect.is_empty() {
+        // --connect 可选：给了 --signal 且 --p2p != off 时 P2P 优先，TCP 只是兜底
+        let p2p_available = cfg.signal.is_some() && cfg.p2p.enabled();
+        if !has_connect && !p2p_available {
+            return Err(String::from(
+                "缺少 --connect <host:port>（没给 --signal 时必须提供 TCP 直连地址）",
+            ));
+        }
+        if matches!(cfg.connect.as_deref(), Some("")) {
             return Err(String::from("--connect 不能为空"));
         }
         Ok(Parsed::Run(cfg))
@@ -203,7 +209,7 @@ mod tests {
         .expect("parse");
         match parsed {
             Parsed::Run(cfg) => {
-                assert_eq!(cfg.connect, "127.0.0.1:7800");
+                assert_eq!(cfg.connect.as_deref(), Some("127.0.0.1:7800"));
                 assert_eq!(cfg.password, "1234");
                 assert_eq!(cfg.title, "lrc viewer");
                 assert!(cfg.stats);
@@ -218,7 +224,7 @@ mod tests {
         let parsed = parse(&["--connect=a:1", "--password=p"]).expect("parse");
         match parsed {
             Parsed::Run(cfg) => {
-                assert_eq!(cfg.connect, "a:1");
+                assert_eq!(cfg.connect.as_deref(), Some("a:1"));
                 assert_eq!(cfg.password, "p");
                 assert_eq!(cfg.title, "lrc viewer");
                 assert!(!cfg.stats);
@@ -263,6 +269,28 @@ mod tests {
         }
         assert!(parse(&["--connect", "a:1", "--password", "p", "--p2p", "bogus"]).is_err());
         assert!(parse(&["--connect", "a:1", "--password", "p", "--room", "x"]).is_err());
+    }
+
+    #[test]
+    fn connect_is_optional_when_p2p_enabled() {
+        // 给了 --signal 且 p2p != off：可以不给 --connect
+        let parsed = parse(&["--password", "p", "--signal", "127.0.0.1:7801"]).expect("parse");
+        match parsed {
+            Parsed::Run(cfg) => {
+                assert!(cfg.connect.is_none());
+                assert_eq!(cfg.p2p, P2pMode::Auto);
+            }
+            Parsed::Help => panic!("should run"),
+        }
+        // relay/direct 模式同样可以省略 --connect
+        assert!(parse(&["--password", "p", "--signal", "1.2.3.4:7801", "--p2p", "relay"]).is_ok());
+        assert!(parse(&["--password", "p", "--signal", "1.2.3.4:7801", "--p2p", "direct"]).is_ok());
+        // --p2p off：P2P 不可用，仍然必须有 --connect
+        assert!(parse(&["--password", "p", "--signal", "1.2.3.4:7801", "--p2p", "off"]).is_err());
+        // 两者都不给：报错
+        assert!(parse(&["--password", "p"]).is_err());
+        // 空 --connect 也要报错
+        assert!(parse(&["--password", "p", "--signal", "1.2.3.4:7801", "--connect", ""]).is_err());
     }
 
     #[test]

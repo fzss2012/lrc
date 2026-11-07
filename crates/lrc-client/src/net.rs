@@ -52,8 +52,8 @@ enum HandshakeError {
 
 /// 建连参数：TCP 兜底地址 + P2P 信令。
 struct ConnParams {
-    /// TCP 直连地址（--connect）
-    tcp_addr: String,
+    /// TCP 直连地址（--connect；没给时 P2P 失败就没有兜底）
+    tcp_addr: Option<String>,
     /// relay 信令地址（--signal；None = 不启用 P2P）
     signal: Option<String>,
     /// 房间号（--room）
@@ -143,6 +143,10 @@ fn supervise(
     shared: &Arc<Shared>,
 ) {
     let p2p_enabled = params.signal.is_some() && params.p2p.enabled();
+    // 没给 --connect：P2P 失败就没有 TCP 兜底了，要提前说清楚
+    if params.tcp_addr.is_none() {
+        log::warn!("未给 --connect：P2P 失败后无法回退 TCP");
+    }
     let mut attempt: u32 = 0;
     let mut ever_connected = false;
     // 上次成功的路径：P2P 可用时先试 P2P
@@ -161,7 +165,11 @@ fn supervise(
         // ---- 1) 建连：按优先级依次尝试（P2P/relay → TCP 兜底）----
         let mut opened: Option<(LinkWriter, LinkReader, &'static str)> = None;
         let mut last_error = String::new();
-        for kind in attempt_order(p2p_enabled, preferred) {
+        let mut order = attempt_order(p2p_enabled, preferred);
+        if params.tcp_addr.is_none() {
+            order.retain(|kind| *kind != P2pPath::Tcp);
+        }
+        for kind in order {
             if shared.is_quit() {
                 return;
             }
@@ -170,12 +178,15 @@ fn supervise(
                     Some(signal) => open_udp(signal, params.room, params.p2p),
                     None => Err(String::from("未配置 --signal")),
                 },
-                P2pPath::Tcp => match Conn::connect(&params.tcp_addr) {
-                    Ok(conn) => match link::from_tcp(conn) {
-                        Ok(link) => Ok(link),
-                        Err(e) => Err(format!("TCP split 失败：{e}")),
+                P2pPath::Tcp => match params.tcp_addr.as_deref() {
+                    Some(addr) => match Conn::connect(addr) {
+                        Ok(conn) => match link::from_tcp(conn) {
+                            Ok(link) => Ok(link),
+                            Err(e) => Err(format!("TCP split 失败：{e}")),
+                        },
+                        Err(e) => Err(format!("TCP 连接 {addr} 失败：{e}")),
                     },
-                    Err(e) => Err(format!("TCP 连接 {} 失败：{e}", params.tcp_addr)),
+                    None => Err(String::from("未给 --connect：P2P 失败后无法回退 TCP")),
                 },
             };
             match result {

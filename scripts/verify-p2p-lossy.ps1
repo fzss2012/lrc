@@ -144,16 +144,20 @@ foreach ($loss in $losses) {
         $relayed = As-Long (Get-Field $relayLast "relayed_bytes")
 
         $blocksGrew = ($blkLast -gt $blkFirst) -and ($blkLast -gt 0)
-        # 会话活着 = 有持续统计输出 + 没有触发重连 + 画面在动（fps>0 或解码块在增长）
-        $alive = ($clientLines.Count -gt 3) -and ($reconn -eq 0) -and (($fps -gt 0) -or $blocksGrew)
+        # 视频模式下块模式 fps/decoded_blocks 会冻结（画面走 VideoAu），所以判活要同时看 video_fps 与码率
+        $videoFps = As-Double (Get-Field $last "video_fps")
+        $mode = Get-Field $last "mode"
+        $flowing = ($fps -gt 0) -or ($videoFps -gt 0) -or $blocksGrew -or ($kbps -gt 50)
+        # 会话活着 = 有持续统计输出 + 没有触发重连 + 画面在动
+        $alive = ($clientLines.Count -gt 3) -and ($reconn -eq 0) -and $flowing
 
         $rows += [pscustomobject]@{
             loss = $loss; path = $(if ($cPath) { $cPath } else { $hPath }); client_fps = $fps;
             blocks = $blkLast; grew = $blocksGrew; c_kbps = $kbps; h_kbps = $hKbps;
             c_rtt = $cRtt; h_rtt = $hRtt; c_loss = $cLoss; h_loss = $hLoss;
-            reconnects = $reconn; relayed = $relayed; alive = $alive
+            reconnects = $reconn; relayed = $relayed; alive = $alive; mode = $mode; video_fps = $videoFps
         }
-        Write-Host ("  path=" + $cPath + " fps=" + $fps + " blocks=" + $blkFirst + "->" + $blkLast + " kbps(client)=" + [math]::Round($kbps, 1) + " kbps(host)=" + [math]::Round($hKbps, 1) + " udp_rtt=" + $cRtt + " udp_loss=" + $cLoss + " reconnects=" + $reconn + " relayed_bytes=" + $relayed)
+        Write-Host ("  path=" + $cPath + " mode=" + $mode + " fps=" + $fps + " video_fps=" + $videoFps + " blocks=" + $blkFirst + "->" + $blkLast + " kbps(client)=" + [math]::Round($kbps, 1) + " kbps(host)=" + [math]::Round($hKbps, 1) + " udp_rtt=" + $cRtt + " udp_loss=" + $cLoss + " reconnects=" + $reconn + " relayed_bytes=" + $relayed)
     }
     finally {
         Stop-Logged $client; Stop-Logged $hostp; Stop-Logged $proxy; Stop-Logged $relay

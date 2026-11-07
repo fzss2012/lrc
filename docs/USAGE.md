@@ -143,18 +143,21 @@ t=12.0 fps=18.3 blocks=42 sent_frames=220 bytes=1234567 kbps=987.6 idle_frames=1
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `--connect <host:port>` | **必填** | 被控端地址，例如 `127.0.0.1:7800`；连不上会退避重试、窗口保持打开 |
+| `--connect <host:port>` | 视情况必填 | 被控端 TCP 地址，例如 `127.0.0.1:7800`；连不上会退避重试、窗口保持打开。**给了 `--signal` 且 `--p2p != off` 时可省略**（P2P 优先）——但省略后 P2P/relay 失败就没有 TCP 兜底，日志会打「未给 --connect：P2P 失败后无法回退 TCP」 |
 | `--password <PWD>` | **必填** | 认证口令，HMAC-SHA256 的 key。**没有环境变量入口**（见 §5） |
 | `--title <text>` | `lrc viewer` | 窗口标题 |
 | `--stats` | 关 | 每秒打印一行统计（字段见 3.4） |
 | `--audio on\|off` | `on` | 音频通道；设备不可用时自动降级关闭，不影响视频 |
 | `--audio-dump <path>` | 无 | 把解码后的 PCM（s16le 48k/2ch）追加写文件，**调试用**（不轮转，文件会一直长） |
-| `--signal <IP:PORT>` | 无 | relay 信令地址，语义与 host 相同（不给 = 只走 TCP）。**以 client-app 交付为准，尚未核对实际参数名/默认值** |
-| `--room <N>` | `1` | relay 房间号，必须与 host 一致（待核对） |
-| `--p2p <auto\|off\|direct\|relay>` | `auto` | 路径策略，语义见 §4.4（待核对） |
+| `--signal <IP:PORT>` | 无 | relay 信令地址，语义与 host 相同（不给 = 只走 TCP）。给了就 **P2P 优先**，TCP 仅作兜底 |
+| `--room <N>` | `1` | relay 房间号，必须与 host 一致 |
+| `--p2p <auto\|off\|direct\|relay>` | `auto` | 路径策略，语义见 §4.4 |
 | `-h, --help` | | 打印帮助 |
 
 窗口客户区默认 **1280×720**（代码里的默认值，不是命令行参数）；首帧到达后按远端宽高比自动调整一次。
+
+> 参数组合：只给 `--connect` = 纯 TCP（M3 行为）；`--signal` + `--connect` = P2P 优先、失败回退 TCP；
+> 只给 `--signal` = 纯 UDP（P2P/relay），P2P 失败会一直重试、不会退回 TCP。`--p2p off` 时必须有 `--connect`。
 
 ### 3.2 窗口操作与输入映射
 
