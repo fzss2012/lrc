@@ -8,6 +8,9 @@ param(
     [int]$RelayPort = 7801,
     # relay 地址：本机自测填 127.0.0.1（脚本会自己起 relay）；跨公网填 VPS 公网 IP（脚本不起本地 relay）
     [string]$RelayHost = "127.0.0.1",
+    # 远端 relay 时，用 ssh 去读它的 relayed_bytes（留空则跳过这项）
+    [string]$SshTarget = "",
+    [string]$SshKey = "",
     [int]$Room = 1,
     [int]$HostDisplay = 1,
     [int]$PatternTargetX = 1920,
@@ -58,6 +61,13 @@ function Run-Phase([string]$p2p, [string]$tag) {
     $cPath = if ($cLines.Count) { ($cLines[-1] -replace '.*path=([a-z_]+).*', '$1') } else { 'NONE' }
     $relayed = 0
     foreach ($l in $rLines) { if ($l -match 'relayed_bytes=(\d+)') { $relayed = [int]$Matches[1] } }
+    if ($SshTarget -ne '' -and $SshKey -ne '') {
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        $line = & ssh -i $SshKey -o StrictHostKeyChecking=no -o UserKnownHostsFile=NUL -o BatchMode=yes $SshTarget 'tail -1 ~/relay.log' 2>$null
+        $ErrorActionPreference = $prevEap
+        if ($line -match 'relayed_bytes=(\d+)') { $relayed = [int]$Matches[1] }
+    }
     Write-Host ("   host path={0}  client path={1}  relay relayed_bytes={2}" -f $hPath, $cPath, $relayed)
     return [pscustomobject]@{ Tag = $tag; HostPath = $hPath; ClientPath = $cPath; RelayedBytes = $relayed; HostOut = $hostOut; ClientOut = $clientOut; RelayOut = $relayOut }
 }

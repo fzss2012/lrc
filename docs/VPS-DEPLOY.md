@@ -247,9 +247,25 @@ target\release\lrc-client.exe --password 1234 --stats ^
 | **UDP 入站可达性** | ❌ **确证不通**：tcpdump 抓包 + 多端口 Python 监听，从 Windows 打 UDP 到 7801/3478/45000 → **全部 0 个到达**；同时 **TCP 7800 连接成功**；VPS 内 `ufw inactive`、`iptables INPUT ACCEPT` |
 | 结论 | **只差安全组放行 UDP 入站**。代码/服务侧已完全就绪，加完规则即可做真实打洞测试 |
 
-### 重装后的最终状态（2026-11-07 20:30 左右）
+### 重装后的最终状态（2026-11-07 20:40 更新：UDP 已放行，公网链路跑通）
+
+**✅ 全链路已在公网跑通**：Windows 端 host + client 通过 `118.24.79.47:7801` 建链，
+`path=relay_udp`、30 fps、1.6–2.3 Mbps、`udp_rtt≈87ms`、12 秒 relay 转发 32.7 MB。
+
+**期间定位到的两个坑（都写进排障表）**：
+
+1. 第一次"打不开"是**安全组规则选成了 TCP**：实测 TCP 7801 返回 RST（放行）、TCP 7800 超时（未放行）、UDP 7801 tcpdump 零包
+   → 改成 **协议=UDP** 后立刻通。
+2. 中间有一次 **TCP 7800 显示"成功"是假阳性**：当时本机 Clash Verge 的 TUN 在代理，连接是从代理节点发出的；
+   退出 Clash 后同一测试立刻超时。**做网络连通性验证时先把 Clash/TUN 关掉**。
+
+3. 打洞（`direct_udp`）在"同一台机器/同一个 NAT"下必然失败（路由器不做 hairpin），
+   要验证真实打洞需要**两台不同网络的机器**。
+
+### 服务端当前部署细节
 
 ```
+# 二进制在 /home/ubuntu/lrc/relay-src/target/release/lrc-relay
 systemctl is-active lrc-relay  → active（Restart=always，开机自启）
 ss -lunp | grep 7801           → UNCONN 0.0.0.0:7801 (lrc-relay, pid=14424)
 二进制                         → /home/ubuntu/lrc/relay-src/target/release/lrc-relay (9,384,544 B)

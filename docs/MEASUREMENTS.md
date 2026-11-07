@@ -69,6 +69,25 @@
 - relay 路径实测：`udp_rtt 2–12 ms`、`udp_loss 23–39‰`（relay 单线程转发在忙时会丢包，靠 `lrc-udp` 重传补回，画面不烂）
 - `lrc-udp` 自测：回环 1000 条消息 15.1 MB/s；**注入 10% 丢包仍 1000 条全量有序不重复**（重传 51.9%）
 
+### 1.6 跨公网实测（腾讯云 118.24.79.47，2026-11-07）
+
+> 这是第一次**真实跨公网**跑通：Windows 端 host + client，信令与中继都在公网 VPS 上。
+> ⚠️ 两台 peer 都在**同一个 NAT 后面**（同一台机器），所以打洞必然失败（家用路由器不做 hairpin），
+> 得到的是 `relay_udp` —— **这不代表真实两端网络的打洞成功率**。
+
+| 指标 | 实测 |
+|---|---|
+| 路径 | **`relay_udp`**（两端都是） |
+| 帧率 | 30 fps 稳定 |
+| 客户端接收 | 1.6 – 2.3 Mbps |
+| `udp_rtt` | **82 – 88 ms**（VPS 在北京，本机 ping ≈39 ms，经 relay 往返符合预期） |
+| `udp_loss` | 24 – 29‰（relay 单线程转发在 ~2.8k pps 下会丢包，`lrc-udp` 重传兜住，画面正常） |
+| relay 转发量 | 12 秒转发 **32.7 MB / 34,397 包**；两阶段累计 **88 MB** |
+| 会话稳定性 | `reconnects=0`，`decoded_blocks` 持续增长，无花屏 |
+
+**P2P 直连（`direct_udp`）仍未验证**：需要在**两个不同网络**的机器上跑（例如一台接家庭宽带、一台用手机热点）。
+脚本已支持远端 relay：`scripts/verify-p2p.ps1 -RelayHost <IP> -SshTarget ubuntu@<IP> -SshKey <key>`。
+
 ### 1.5 M4 弱网验收（`scripts/verify-p2p-lossy.ps1`：udp-proxy 注入丢包 + 20ms 延迟）
 
 | 丢包设定 | path | fps | 解码块 | 码率(client) | udp_rtt | udp_loss | 重连 | relay 转发 |
