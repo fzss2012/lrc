@@ -5,13 +5,20 @@
 
 pub mod ffmpeg;
 
-pub use ffmpeg::{DecoderConfig, FfmpegDecoder, FfmpegEncoder, resolve_ffmpeg};
+pub use ffmpeg::{
+    probe, probe_with_ffmpeg, resolve_ffmpeg, CodecInfo, DecoderConfig, FfmpegDecoder,
+    FfmpegEncoder, BITRATE_LADDER,
+};
 
 use std::fmt;
 
 /// 编码器配置。
 #[derive(Clone, Debug)]
 pub struct EncoderConfig {
+    /// 画面宽（物理像素）
+    pub width: u32,
+    /// 画面高（物理像素）
+    pub height: u32,
     /// 目标码率（比特/秒）
     pub bitrate_bps: u32,
     /// 关键帧间隔（帧）
@@ -27,12 +34,36 @@ pub struct EncoderConfig {
 impl Default for EncoderConfig {
     fn default() -> Self {
         Self {
+            width: 1920,
+            height: 1080,
             bitrate_bps: 4_000_000,
             gop: 60,
             fps: 30,
             codec: "hevc_nvenc".to_string(),
             ffmpeg_path: None,
         }
+    }
+}
+
+impl EncoderConfig {
+    /// 按宽高出帧的字节数（BGRA）。
+    pub fn frame_bytes(&self) -> usize {
+        self.width as usize * self.height as usize * 4
+    }
+}
+
+/// 编码器名 → `lrc_proto::codec_tag`（线格式里用 1 字节描述码流类型）。
+///
+/// `hevc_nvenc`/`hevc`/… → `codec_tag::HEVC`；`h264_*`/`h264`/… → `codec_tag::H264`；
+/// 认不出来返回 `None`（调用方应视为"没有视频通道"）。
+pub fn codec_tag_of(codec: &str) -> Option<u8> {
+    let c = codec.to_ascii_lowercase();
+    if c.contains("hevc") || c.contains("265") {
+        Some(lrc_proto::codec_tag::HEVC)
+    } else if c.contains("h264") || c.contains("avc") || c.contains("264") {
+        Some(lrc_proto::codec_tag::H264)
+    } else {
+        None
     }
 }
 

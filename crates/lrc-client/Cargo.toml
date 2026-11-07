@@ -13,6 +13,8 @@ lrc-proto.workspace = true
 lrc-codec.workspace = true
 lrc-render.workspace = true
 lrc-transport.workspace = true
+# root Cargo.toml 的 [workspace.dependencies] 还没有 lrc-video，先直接 path 依赖
+lrc-video = { path = "../lrc-video" }
 # Win32_Security_Cryptography 只用于 BCryptGenRandom 生成 client_id / nonce_c
 windows = { workspace = true, features = ["Win32_Security_Cryptography"] }
 anyhow.workspace = true

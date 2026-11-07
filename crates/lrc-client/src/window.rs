@@ -325,6 +325,10 @@ struct Stats {
     at: Instant,
     frames: u64,
     bytes: u64,
+    /// 累计解码出的视频帧（算 video_fps 用）
+    video_frames: u64,
+    /// 上一次的管线延迟（这一秒没有视频帧时沿用）
+    lat_ms: f64,
 }
 
 impl Stats {
@@ -333,6 +337,8 @@ impl Stats {
             at: Instant::now(),
             frames: 0,
             bytes: 0,
+            video_frames: 0,
+            lat_ms: 0.0,
         }
     }
 }
@@ -381,9 +387,16 @@ impl AppState {
     fn on_present_timer(&mut self) {
         self.sync_surface();
         self.fit_window_aspect_once();
-        // 1) 解码块先进干净帧（光标不进码流，合成前必须先有"无光标"的底图）
+        // 0) 视频通道：整帧解码结果先上屏（只在视频路径用 update_full）
+        self.apply_video_frame();
+
+        // 1) 块通道：解码块先进干净帧（光标不进码流，合成前必须先有"无光标"的底图）
         let blocks = self.shared.take_blocks();
         let mut damage: Vec<Rect> = Vec::with_capacity(blocks.len() + 4);
+        if self.shared.take_block_full_reset() {
+            // 视频 → 块：整屏重建 clean，顺手把旧光标/视频残影清掉
+            self.reset_clean_for_blocks(&mut damage);
+        }
         for block in &blocks {
             self.apply_block_to_clean(block, &mut damage);
         }
@@ -561,6 +574,145 @@ impl AppState {
                 None
             }
         }
+    }
+
+    /// 视频通道：把最新解出的一帧整帧上屏，并同步光标合成用的 clean。
+    ///
+    /// 视频路径**只用 `update_full`**（块路径用 `update_block`）；之后强制光标重绘，
+    /// 让它叠到新帧上。
+    fn apply_video_frame(&mut self) {
+        let Some(frame) = self.shared.take_video_frame() else {
+            return;
+        };
+        let (width, height, stride) = (frame.width, frame.height, frame.stride);
+        if width == 0 || height == 0 {
+            return;
+        }
+        let Some(clean_stride) = (width as usize).checked_mul(4) else {
+            return;
+        };
+        if stride < clean_stride {
+            log::warn!("视频帧 stride 非法: {stride} < {clean_stride}");
+            return;
+        }
+        // 尺寸变了（被控端分辨率切换）：重建呈现面 + clean
+        self.ensure_surface_for(width, height);
+
+        // 更新干净帧（光标合成底图），否则光标一移动就会擦出视频帧之前的内容
+        let rows = height as usize;
+        if self.clean.len() < clean_stride.saturating_mul(rows + 1) {
+            self.clean.clear();
+            self.clean.resize(clean_stride.saturating_mul(rows + 1), 0);
+        }
+        for row in 0..rows {
+            let Some(src_off) = row.checked_mul(stride) else {
+                break;
+            };
+            let Some(dst_off) = row.checked_mul(clean_stride) else {
+                break;
+            };
+            let (Some(src_end), Some(dst_end)) =
+                (src_off.checked_add(clean_stride), dst_off.checked_add(clean_stride))
+            else {
+                break;
+            };
+            let (Some(src), Some(dst)) = (
+                frame.bgra.get(src_off..src_end),
+                self.clean.get_mut(dst_off..dst_end),
+            ) else {
+                break;
+            };
+            dst.copy_from_slice(src);
+        }
+
+        // 整帧上屏：视频路径只用 update_full
+        let mut degraded = false;
+        match &mut self.surface {
+            Surface::Gpu(presenter) => {
+                let updated = catch_unwind(AssertUnwindSafe(|| {
+                    presenter.update_full(width, height, &frame.bgra, stride)
+                }));
+                match updated {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        log::warn!("update_full 失败: {e}");
+                        degraded = true;
+                    }
+                    Err(_) => {
+                        log::warn!("update_full panic");
+                        degraded = true;
+                    }
+                }
+            }
+            Surface::Gdi(canvas) => {
+                canvas.blit_rect(0, 0, width, height, &frame.bgra, stride);
+                let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+            }
+            Surface::None => {}
+        }
+        if degraded {
+            self.degrade_to_gdi();
+        }
+
+        // update_full 换掉了整张纹理：强制下一次光标合成把光标画到新帧上
+        self.cursor.drawn = None;
+        self.cursor.version = 0;
+        self.need_present = true;
+        log::trace!(
+            "视频帧上屏 seq={} {}x{} stride={}",
+            frame.seq,
+            width,
+            height,
+            stride
+        );
+    }
+
+    /// 视频帧尺寸和当前呈现面不一致时重建（分辨率切换）。
+    fn ensure_surface_for(&mut self, width: u32, height: u32) {
+        if self.surface_size == Some((width, height)) {
+            return;
+        }
+        log::info!("呈现面尺寸切换为 {width}x{height}");
+        self.surface_size = Some((width, height));
+        let stride = (width as usize).saturating_mul(4);
+        self.clean.clear();
+        self.clean.resize(
+            stride.saturating_mul(height as usize + 1),
+            0,
+        );
+        self.scratch.clear();
+        self.cursor.reset();
+        self.need_present = true;
+        // Presenter 会在 update_full / resize 里自己 resize；GDI 回退的画布要换新的
+        if let Surface::Gdi(canvas) = &self.surface {
+            if (canvas.w, canvas.h) != (width, height) {
+                self.surface = Surface::Gdi(SoftCanvas::new(width, height));
+            }
+        }
+    }
+
+    /// 从视频模式切回块模式：整屏重建 clean（清掉视频帧残留），并让光标重画。
+    fn reset_clean_for_blocks(&mut self, damage: &mut Vec<Rect>) {
+        let Some((width, height)) = self.surface_size else {
+            return;
+        };
+        for byte in &mut self.clean {
+            *byte = 0;
+        }
+        // 旧光标包围盒作废：refresh_cursor 会把它重画到重建后的画面上
+        self.cursor.drawn = None;
+        self.cursor.version = 0;
+        if let Some(rect) = clipped_rect_pixels(
+            0,
+            0,
+            width as i32,
+            height as i32,
+            (width, height),
+        ) {
+            damage.push(rect);
+        }
+        self.need_present = true;
+        log::info!("切回块模式：整屏重建干净帧（{width}x{height}）");
     }
 
     /// 把一个解码块拷进干净帧，并把它的矩形记入本次要重绘的区域。
@@ -786,22 +938,41 @@ impl AppState {
         let frames = self.shared.frame_count.load(Ordering::Relaxed);
         let bytes = self.shared.recv_bytes.load(Ordering::Relaxed);
         let blocks = self.shared.decoded_blocks.load(Ordering::Relaxed);
+        let video_frames = self.shared.video_frames.load(Ordering::Relaxed);
+        let mode = if self.shared.is_video_mode() {
+            "video"
+        } else {
+            "blocks"
+        };
         let dt = now.duration_since(self.stats.at).as_secs_f64();
         let dframes = frames.saturating_sub(self.stats.frames);
         let dbytes = bytes.saturating_sub(self.stats.bytes);
+        let dvideo = video_frames.saturating_sub(self.stats.video_frames);
+        // 最近一秒的管线延迟平均；这一秒没有视频帧就沿用上一次，避免抖成 0
+        let lat_ms = match self.shared.take_latency_avg_ms() {
+            Some(avg) => avg,
+            None => self.stats.lat_ms,
+        };
         self.stats = Stats {
             at: now,
             frames,
             bytes,
+            video_frames,
+            lat_ms,
         };
         if !self.stats_enabled || dt <= 0.0 {
             return;
         }
         let fps = dframes as f64 / dt;
         let kbps = dbytes as f64 * 8.0 / 1000.0 / dt;
+        let video_fps = dvideo as f64 / dt;
         let rtt_ms = self.shared.rtt_micros() as f64 / 1000.0;
-        // 每秒一行，便于重定向到文件后逐行看
-        println!("fps={fps:.0} recv_kbps={kbps:.1} decoded_blocks={blocks} rtt_ms={rtt_ms:.3}");
+        // 每秒一行，便于重定向到文件后逐行看。
+        // lat_ms 只在视频模式下、且两端用同一时钟源（GetTickCount64）时才是真延迟。
+        println!(
+            "fps={fps:.0} recv_kbps={kbps:.1} decoded_blocks={blocks} rtt_ms={rtt_ms:.3} \
+mode={mode} video_fps={video_fps:.1} lat_ms={lat_ms:.1}"
+        );
         let _ = std::io::stdout().flush();
     }
 

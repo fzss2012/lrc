@@ -10,9 +10,41 @@ pub const DEFAULT_FPS: u32 = 30;
 pub const DEFAULT_QUALITY: u8 = 85;
 /// 帧率上限的硬顶。
 pub const MAX_FPS: u32 = 240;
+/// 视频通道默认码率（bit/s）。
+pub const DEFAULT_VIDEO_BITRATE: u32 = 4_000_000;
+/// 视频模式默认帧率上限。
+pub const DEFAULT_VIDEO_MAX_FPS: u32 = 30;
+/// 视频码率的合理范围。
+pub const VIDEO_BITRATE_RANGE: std::ops::RangeInclusive<u32> = 100_000..=80_000_000;
 
-pub const USAGE: &str =
-    "用法: lrc-host --password <PASS> [--listen <IP:PORT>] [--display N] [--fps N] [--quality N] [--stats]";
+/// 视频通道选择。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoChoice {
+    /// 探测到 NVENC 就用 hevc，否则永久块模式
+    Auto,
+    /// 完全不用视频通道
+    Off,
+    Hevc,
+    H264,
+}
+
+impl VideoChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoChoice::Auto => "auto",
+            VideoChoice::Off => "off",
+            VideoChoice::Hevc => "hevc",
+            VideoChoice::H264 => "h264",
+        }
+    }
+
+    /// 显式关了视频就不该去探测/起编码器。
+    pub fn is_off(self) -> bool {
+        matches!(self, VideoChoice::Off)
+    }
+}
+
+pub const USAGE: &str = "用法: lrc-host --password <PASS> [--listen <IP:PORT>] [--display N] [--fps N] [--quality N] [--stats] [--video auto|off|hevc|h264] [--video-bitrate B] [--video-max-fps N]";
 
 pub const HELP: &str = "\
 lrc-host — lrc 被控端（单流点对点）
@@ -26,14 +58,17 @@ lrc-host — lrc 被控端（单流点对点）
 选项:
   --listen <ADDR>     监听地址，默认 0.0.0.0:7800
   --display <N>       采集第 N 个输出（DXGI 输出序号，0 起），默认 0
-  --fps <N>           发送帧率上限 1..=240，默认 30
+  --fps <N>           块模式发送帧率上限 1..=240，默认 30
   --quality <N>       JPEG 质量 1..=100，默认 85
   --stats             每秒往 stdout 打一行统计
+  --video <MODE>      视频通道 auto|off|hevc|h264，默认 auto（探测到 NVENC 就用 hevc）
+  --video-bitrate <B> 视频码率 bit/s，默认 4000000
+  --video-max-fps <N> 视频模式帧率上限 1..=240，默认 30
   -h, --help          显示本帮助
 
 统计行:
-  fps=<帧/秒> capture_ms_avg=<采集耗时均值 ms> blocks_changed=<变化块数>
-  bytes_sent=<线上字节> kbps=<千比特/秒> idle_frames=<无变化次数> dropped=<流控丢帧>
+  t=<秒> fps= blocks= sent_frames= bytes= kbps= idle_frames= dropped= sec_bytes=
+  cursor_msgs= full_resends= mode=blocks|video video_kbps= video_fps=
 ";
 
 /// 解析后的启动参数。
@@ -45,6 +80,12 @@ pub struct Args {
     pub fps: u32,
     pub quality: u8,
     pub stats: bool,
+    /// 视频通道（M2）
+    pub video: VideoChoice,
+    /// 视频码率（bit/s）
+    pub video_bitrate: u32,
+    /// 视频模式帧率上限
+    pub video_max_fps: u32,
 }
 
 /// 解析结果：要么是帮助，要么是运行参数。
@@ -97,6 +138,9 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
     let mut fps = DEFAULT_FPS;
     let mut quality = DEFAULT_QUALITY;
     let mut stats = false;
+    let mut video = VideoChoice::Auto;
+    let mut video_bitrate = DEFAULT_VIDEO_BITRATE;
+    let mut video_max_fps = DEFAULT_VIDEO_MAX_FPS;
 
     let mut i = 0usize;
     while i < argv.len() {
@@ -111,7 +155,8 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
                 stats = !matches!(inline.as_deref(), Some("0") | Some("false") | Some("no"));
             }
             "--no-stats" => stats = false,
-            "--listen" | "--password" | "--display" | "--fps" | "--quality" => {
+            "--listen" | "--password" | "--display" | "--fps" | "--quality" | "--video"
+            | "--video-bitrate" | "--video-max-fps" => {
                 let value = match inline {
                     Some(v) => v,
                     None => {
@@ -157,6 +202,48 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
                         }
                         quality = v as u8;
                     }
+                    "--video" => {
+                        video = match value.as_str() {
+                            "auto" => VideoChoice::Auto,
+                            "off" | "none" | "0" => VideoChoice::Off,
+                            "hevc" | "h265" | "hevc_nvenc" => VideoChoice::Hevc,
+                            "h264" | "avc" | "h264_nvenc" => VideoChoice::H264,
+                            _ => {
+                                return Err(CliError::BadValue {
+                                    flag: name.to_string(),
+                                    value,
+                                    expect: "auto|off|hevc|h264",
+                                })
+                            }
+                        };
+                    }
+                    "--video-bitrate" => {
+                        let v = parse_usize(name, &value)?;
+                        let v = u32::try_from(v).ok().filter(|v| {
+                            VIDEO_BITRATE_RANGE.contains(v)
+                        });
+                        match v {
+                            Some(v) => video_bitrate = v,
+                            None => {
+                                return Err(CliError::BadValue {
+                                    flag: name.to_string(),
+                                    value,
+                                    expect: "100000..=80000000",
+                                })
+                            }
+                        }
+                    }
+                    "--video-max-fps" => {
+                        let v = parse_usize(name, &value)?;
+                        if v == 0 || v > MAX_FPS as usize {
+                            return Err(CliError::BadValue {
+                                flag: name.to_string(),
+                                value,
+                                expect: "1..=240",
+                            });
+                        }
+                        video_max_fps = v as u32;
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -177,6 +264,9 @@ pub fn parse_with(argv: &[String], env_password: Option<&str>) -> Result<Cli, Cl
         fps,
         quality,
         stats,
+        video,
+        video_bitrate,
+        video_max_fps,
     }))
 }
 
@@ -219,6 +309,36 @@ mod tests {
         assert_eq!(a.fps, DEFAULT_FPS);
         assert_eq!(a.quality, DEFAULT_QUALITY);
         assert!(!a.stats);
+        assert_eq!(a.video, VideoChoice::Auto);
+        assert_eq!(a.video_bitrate, DEFAULT_VIDEO_BITRATE);
+        assert_eq!(a.video_max_fps, DEFAULT_VIDEO_MAX_FPS);
+    }
+
+    #[test]
+    fn video_flags() {
+        let a = run(&["--password", "1", "--video", "off"]);
+        assert_eq!(a.video, VideoChoice::Off);
+        assert!(a.video.is_off());
+        let a = run(&["--password", "1", "--video=h264", "--video-bitrate", "8000000", "--video-max-fps", "60"]);
+        assert_eq!(a.video, VideoChoice::H264);
+        assert_eq!(a.video_bitrate, 8_000_000);
+        assert_eq!(a.video_max_fps, 60);
+        // 别名
+        assert_eq!(run(&["--password", "1", "--video", "h265"]).video, VideoChoice::Hevc);
+        assert_eq!(run(&["--password", "1", "--video", "avc"]).video, VideoChoice::H264);
+        // 非法值
+        assert!(matches!(
+            parse(&argv(&["--password", "1", "--video", "vp9"])),
+            Err(CliError::BadValue { .. })
+        ));
+        assert!(matches!(
+            parse(&argv(&["--password", "1", "--video-bitrate", "10"])),
+            Err(CliError::BadValue { .. })
+        ));
+        assert!(matches!(
+            parse(&argv(&["--password", "1", "--video-max-fps", "0"])),
+            Err(CliError::BadValue { .. })
+        ));
     }
 
     #[test]

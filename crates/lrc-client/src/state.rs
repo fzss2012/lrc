@@ -3,9 +3,11 @@
 //! 窗口线程（主线程）是唯一碰 D3D/GDI 的地方；接收线程只解码并把"脏块"塞进队列，
 //! 由 8ms 定时器在主线程 drain。
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
+
+use windows::Win32::System::SystemInformation::GetTickCount64;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -37,6 +39,29 @@ pub struct CursorShapeOwned {
     pub hotspot_x: i32,
     pub hotspot_y: i32,
     pub bgra: Vec<u8>,
+}
+
+/// 一帧解码出来的视频画面（BGRA 整帧）。只保留最新一帧。
+#[derive(Clone, Debug, Default)]
+pub struct VideoFrameUpdate {
+    pub width: u32,
+    pub height: u32,
+    /// 行步长（= width*4）
+    pub stride: usize,
+    pub bgra: Vec<u8>,
+    /// host 采集完成时刻（`VideoAu.ts_ms`），用来算管线延迟
+    pub ts_ms: u32,
+    pub seq: u32,
+}
+
+/// 系统开机毫秒（u32 截断）。
+///
+/// `VideoAu.ts_ms` 用它当时间基准时，同机 host/client 共享同一个系统时钟，
+/// 算出来的管线延迟才有意义；**跨机时两端开机时间不同，差值只能当参考**
+/// （甚至可能为负/巨大，这时 `lat_ms` 就只是个数字，不代表真实延迟）。
+pub fn host_clock_ms() -> u32 {
+    let uptime = unsafe { GetTickCount64() };
+    (uptime & 0xFFFF_FFFF) as u32
 }
 
 /// 某一时刻的光标状态。
@@ -93,6 +118,19 @@ pub struct Shared {
     rtt_micros: AtomicU64,
     /// 单调时钟原点（Ping 的 ts_ms 用它算；两个线程共用）
     epoch: Instant,
+    /// 最新解出的视频帧（窗口线程取走即清空；只保留最新一帧）
+    video_frame: Mutex<Option<VideoFrameUpdate>>,
+    /// 当前通道模式：0 = 块，1 = 视频
+    mode: AtomicU8,
+    /// 累计解出的视频帧数
+    pub video_frames: AtomicU64,
+    /// 视频解码失败次数
+    pub decode_errors: AtomicU64,
+    /// 管线延迟滑动窗口：累加毫秒 + 样本数（窗口线程每秒取走并清零）
+    lat_sum_ms: AtomicU64,
+    lat_samples: AtomicU64,
+    /// 从视频模式切回块模式：要求窗口线程整屏重建 clean
+    block_full_reset: AtomicBool,
 }
 
 impl Shared {
@@ -116,6 +154,13 @@ impl Shared {
             ping_pending: Mutex::new(None),
             rtt_micros: AtomicU64::new(0),
             epoch: Instant::now(),
+            video_frame: Mutex::new(None),
+            mode: AtomicU8::new(0),
+            video_frames: AtomicU64::new(0),
+            decode_errors: AtomicU64::new(0),
+            lat_sum_ms: AtomicU64::new(0),
+            lat_samples: AtomicU64::new(0),
+            block_full_reset: AtomicBool::new(false),
         }
     }
 
@@ -266,6 +311,60 @@ impl Shared {
     /// 最近一次 RTT（微秒）；0 表示还没测到。
     pub fn rtt_micros(&self) -> u64 {
         self.rtt_micros.load(Ordering::Relaxed)
+    }
+
+    // ---- 视频通道 ----
+
+    /// 放入最新解出的视频帧（覆盖上一帧：解码跟不上时只保留最新，旧帧直接丢）。
+    pub fn put_video_frame(&self, frame: VideoFrameUpdate) {
+        *lock_or_recover(&self.video_frame) = Some(frame);
+    }
+
+    /// 窗口线程取走最新视频帧。
+    pub fn take_video_frame(&self) -> Option<VideoFrameUpdate> {
+        lock_or_recover(&self.video_frame).take()
+    }
+
+    pub fn set_mode_block(&self) {
+        self.mode.store(0, Ordering::Relaxed);
+    }
+
+    pub fn set_mode_video(&self) {
+        self.mode.store(1, Ordering::Relaxed);
+    }
+
+    pub fn is_video_mode(&self) -> bool {
+        self.mode.load(Ordering::Relaxed) == 1
+    }
+
+    /// 记一次视频帧的管线延迟（毫秒），进每秒滑动窗口。
+    pub fn add_latency_ms(&self, ms: u64) {
+        self.lat_sum_ms.fetch_add(ms, Ordering::Relaxed);
+        self.lat_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 取走最近一个窗口的平均延迟；这一秒没有样本返回 None。
+    pub fn take_latency_avg_ms(&self) -> Option<f64> {
+        let samples = self.lat_samples.swap(0, Ordering::Relaxed);
+        let sum = self.lat_sum_ms.swap(0, Ordering::Relaxed);
+        if samples == 0 {
+            None
+        } else {
+            Some(sum as f64 / samples as f64)
+        }
+    }
+
+    /// 从视频模式切回块模式：要求窗口线程用整帧重建 clean，清掉视频帧/光标残影。
+    pub fn mark_block_full_reset(&self) {
+        self.block_full_reset.store(true, Ordering::Relaxed);
+    }
+
+    pub fn take_block_full_reset(&self) -> bool {
+        self.block_full_reset.swap(false, Ordering::Relaxed)
+    }
+
+    pub fn bump_decode_error(&self) {
+        self.decode_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn add_recv_bytes(&self, n: u64) {
@@ -419,6 +518,51 @@ mod tests {
         // 不匹配的 ts 也忽略
         let _ = shared.begin_ping();
         assert!(shared.finish_ping(ts.wrapping_add(1)).is_none());
+    }
+
+    #[test]
+    fn video_frame_keeps_only_latest() {
+        let shared = Shared::new();
+        assert!(shared.take_video_frame().is_none());
+        let mk = |seq: u32| VideoFrameUpdate {
+            width: 4,
+            height: 2,
+            stride: 16,
+            bgra: vec![seq as u8; 32],
+            ts_ms: 1000 + seq,
+            seq,
+        };
+        shared.put_video_frame(mk(1));
+        shared.put_video_frame(mk(2));
+        let frame = shared.take_video_frame().expect("frame");
+        assert_eq!(frame.seq, 2, "旧帧应被新帧覆盖");
+        assert!(shared.take_video_frame().is_none());
+    }
+
+    #[test]
+    fn mode_and_block_full_reset() {
+        let shared = Shared::new();
+        assert!(!shared.is_video_mode());
+        shared.set_mode_video();
+        assert!(shared.is_video_mode());
+        shared.set_mode_block();
+        assert!(!shared.is_video_mode());
+        assert!(!shared.take_block_full_reset());
+        shared.mark_block_full_reset();
+        assert!(shared.take_block_full_reset());
+        assert!(!shared.take_block_full_reset());
+    }
+
+    #[test]
+    fn latency_window_average() {
+        let shared = Shared::new();
+        assert!(shared.take_latency_avg_ms().is_none());
+        shared.add_latency_ms(30);
+        shared.add_latency_ms(50);
+        let avg = shared.take_latency_avg_ms().expect("avg");
+        assert!((avg - 40.0).abs() < 1e-9, "avg={avg}");
+        // 取走后窗口清空
+        assert!(shared.take_latency_avg_ms().is_none());
     }
 
     #[test]

@@ -10,6 +10,7 @@ members = [
     "crates/lrc-client",
     "crates/lrc-bench",
     "crates/lrc-video",
+    "crates/lrc-adapt",
 ]
 
 [workspace.package]
@@ -24,6 +25,8 @@ lrc-codec = { path = "crates/lrc-codec" }
 lrc-capture = { path = "crates/lrc-capture" }
 lrc-render = { path = "crates/lrc-render" }
 lrc-transport = { path = "crates/lrc-transport" }
+lrc-video = { path = "crates/lrc-video" }
+lrc-adapt = { path = "crates/lrc-adapt" }
 
 anyhow = "1"
 thiserror = "2"

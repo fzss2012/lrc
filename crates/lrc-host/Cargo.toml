@@ -13,6 +13,9 @@ lrc-proto.workspace = true
 lrc-codec.workspace = true
 lrc-capture.workspace = true
 lrc-transport.workspace = true
+# TODO(lead): root Cargo.toml 的 [workspace.dependencies] 补上 lrc-video 后，这里改成
+# lrc-video.workspace = true
+lrc-video = { path = "../lrc-video" }
 windows.workspace = true
 anyhow.workspace = true
 log.workspace = true

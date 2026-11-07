@@ -349,6 +349,28 @@ struct Row {
 
 fn main() {
     env_logger::init();
+    // --probe：只做可用性探测，然后退出
+    if std::env::args().any(|a| a == "--probe") {
+        let ffmpeg = std::env::args().skip_while(|a| a != "--ffmpeg").nth(1);
+        for codec in ["hevc_nvenc", "h264_nvenc", "hevc", "h264"] {
+            let t0 = Instant::now();
+            match lrc_video::probe_with_ffmpeg(codec, ffmpeg.as_deref()) {
+                Ok(info) => println!(
+                    "probe {codec:<12} available={:<5} {:>6}us  ffmpeg={}  detail={}",
+                    info.available,
+                    t0.elapsed().as_micros(),
+                    info.ffmpeg,
+                    if info.available {
+                        "OK".to_string()
+                    } else {
+                        info.detail.replace('\n', " | ")
+                    }
+                ),
+                Err(e) => println!("probe {codec:<12} ERROR: {e}"),
+            }
+        }
+        return;
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -371,6 +393,8 @@ fn run(args: &Args) -> Result<(), Box<dyn Error>> {
     );
 
     let enc_cfg = EncoderConfig {
+        width: args.width,
+        height: args.height,
         bitrate_bps: args.bitrate,
         gop: args.fps * 2,
         fps: args.fps,
@@ -384,11 +408,11 @@ fn run(args: &Args) -> Result<(), Box<dyn Error>> {
         ffmpeg_path: Some(ffmpeg.to_string_lossy().into_owned()),
     };
     println!();
-    println!("[编码命令] {}", encode_command_line(&enc_cfg, args.width, args.height, &ffmpeg).join(" "));
+    println!("[编码命令] {}", encode_command_line(&enc_cfg, &ffmpeg).join(" "));
     println!("[解码命令] {}", decode_command_line(&dec_cfg.codec, &ffmpeg).join(" "));
     println!();
 
-    let mut enc = FfmpegEncoder::new(args.width, args.height, enc_cfg)?;
+    let mut enc = FfmpegEncoder::new(enc_cfg)?;
     let mut dec = FfmpegDecoder::new(&dec_cfg)?;
 
     let mut frames = Frames::new(args.width, args.height);

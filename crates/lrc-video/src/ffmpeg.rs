@@ -70,12 +70,7 @@ fn is_hevc(codec: &str) -> bool {
 }
 
 /// 编码器命令行（也用于 probe 打印，保证「我说用的参数」和「实际跑的」一致）。
-pub fn encode_command_line(
-    cfg: &EncoderConfig,
-    width: u32,
-    height: u32,
-    ffmpeg: &Path,
-) -> Vec<String> {
+pub fn encode_command_line(cfg: &EncoderConfig, ffmpeg: &Path) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "-hide_banner".into(),
         "-loglevel".into(),
@@ -85,7 +80,7 @@ pub fn encode_command_line(
         "-pix_fmt".into(),
         "bgra".into(),
         "-s".into(),
-        format!("{width}x{height}"),
+        format!("{}x{}", cfg.width, cfg.height),
         "-framerate".into(),
         cfg.fps.to_string(),
         "-i".into(),
@@ -403,6 +398,14 @@ impl PipeChild {
         Ok(out)
     }
 
+    /// 进程是否已经退出（Some = 退出状态）。
+    fn try_exited(&mut self) -> Option<std::process::ExitStatus> {
+        match self.child.try_wait() {
+            Ok(Some(s)) => Some(s),
+            _ => None,
+        }
+    }
+
     fn shutdown(&mut self) {
         if self.closed {
             return;
@@ -509,6 +512,8 @@ mod tests {
 
     fn cfg() -> EncoderConfig {
         EncoderConfig {
+            width: 1920,
+            height: 1080,
             bitrate_bps: 4_000_000,
             gop: 60,
             fps: 30,
@@ -519,7 +524,7 @@ mod tests {
 
     #[test]
     fn encoder_cmdline_has_low_latency_flags() {
-        let line = encode_command_line(&cfg(), 1920, 1080, Path::new("ffmpeg")).join(" ");
+        let line = encode_command_line(&cfg(), Path::new("ffmpeg")).join(" ");
         // 这几个参数少一个延迟/帧率就会崩，必须钉住
         assert!(line.contains("-delay 0"), "缺 -delay 0（nvenc 异步深度）");
         assert!(line.contains("-zerolatency 1"));
@@ -542,10 +547,10 @@ mod tests {
 
     #[test]
     fn h264_and_hevc_use_different_demuxers() {
-        let hevc = encode_command_line(&cfg(), 640, 480, Path::new("ffmpeg")).join(" ");
+        let hevc = encode_command_line(&cfg(), Path::new("ffmpeg")).join(" ");
         let mut c = cfg();
         c.codec = "h264_nvenc".into();
-        let h264 = encode_command_line(&c, 640, 480, Path::new("ffmpeg")).join(" ");
+        let h264 = encode_command_line(&c, Path::new("ffmpeg")).join(" ");
         assert!(hevc.contains("-f hevc"));
         assert!(h264.contains("-f h264"));
         assert!(decode_command_line("hevc", Path::new("f")).join(" ").contains("-f hevc"));
@@ -575,6 +580,265 @@ mod tests {
         let params_only = vec![0u8, 0, 0, 1, 32 << 1, 1, 0, 0, 1, 33 << 1, 1];
         assert!(!au_has_vcl(&params_only, true));
     }
+
+    /// 小尺寸配置，测试跑得快
+    fn small_cfg() -> EncoderConfig {
+        EncoderConfig {
+            width: 64,
+            height: 64,
+            bitrate_bps: 3_000_000,
+            gop: 30,
+            fps: 30,
+            codec: "hevc_nvenc".into(),
+            ffmpeg_path: None,
+        }
+    }
+
+    fn nvenc_available() -> bool {
+        probe("hevc_nvenc")
+            .map(|i| i.available)
+            .unwrap_or(false)
+    }
+
+    /// 数一下系统里现存多少个 ffmpeg.exe 进程
+    fn ffmpeg_process_count() -> usize {
+        let out = Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq ffmpeg.exe", "/NH", "/FO", "CSV"])
+            .output();
+        match out {
+            Ok(o) => String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter(|l| l.to_ascii_lowercase().contains("ffmpeg.exe"))
+                .count(),
+            Err(_) => 0,
+        }
+    }
+
+    #[test]
+    fn probe_reports_unavailable_for_bogus_encoder() {
+        let info = probe("definitely_not_a_real_encoder").expect("probe 不应 Err");
+        assert!(!info.available, "不存在的编码器必须报不可用");
+        assert!(!info.detail.is_empty(), "必须给出原因");
+        assert!(info.detail.to_ascii_lowercase().contains("encoder")
+            || info.detail.contains("未知")
+            || !info.detail.is_empty());
+    }
+
+    #[test]
+    fn probe_returns_info_for_nvenc() {
+        // 结果与机器相关，不断言 available，只断言"能拿到结论且不 panic"
+        let info = probe("hevc_nvenc").expect("probe 不应 Err");
+        assert_eq!(info.codec, "hevc_nvenc");
+        assert!(!info.detail.is_empty());
+        println!("probe(hevc_nvenc) = {:?}", info);
+    }
+
+    #[test]
+    fn unknown_encoder_construct_returns_unsupported_without_leak() {
+        let before = ffmpeg_process_count();
+        let mut c = small_cfg();
+        c.codec = "definitely_not_a_real_encoder".into();
+        let r = FfmpegEncoder::new(c);
+        assert!(
+            matches!(r, Err(VideoError::Unsupported(_))),
+            "构造失败必须是 Unsupported（拿到 {:?}）",
+            r.err()
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let after = ffmpeg_process_count();
+        assert!(after <= before, "构造失败后有残留进程: {before} -> {after}");
+    }
+
+    #[test]
+    fn drop_leaves_no_ffmpeg_process() {
+        if !nvenc_available() {
+            println!("跳过：本机没有 hevc_nvenc");
+            return;
+        }
+        let before = ffmpeg_process_count();
+        let frame = vec![0u8; 64 * 64 * 4];
+        for _ in 0..8 {
+            let enc = FfmpegEncoder::new(small_cfg());
+            let Ok(mut enc) = enc else { continue };
+            let _ = enc.encode(&frame, 64 * 4);
+            drop(enc); // Drop → shutdown → kill
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        let after = ffmpeg_process_count();
+        assert!(
+            after <= before,
+            "8 次起停后仍有残留 ffmpeg 进程: before={before} after={after}"
+        );
+        println!("ffmpeg 残留检查: before={before} after={after}");
+    }
+
+    #[test]
+    fn set_bitrate_restarts_and_yields_idr() {
+        if !nvenc_available() {
+            println!("跳过：本机没有 hevc_nvenc");
+            return;
+        }
+        let mut enc = match FfmpegEncoder::new(small_cfg()) {
+            Ok(e) => e,
+            Err(e) => {
+                println!("跳过：{e}");
+                return;
+            }
+        };
+        let frame = vec![0u8; 64 * 64 * 4];
+        let _ = enc.encode(&frame, 64 * 4);
+        assert_eq!(enc.bitrate(), 3_000_000);
+        enc.set_bitrate(BITRATE_LADDER[2]).expect("set_bitrate");
+        assert_eq!(enc.bitrate(), 6_000_000);
+        assert!(enc.restart_cost_us() > 0, "必须记录重启耗时");
+        let aus = enc.encode(&frame, 64 * 4).expect("重启后编码");
+        assert!(!aus.is_empty());
+        assert!(enc.last_au_was_keyframe(), "切档后第一帧必须是 IDR");
+        println!("set_bitrate 重启耗时 = {}us", enc.restart_cost_us());
+        enc.shutdown();
+    }
+}
+
+/// 启动后等这么久确认编码器没有秒退（不可用时会在这个窗口内退出）。
+const ALIVE_CHECK_MS: u64 = 120;
+/// 可用性探测的最长等待。
+const PROBE_TIMEOUT_MS: u64 = 8000;
+
+/// 推荐的码率档位（bps）：办公 3 Mbps / 常规 4 Mbps / 视频 6 Mbps。
+pub const BITRATE_LADDER: [u32; 3] = [3_000_000, 4_000_000, 6_000_000];
+
+/// 可用性探测结果。host 在启用视频通道前先调 `probe()`。
+#[derive(Debug, Clone)]
+pub struct CodecInfo {
+    /// 被探测的编码器名
+    pub codec: String,
+    /// 是否可用（能真的编出码流）
+    pub available: bool,
+    /// 实际使用的 ffmpeg 路径
+    pub ffmpeg: String,
+    /// 失败原因（可用时是 "OK"）
+    pub detail: String,
+}
+
+/// 探测某个 ffmpeg 编码器在本机能不能用（跑一次 64x64 黑帧的最短编码）。
+///
+/// **不会 panic，最多等 PROBE_TIMEOUT_MS，超时会直接杀进程。**
+/// 返回 `Ok(CodecInfo{available:false,..})` 表示"跑不起来"，`Err` 只用于极端情况。
+pub fn probe(codec: &str) -> VideoResult<CodecInfo> {
+    probe_with_ffmpeg(codec, None)
+}
+
+/// 同 `probe()`，但可以指定 ffmpeg 路径。
+pub fn probe_with_ffmpeg(codec: &str, ffmpeg_path: Option<&str>) -> VideoResult<CodecInfo> {
+    let ffmpeg = resolve_ffmpeg(ffmpeg_path);
+    let ffmpeg_str = ffmpeg.to_string_lossy().into_owned();
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        // 注意：NVENC 有最小分辨率限制（约 145x49），64x64 会被拒："Frame dimensions are
+        // less than the minimum supported value"。用 256x256 才探得准。
+        "color=black:s=256x256:d=0.1:r=30",
+        "-frames:v",
+        "3",
+        "-c:v",
+        codec,
+        "-f",
+        "null",
+        "-",
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(CodecInfo {
+                codec: codec.to_string(),
+                available: false,
+                ffmpeg: ffmpeg_str,
+                detail: format!("启动 ffmpeg 失败: {e}"),
+            })
+        }
+    };
+
+    let deadline = Instant::now() + Duration::from_millis(PROBE_TIMEOUT_MS);
+    let mut status = None;
+    let mut timed_out = false;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                status = Some(st);
+                break;
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(20)),
+            Err(e) => {
+                let _ = child.kill();
+                return Err(VideoError::Io(format!("探测 {codec} 时等待进程失败: {e}")));
+            }
+        }
+    }
+    if status.is_none() {
+        timed_out = true;
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    // 读完 stderr（进程已退出或已被杀，不会阻塞）
+    let mut err_text = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let mut buf = Vec::new();
+        let _ = e.read_to_end(&mut buf);
+        err_text = String::from_utf8_lossy(&buf).trim().to_string();
+    }
+
+    let available = status.map(|s| s.success()).unwrap_or(false);
+    let detail = if available {
+        "OK".to_string()
+    } else if timed_out {
+        format!("{PROBE_TIMEOUT_MS}ms 内没跑完，已杀进程")
+    } else if err_text.is_empty() {
+        match status {
+            Some(s) => format!("ffmpeg 退出码 {s}"),
+            None => "未知失败".to_string(),
+        }
+    } else {
+        err_text
+    };
+    Ok(CodecInfo {
+        codec: codec.to_string(),
+        available,
+        ffmpeg: ffmpeg_str,
+        detail,
+    })
+}
+
+/// 编码进程起来后等一小会儿，确认它没有立刻退出。
+/// 编码器名/驱动不对时 ffmpeg 会秒退；这里把它抓成 Unsupported，让 host 干净回退。
+fn check_alive(proc: &mut PipeChild, codec: &str) -> VideoResult<()> {
+    let deadline = Instant::now() + Duration::from_millis(ALIVE_CHECK_MS);
+    while Instant::now() < deadline {
+        if let Some(st) = proc.try_exited() {
+            let tail = proc.stderr_snippet();
+            log::warn!("video: 编码器 {codec} 启动即退出（{st}）: {tail}");
+            return Err(VideoError::Unsupported(
+                "编码器不可用（ffmpeg 启动即退出）。先用 lrc_video::probe(codec) 拿具体原因",
+            ));
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+    Ok(())
 }
 
 /// 用 ffmpeg + NVENC 的编码器。
@@ -590,18 +854,34 @@ pub struct FfmpegEncoder {
     last_keyframe: bool,
     au_count: u64,
     force_keyframe: bool,
+    ffmpeg: PathBuf,
+    restart_us: u64,
 }
 
 impl FfmpegEncoder {
-    /// 注意：契约里的 @@EncoderConfig@@ 不含尺寸，所以宽高单独传（已在汇报里跟 Lead 提了要不要补进 config）。
-    pub fn new(width: u32, height: u32, cfg: EncoderConfig) -> VideoResult<Self> {
-        if width == 0 || height == 0 {
+    /// 建编码器。**编码器不可用时返回 VideoError::Unsupported**（不 panic、不挂住），
+    /// host 靠这个做"没有 NVENC 就退回块编码"的干净回退。
+    pub fn new(cfg: EncoderConfig) -> VideoResult<Self> {
+        if cfg.width == 0 || cfg.height == 0 {
             return Err(VideoError::Unsupported("宽高不能为 0"));
         }
+        // 先做一次可用性探测：编码器名写错/驱动没装时 ffmpeg 会卡在等输入而不是立刻报错，
+        // 光靠"起来后看它有没有退出"抓不到，必须真的跑一次最短编码。
+        let info = probe_with_ffmpeg(&cfg.codec, cfg.ffmpeg_path.as_deref())?;
+        if !info.available {
+            log::warn!("video: 编码器 {} 不可用: {}", cfg.codec, info.detail);
+            return Err(VideoError::Unsupported(
+                "编码器不可用。先用 lrc_video::probe(codec) 拿具体原因再决定是否启用视频通道",
+            ));
+        }
         let ffmpeg = resolve_ffmpeg(cfg.ffmpeg_path.as_deref());
-        let cmdline = encode_command_line(&cfg, width, height, &ffmpeg);
-        let proc = PipeChild::spawn(&cmdline, "encoder")?;
-        let frame_bytes = width as usize * height as usize * 4;
+        let cmdline = encode_command_line(&cfg, &ffmpeg);
+        let mut proc = PipeChild::spawn(&cmdline, "encoder")?;
+        // 编码器名/驱动不对时 ffmpeg 会立刻退出（Unknown encoder / Cannot load nvcuda.dll）。
+        // 这里主动等一小会儿抓出来，让上层拿到 Unsupported 而不是等第一帧才炸。
+        check_alive(&mut proc, &cfg.codec)?;
+        let frame_bytes = cfg.frame_bytes();
+        let (width, height) = (cfg.width, cfg.height);
         Ok(Self {
             proc,
             width,
@@ -615,11 +895,51 @@ impl FfmpegEncoder {
             last_keyframe: false,
             au_count: 0,
             force_keyframe: false,
+            ffmpeg,
+            restart_us: 0,
         })
     }
 
     pub fn command_line(&self) -> String {
         self.cmdline.join(" ")
+    }
+
+    pub fn bitrate(&self) -> u32 {
+        self.cfg.bitrate_bps
+    }
+
+    /// 最近一次 set_bitrate 触发的进程重启耗时（微秒）。
+    pub fn restart_cost_us(&self) -> u64 {
+        self.restart_us
+    }
+
+    /// 换码率：**重启编码进程**（新进程第一帧天然是 IDR，切档后客户端能立刻解）。
+    /// 实测重启 ~150–300 ms，期间没有输出；建议 host 在画面空档切档或允许丢 1-2 帧。
+    pub fn set_bitrate(&mut self, bps: u32) -> VideoResult<()> {
+        if bps == 0 {
+            return Err(VideoError::Unsupported("码率不能为 0"));
+        }
+        if bps == self.cfg.bitrate_bps {
+            return Ok(());
+        }
+        let t0 = Instant::now();
+        self.cfg.bitrate_bps = bps;
+        self.restart()?;
+        self.restart_us = t0.elapsed().as_micros() as u64;
+        log::info!("video: 码率切到 {} bps，重启耗时 {}us", bps, self.restart_us);
+        Ok(())
+    }
+
+    /// 用当前配置重建编码器进程（首帧必为 IDR）。
+    fn restart(&mut self) -> VideoResult<()> {
+        let cmdline = encode_command_line(&self.cfg, &self.ffmpeg);
+        self.proc.shutdown();
+        self.proc = PipeChild::spawn(&cmdline, "encoder")?;
+        self.cmdline = cmdline;
+        // 新编码器会话的第一帧 = IDR
+        self.last_keyframe = true;
+        self.pack.clear();
+        Ok(())
     }
 
     /// 上一个 AU 是不是关键帧（决定客户端能不能从这里开始解码）。

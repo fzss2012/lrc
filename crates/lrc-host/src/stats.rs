@@ -24,6 +24,15 @@ pub struct Stats {
     pub capture_ms_sum: f64,
 }
 
+/// 视频通道在统计行里的三个字段（mode 是瞬时状态，fps/kbps 是本区间增量）。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct VideoLine {
+    /// "blocks" 或 "video"
+    pub mode: &'static str,
+    pub fps: f64,
+    pub kbps: f64,
+}
+
 impl Stats {
     pub fn add(&mut self, other: &Stats) {
         self.frames += other.frames;
@@ -51,22 +60,29 @@ impl Stats {
 /// - idle_frames：本区间"无变化"次数
 /// - sec_bytes：本区间发出的字节数（静止时应当为 0，验收"零变化零发送"就看这个）
 /// - cursor_msgs / full_resends：累计的光标消息数、响应整帧请求的重发次数
-pub fn format_line(total: &Stats, sec: &Stats, session_secs: f64, interval_secs: f64) -> String {
+pub fn format_line(
+    total: &Stats,
+    sec: &Stats,
+    session_secs: f64,
+    interval_secs: f64,
+    video: &VideoLine,
+) -> String {
     let interval = if interval_secs > 0.0 { interval_secs } else { 1.0 };
     let t = if session_secs > 0.0 { session_secs } else { 0.0 };
     let fps = sec.frames as f64 / interval;
     let kbps = (sec.bytes as f64 * 8.0 / 1000.0) / interval;
-    line(t, fps, sec.blocks, total, kbps, sec.idle, sec.bytes)
+    line(t, fps, sec.blocks, total, kbps, sec.idle, sec.bytes, video)
 }
 
 /// 会话结束时的总结行（同一套字段，fps/kbps 用整场平均值）。
-pub fn format_summary(total: &Stats, session_secs: f64) -> String {
+pub fn format_summary(total: &Stats, session_secs: f64, video: &VideoLine) -> String {
     let t = if session_secs > 0.0 { session_secs } else { 1.0 };
     let fps = total.frames as f64 / t;
     let kbps = (total.bytes as f64 * 8.0 / 1000.0) / t;
-    line(t, fps, total.blocks, total, kbps, total.idle, total.bytes)
+    line(t, fps, total.blocks, total, kbps, total.idle, total.bytes, video)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn line(
     t: f64,
     fps: f64,
@@ -75,10 +91,18 @@ fn line(
     kbps: f64,
     idle_frames: u64,
     sec_bytes: u64,
+    video: &VideoLine,
 ) -> String {
     format!(
-        "t={t:.1} fps={fps:.1} blocks={blocks} sent_frames={} bytes={} kbps={kbps:.1} idle_frames={idle_frames} dropped={} sec_bytes={sec_bytes} cursor_msgs={} full_resends={}",
-        total.frames, total.bytes, total.dropped, total.cursor_msgs, total.full_resends
+        "t={t:.1} fps={fps:.1} blocks={blocks} sent_frames={} bytes={} kbps={kbps:.1} idle_frames={idle_frames} dropped={} sec_bytes={sec_bytes} cursor_msgs={} full_resends={} mode={} video_kbps={:.1} video_fps={:.1}",
+        total.frames,
+        total.bytes,
+        total.dropped,
+        total.cursor_msgs,
+        total.full_resends,
+        video.mode,
+        video.kbps,
+        video.fps
     )
 }
 
@@ -105,8 +129,8 @@ mod tests {
         total.dropped = 2;
         let sec = sec_sample();
         assert_eq!(
-            format_line(&total, &sec, 1.0, 1.0),
-            "t=1.0 fps=30.0 blocks=120 sent_frames=30 bytes=100000 kbps=800.0 idle_frames=5 dropped=2 sec_bytes=100000 cursor_msgs=0 full_resends=0"
+            format_line(&total, &sec, 1.0, 1.0, &VideoLine::default()),
+            "t=1.0 fps=30.0 blocks=120 sent_frames=30 bytes=100000 kbps=800.0 idle_frames=5 dropped=2 sec_bytes=100000 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0"
         );
     }
 
@@ -121,10 +145,10 @@ mod tests {
             idle: 490,
             ..Stats::default()
         };
-        let line = format_line(&total, &sec, 12.0, 1.0);
+        let line = format_line(&total, &sec, 12.0, 1.0, &VideoLine::default());
         assert_eq!(
             line,
-            "t=12.0 fps=0.0 blocks=0 sent_frames=220 bytes=1234567 kbps=0.0 idle_frames=490 dropped=0 sec_bytes=0 cursor_msgs=0 full_resends=0"
+            "t=12.0 fps=0.0 blocks=0 sent_frames=220 bytes=1234567 kbps=0.0 idle_frames=490 dropped=0 sec_bytes=0 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0"
         );
         // 验收脚本按 kbps= 抓数
         assert!(line.contains("kbps=0.0"));
@@ -138,10 +162,10 @@ mod tests {
             bytes: 1_000,
             ..Stats::default()
         };
-        let line = format_line(&total, &total, 2.0, 2.0);
+        let line = format_line(&total, &total, 2.0, 2.0, &VideoLine::default());
         assert_eq!(
             line,
-            "t=2.0 fps=15.0 blocks=0 sent_frames=30 bytes=1000 kbps=4.0 idle_frames=0 dropped=0 sec_bytes=1000 cursor_msgs=0 full_resends=0"
+            "t=2.0 fps=15.0 blocks=0 sent_frames=30 bytes=1000 kbps=4.0 idle_frames=0 dropped=0 sec_bytes=1000 cursor_msgs=0 full_resends=0 mode=blocks video_kbps=0.0 video_fps=0.0"
         );
     }
 
@@ -157,17 +181,17 @@ mod tests {
             full_resends: 1,
             capture_ms_sum: 200.0,
         };
-        let line = format_summary(&total, 10.0);
+        let line = format_summary(&total, 10.0, &VideoLine::default());
         assert_eq!(
             line,
-            "t=10.0 fps=10.0 blocks=500 sent_frames=100 bytes=10000 kbps=8.0 idle_frames=50 dropped=1 sec_bytes=10000 cursor_msgs=3 full_resends=1"
+            "t=10.0 fps=10.0 blocks=500 sent_frames=100 bytes=10000 kbps=8.0 idle_frames=50 dropped=1 sec_bytes=10000 cursor_msgs=3 full_resends=1 mode=blocks video_kbps=0.0 video_fps=0.0"
         );
     }
 
     #[test]
     fn zero_elapsed_is_safe() {
         let s = Stats::default();
-        let line = format_line(&s, &s, 0.0, 0.0);
+        let line = format_line(&s, &s, 0.0, 0.0, &VideoLine::default());
         assert!(line.starts_with("t=0.0 fps=0.0 "), "{line}");
     }
 

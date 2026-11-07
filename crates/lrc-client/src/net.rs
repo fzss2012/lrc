@@ -6,21 +6,24 @@
 //! - 呈现只在窗口线程做（D3D11 设备非线程安全）。
 
 use std::io;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use lrc_codec as codec;
 use lrc_proto::{
-    auth_reason, ClientHello, Message, Pong, ServerHello, VideoFrame, PROTO_VERSION,
+    auth_reason, codec_tag, ClientHello, Message, Pong, ServerHello, VideoAu, VideoFrame,
+    PROTO_VERSION,
 };
 use lrc_transport::{Conn, ConnReader, ConnWriter};
+use lrc_video::{DecoderConfig, FfmpegDecoder, VideoDecoder};
 use sha2::Sha256;
 use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
 
 use crate::cli::Config;
-use crate::state::{BlockUpdate, CursorShapeOwned, Shared};
+use crate::state::{host_clock_ms, BlockUpdate, CursorShapeOwned, Shared, VideoFrameUpdate};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -162,6 +165,7 @@ fn video_loop(
     tx: &Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
     let mut buf: Vec<u8> = Vec::with_capacity(128 * 1024);
+    let mut video = VideoRx::new();
     loop {
         if shared.is_quit() {
             return Ok(());
@@ -180,7 +184,18 @@ fn video_loop(
         shared.add_recv_bytes(n as u64);
 
         match Message::decode(&buf) {
-            Ok(Message::VideoFrame(frame)) => handle_frame(&frame, shared),
+            Ok(Message::VideoFrame(frame)) => {
+                if shared.is_video_mode() {
+                    log::info!("从视频模式切回块模式");
+                }
+                shared.set_mode_block();
+                if frame.is_full() {
+                    // 整帧：窗口线程要用它重建 clean，清掉视频帧/光标残影
+                    shared.mark_block_full_reset();
+                }
+                handle_frame(&frame, shared);
+            }
+            Ok(Message::VideoAu(au)) => video.handle_au(&au, shared, tx),
             Ok(Message::Ping(ping)) => {
                 send(tx, Message::Pong(Pong { ts_ms: ping.ts_ms }).encode());
             }
@@ -235,6 +250,169 @@ fn video_loop(
 }
 
 /// 逐块解码一帧，把成功解出的块塞进共享队列。
+/// 视频通道接收侧状态（只被接收线程使用）。
+struct VideoRx {
+    /// (codec_tag, 解码器)
+    decoder: Option<(u8, FfmpegDecoder)>,
+    /// 是否已经解出过关键帧：没拿到 IDR 之前收到的 P 帧全丢
+    seen_key: bool,
+    /// 连续解码失败次数：连坏几次就把解码器扔掉，等下一帧 IDR 重建
+    consecutive_errors: u32,
+    /// 上次发 RequestFull 的时刻（1 秒最多一次，避免刷屏）
+    last_full_request: Option<Instant>,
+}
+
+impl VideoRx {
+    fn new() -> Self {
+        Self {
+            decoder: None,
+            seen_key: false,
+            consecutive_errors: 0,
+            last_full_request: None,
+        }
+    }
+
+    /// 限流版 RequestFull（host 收到会立刻出 IDR）。
+    fn request_full(&mut self, tx: &Sender<Vec<u8>>, why: &str) {
+        let now = Instant::now();
+        if let Some(last) = self.last_full_request {
+            if now.duration_since(last) < Duration::from_secs(1) {
+                return;
+            }
+        }
+        self.last_full_request = Some(now);
+        log::info!("请求整帧（{why}）");
+        send(tx, Message::RequestFull.encode());
+    }
+
+    /// 处理一个视频访问单元：解码 → 存最新帧；缺 IDR/解码失败 → 请求整帧。
+    fn handle_au(&mut self, au: &VideoAu<'_>, shared: &Arc<Shared>, tx: &Sender<Vec<u8>>) {
+        let Some(name) = codec_name(au.codec) else {
+            log::warn!("未知视频码流 codec={}", au.codec);
+            shared.bump_decode_error();
+            self.request_full(tx, "未知视频 codec");
+            return;
+        };
+        // 解码器要精确的宽高来定 frame_bytes；ServerHello 之后才有
+        let Some((width, height)) = shared.remote_size() else {
+            self.request_full(tx, "收到视频帧但还不知道被控端尺寸");
+            return;
+        };
+
+        // 解码器按需建立；codec 变了且来了 IDR → 重建
+        let need_decoder = match &self.decoder {
+            None => true,
+            Some((codec, _)) => *codec != au.codec && au.is_key(),
+        };
+        if need_decoder {
+            let cfg = DecoderConfig {
+                width,
+                height,
+                codec: String::from(name),
+                ffmpeg_path: None,
+            };
+            match FfmpegDecoder::new(&cfg) {
+                Ok(decoder) => {
+                    log::info!("视频解码器已建立：{} {}x{}", cfg.codec, width, height);
+                    self.decoder = Some((au.codec, decoder));
+                    self.seen_key = false;
+                    self.consecutive_errors = 0;
+                }
+                Err(e) => {
+                    log::error!("视频解码器创建失败: {e}");
+                    shared.bump_decode_error();
+                    self.request_full(tx, "视频解码器不可用");
+                    return;
+                }
+            }
+        }
+
+        // 还没见过关键帧：P 帧解不出来，直接丢并要 IDR
+        if !self.seen_key && !au.is_key() {
+            log::debug!("视频 AU 非关键帧且还没见过 IDR（seq={}），丢弃", au.seq);
+            self.request_full(tx, "缺少关键帧");
+            return;
+        }
+
+        let Some((_, decoder)) = self.decoder.as_mut() else {
+            return;
+        };
+        let started = Instant::now();
+        let result = decoder.decode(au.data);
+        let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+        match result {
+            Ok(Some(bgra)) => {
+                let need = (width as usize)
+                    .saturating_mul(height as usize)
+                    .saturating_mul(4);
+                if bgra.len() < need {
+                    log::warn!("解码帧字节数不足: {} < {}", bgra.len(), need);
+                    shared.bump_decode_error();
+                    self.request_full(tx, "解码帧尺寸不符");
+                    return;
+                }
+                if au.is_key() {
+                    self.seen_key = true;
+                }
+                self.consecutive_errors = 0;
+                // 管线延迟：ts_ms 用 GetTickCount64（系统开机毫秒）作基准，
+                // 同机时 host/client 共享同一系统时钟 → 是真延迟；
+                // 跨机时两端开机时间不同，这个数只作参考。
+                let lat_ms = u64::from(host_clock_ms().wrapping_sub(au.ts_ms));
+                shared.add_latency_ms(lat_ms);
+                shared.video_frames.fetch_add(1, Ordering::Relaxed);
+                shared.last_seq.store(au.seq, Ordering::Relaxed);
+                shared.set_mode_video();
+                // 只保留最新一帧：解码跟不上时旧的直接覆盖丢掉
+                shared.put_video_frame(VideoFrameUpdate {
+                    width,
+                    height,
+                    stride: width as usize * 4,
+                    bgra,
+                    ts_ms: au.ts_ms,
+                    seq: au.seq,
+                });
+                log::trace!(
+                    "视频帧 seq={} key={} 解码 {decode_ms:.1}ms lat={lat_ms}ms",
+                    au.seq,
+                    au.is_key()
+                );
+            }
+            Ok(None) => log::debug!("视频 AU 没有产出画面（seq={}）", au.seq),
+            Err(e) => {
+                log::warn!(
+                    "视频解码失败 seq={} key={}（{decode_ms:.1}ms）: {e}",
+                    au.seq,
+                    au.is_key()
+                );
+                shared.bump_decode_error();
+                self.seen_key = false;
+                self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+                if self.consecutive_errors >= 3 {
+                    log::warn!(
+                        "连续 {} 次解码失败，丢弃解码器等新的 IDR",
+                        self.consecutive_errors
+                    );
+                    if let Some((_, mut decoder)) = self.decoder.take() {
+                        decoder.shutdown();
+                    }
+                    self.consecutive_errors = 0;
+                }
+                self.request_full(tx, "视频解码失败");
+            }
+        }
+    }
+}
+
+fn codec_name(tag: u8) -> Option<&'static str> {
+    match tag {
+        codec_tag::H264 => Some("h264"),
+        codec_tag::HEVC => Some("hevc"),
+        _ => None,
+    }
+}
+
 fn handle_frame(frame: &VideoFrame<'_>, shared: &Shared) {
     let Some(grid) = frame.grid() else {
         log::warn!("帧几何非法: block_size/blocks 为 0");

@@ -1141,6 +1141,16 @@ mod tests {
             "[perf] 64x64 文字块 encode={enc_us:.1}us decode={dec_us:.1}us | 噪声块(JPEG) encode={photo_enc_us:.1}us decode={photo_dec_us:.1}us"
         );
 
+        // 对照：T10 之前的"左预测 + 两种 zstd"路径（无调色板），同会话同机器比
+        let mut legacy_pred = Vec::new();
+        let t = Instant::now();
+        for _ in 0..iters {
+            apply_predict(&block, w * 4, h, &mut legacy_pred);
+            let _ = zstd_compress(&legacy_pred, 3).unwrap();
+            let _ = zstd_compress(&block, 3).unwrap();
+        }
+        let legacy_us = t.elapsed().as_secs_f64() * 1.0e6 / f64::from(iters);
+        println!("[perf] 旧两模式路径 encode={legacy_us:.1}us（新/旧 = {:.2}x）", enc_us / legacy_us.max(0.001));
         let limit = if cfg!(debug_assertions) { 20_000.0 } else { 1_000.0 };
         assert!(enc_us < limit, "64x64 编码 {enc_us}us 超预算");
         assert!(dec_us < limit, "64x64 解码 {dec_us}us 超预算");
