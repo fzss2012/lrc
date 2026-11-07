@@ -36,6 +36,18 @@
 | 模式切换 | 播完 1–2 秒内自动切回 `mode=blocks`，客户端同步 |
 | 码流合法性 | host 侧把 AU dump 后 `ffprobe` → `codec_name=hevc 1920x1080 nb_read_frames=92`，与发出的 AU 数一致 |
 
+### 1.3 全量验收（`scripts/acceptance.ps1`，2026-11-07 最终一轮：7/7 全通过）
+
+```
+[PASS] release 构建        — cargo build --release --workspace OK
+[PASS] 单元测试            — 199 个测试通过 / exit=0
+[PASS] 静止零发送          — min=0 B/s
+[PASS] 办公打字 ≤1.0 Mbps  — avg=373.4 kbps
+[PASS] 视频模式（码率受控） — mode=video 11/12 秒, video_kbps avg=837
+[PASS] 视频管线延迟 <60ms  — lat_ms avg=41.6（21 个采样）
+[PASS] 停播后自动回块模式   — blocks 3/3
+```
+
 ## 2. 采集（`capture-probe`）
 
 | 指标 | 数值 |

@@ -595,28 +595,64 @@ mod tests {
         }
     }
 
-    fn nvenc_available() -> bool {
-        probe("hevc_nvenc")
-            .map(|i| i.available)
-            .unwrap_or(false)
+    /// 所有会起 ffmpeg 的测试都先抢这把锁：cargo test 默认多线程跑同一个测试二进制，
+    /// 兄弟测试的 ffmpeg 子进程会污染"残留进程"计数（曾导致偶发失败 1 -> 2）。
+    static FFMPEG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn ffmpeg_guard() -> std::sync::MutexGuard<'static, ()> {
+        // 某个测试 panic 会毒化锁，这里照常取回（测试之间没有共享状态可被破坏）
+        FFMPEG_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 数一下系统里现存多少个 ffmpeg.exe 进程
-    fn ffmpeg_process_count() -> usize {
-        let out = Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq ffmpeg.exe", "/NH", "/FO", "CSV"])
-            .output();
-        match out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .filter(|l| l.to_ascii_lowercase().contains("ffmpeg.exe"))
-                .count(),
-            Err(_) => 0,
+    fn nvenc_available() -> bool {
+        probe("hevc_nvenc").map(|i| i.available).unwrap_or(false)
+    }
+
+    /// 只数**本进程直接拉起**的 ffmpeg 进程。
+    ///
+    /// 别用全机 tasklist 计数：`cargo test --workspace` 会并行跑别的 crate
+    /// （比如 lrc-audio）的测试，它们也在起 ffmpeg，于是"残留"数字会随机变大。
+    /// 这里按 ParentProcessId == 当前进程 PID 过滤，把别人的进程排除干净。
+    /// 返回 None = 查询不到（PowerShell 不可用），调用方应跳过断言而不是误判。
+    fn own_ffmpeg_children() -> Option<usize> {
+        let pid = std::process::id();
+        let script = format!(
+            "@(Get-CimInstance Win32_Process -Filter \"Name='ffmpeg.exe'\" | Where-Object {{ $_.ParentProcessId -eq {pid} }}).Count"
+        );
+        let out = Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<usize>()
+            .ok()
+    }
+
+    /// 轮询等待本进程的 ffmpeg 子进程数降到 <= limit（子进程退出需要一点时间）。
+    fn wait_child_count_at_most(limit: usize, timeout: Duration) -> Option<usize> {
+        let deadline = Instant::now() + timeout;
+        let mut last = None;
+        loop {
+            if let Some(n) = own_ffmpeg_children() {
+                last = Some(n);
+                if n <= limit {
+                    return Some(n);
+                }
+            }
+            if Instant::now() >= deadline {
+                return last;
+            }
+            std::thread::sleep(Duration::from_millis(120));
         }
     }
 
     #[test]
     fn probe_reports_unavailable_for_bogus_encoder() {
+        let _g = ffmpeg_guard();
         let info = probe("definitely_not_a_real_encoder").expect("probe 不应 Err");
         assert!(!info.available, "不存在的编码器必须报不可用");
         assert!(!info.detail.is_empty(), "必须给出原因");
@@ -624,6 +660,7 @@ mod tests {
 
     #[test]
     fn probe_returns_info_for_nvenc() {
+        let _g = ffmpeg_guard();
         // 结果与机器相关，不断言 available，只断言"能拿到结论且不 panic"
         let info = probe("hevc_nvenc").expect("probe 不应 Err");
         assert_eq!(info.codec, "hevc_nvenc");
@@ -633,7 +670,11 @@ mod tests {
 
     #[test]
     fn unknown_encoder_construct_returns_unsupported_without_leak() {
-        let before = ffmpeg_process_count();
+        let _g = ffmpeg_guard();
+        let Some(before) = own_ffmpeg_children() else {
+            println!("跳过：拿不到本进程的 ffmpeg 子进程列表");
+            return;
+        };
         let mut c = small_cfg();
         c.codec = "definitely_not_a_real_encoder".into();
         let r = FfmpegEncoder::new(c);
@@ -642,18 +683,23 @@ mod tests {
             "构造失败必须是 Unsupported（拿到 {:?}）",
             r.err()
         );
-        std::thread::sleep(Duration::from_millis(300));
-        let after = ffmpeg_process_count();
-        assert!(after <= before, "构造失败后有残留进程: {before} -> {after}");
+        match wait_child_count_at_most(before, Duration::from_secs(3)) {
+            Some(after) => assert!(after <= before, "构造失败后有残留进程: {before} -> {after}"),
+            None => println!("跳过断言：进程查询失败"),
+        }
     }
 
     #[test]
     fn drop_leaves_no_ffmpeg_process() {
+        let _g = ffmpeg_guard();
         if !nvenc_available() {
             println!("跳过：本机没有 hevc_nvenc");
             return;
         }
-        let before = ffmpeg_process_count();
+        let Some(before) = own_ffmpeg_children() else {
+            println!("跳过：拿不到本进程的 ffmpeg 子进程列表");
+            return;
+        };
         let frame = vec![0u8; 256 * 256 * 4];
         for _ in 0..5 {
             let enc = FfmpegEncoder::new(small_cfg());
@@ -661,17 +707,21 @@ mod tests {
             let _ = enc.encode(&frame, 256 * 4);
             drop(enc); // Drop → shutdown → kill
         }
-        std::thread::sleep(Duration::from_millis(600));
-        let after = ffmpeg_process_count();
-        assert!(
-            after <= before,
-            "8 次起停后仍有残留 ffmpeg 进程: before={before} after={after}"
-        );
-        println!("ffmpeg 残留检查: before={before} after={after}");
+        match wait_child_count_at_most(before, Duration::from_secs(3)) {
+            Some(after) => {
+                assert!(
+                    after <= before,
+                    "5 次起停后仍有残留 ffmpeg 进程: before={before} after={after}"
+                );
+                println!("ffmpeg 残留检查: before={before} after={after}");
+            }
+            None => println!("跳过断言：进程查询失败"),
+        }
     }
 
     #[test]
     fn set_bitrate_restarts_and_yields_idr() {
+        let _g = ffmpeg_guard();
         if !nvenc_available() {
             println!("跳过：本机没有 hevc_nvenc");
             return;

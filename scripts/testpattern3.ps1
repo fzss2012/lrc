@@ -10,7 +10,7 @@ param(
     [int]$Display = 0,
     # 按"虚拟桌面上的 X 坐标"精确选中一块屏（DXGI 输出序号与 WinForms 屏序不保证一致，用这个更可靠）
     [int]$TargetX = -1,
-    [ValidateSet('static', 'typing', 'scroll')]
+    [ValidateSet('static', 'typing', 'scroll', 'video')]
     [string]$Mode = 'typing',
     [int]$Seconds = 20,
     [int]$FontSize = 18,
@@ -89,7 +89,29 @@ function New-FrameBitmap([int]$typedLen, [int]$scrollY) {
     return $bmp
 }
 
-$current = New-FrameBitmap 0 0
+function New-VideoBitmap([int]$phase) {
+    $bmp = New-Object System.Drawing.Bitmap($W, $H)
+    $gr = [System.Drawing.Graphics]::FromImage($bmp)
+    $gr.Clear([System.Drawing.Color]::Black)
+    $bands = 40
+    $bandH = [int][Math]::Ceiling($H / $bands)
+    for ($i = 0; $i -lt $bands; $i++) {
+        $y = ($i * $bandH + $phase) % $H
+        $t = ($i * 6 + $phase) % 360
+        $r = [int](128 + 127 * [Math]::Sin($t * [Math]::PI / 180))
+        $g2 = [int](128 + 127 * [Math]::Sin(($t + 120) * [Math]::PI / 180))
+        $b2 = [int](128 + 127 * [Math]::Sin(($t + 240) * [Math]::PI / 180))
+        $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb($r, $g2, $b2))
+        # 每层画两段以覆盖环绕
+        $gr.FillRectangle($brush, 0, $y, $W, $bandH)
+        if ($y + $bandH -gt $H) { $gr.FillRectangle($brush, 0, 0, $W, ($y + $bandH - $H)) }
+        $brush.Dispose()
+    }
+    $gr.Dispose()
+    return $bmp
+}
+
+$current = if ($Mode -eq 'video') { New-VideoBitmap 0 } else { New-FrameBitmap 0 0 }
 if ($RenderOut -ne '') { $current.Save($RenderOut, [System.Drawing.Imaging.ImageFormat]::Png) }
 
 $form = New-Object System.Windows.Forms.Form
@@ -120,8 +142,18 @@ while ([DateTime]::UtcNow -lt $deadline) {
         if ($frame % 7 -eq 0) { $typed = ($typed + 1) % 80; $doUpdate = $true }
     } elseif ($Mode -eq 'scroll') {
         if ($frame % 4 -eq 0) { $scroll = ($scroll + 2) % 400; $doUpdate = $true }
+    } elseif ($Mode -eq 'video') {
+        # 整屏运动：横向色带整体滚动 + 纵向明暗呼吸，每帧 ~100% 像素变化
+        if ($frame % 2 -eq 0) { $scroll = ($scroll + 7) % 360; $doUpdate = $true }
     }
-    if ($doUpdate) {
+    if ($doUpdate -and $Mode -eq 'video') {
+        $next = New-VideoBitmap $scroll
+        $pb.Image = $next
+        $pb.Invalidate()
+        $old = $current
+        $current = $next
+        if ($null -ne $old) { $old.Dispose() }
+    } elseif ($doUpdate) {
         $next = New-FrameBitmap $typed $scroll
         $pb.Image = $next
         $pb.Invalidate()

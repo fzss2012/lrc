@@ -90,6 +90,7 @@ fn spawn_reader(
     markers: Option<String>,
     shared_rx: Arc<AtomicBool>,
     input_keys: Arc<std::sync::atomic::AtomicU64>,
+    input_digit_keys: Arc<std::sync::atomic::AtomicU64>,
 ) {
     std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -103,9 +104,14 @@ fn spawn_reader(
                         mark(&markers, &format!("MARK select_display={index}"));
                     }
                     Ok(Message::RequestFull) => mark(&markers, "MARK request_full"),
-                    // 快捷键被客户端吃掉的话，这里不该看到对应按键
-                    Ok(Message::Input(InputEvent::Key { .. })) => {
+                    // 快捷键被客户端吃掉的话，这里不该看到数字键（扫描码 0x02..=0x0A）
+                    Ok(Message::Input(InputEvent::Key {
+                        scancode, ..
+                    })) => {
                         input_keys.fetch_add(1, Ordering::Relaxed);
+                        if (0x02..=0x0A).contains(&scancode) {
+                            input_digit_keys.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                     Ok(_) | Err(_) => {}
                 },
@@ -187,12 +193,14 @@ fn run() -> Result<(), String> {
     spawn_writer(writer, rx);
     let disconnected = Arc::new(AtomicBool::new(false));
     let input_keys = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let input_digit_keys = Arc::new(std::sync::atomic::AtomicU64::new(0));
     spawn_reader(
         reader,
         tx.clone(),
         args.markers.clone(),
         disconnected.clone(),
         input_keys.clone(),
+        input_digit_keys.clone(),
     );
 
     // 可选门控：外部脚本先摆好窗口再放行
@@ -378,8 +386,9 @@ fn run() -> Result<(), String> {
     mark(
         &args.markers,
         &format!(
-            "MARK input_keys_forwarded={}",
-            input_keys.load(Ordering::Relaxed)
+            "MARK input_keys_forwarded={} input_digit_keys={}",
+            input_keys.load(Ordering::Relaxed),
+            input_digit_keys.load(Ordering::Relaxed)
         ),
     );
     mark(&args.markers, "MARK done");

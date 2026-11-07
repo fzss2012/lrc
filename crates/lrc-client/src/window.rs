@@ -288,6 +288,19 @@ impl SoftCanvas {
     }
 }
 
+/// Ctrl+Alt+1..9 是否命中显示切换快捷键；命中返回 0 基的输出序号。
+///
+/// 抽成纯函数方便单测（Win32 的 `GetKeyState` 在无头环境里不好造）。
+fn display_switch_index(vk: u32, ctrl: bool, alt: bool) -> Option<u8> {
+    if !ctrl || !alt {
+        return None;
+    }
+    if !(u32::from(b'1')..=u32::from(b'9')).contains(&vk) {
+        return None;
+    }
+    Some((vk - u32::from(b'1')) as u8)
+}
+
 /// 窗口线程专属状态（`Presenter` 非 Send，必须留在本线程）。
 struct AppState {
     hwnd: HWND,
@@ -1158,18 +1171,14 @@ audio_rms={audio_rms:.4} audio_ms={} audio_pkts={audio_pkts} audio_drop={audio_d
     fn intercept_display_switch(&mut self, wparam: WPARAM, lparam: LPARAM, down: bool) -> bool {
         let vk = wparam.0 as u32;
         if down {
-            if !(u32::from(b'1')..=u32::from(b'9')).contains(&vk) {
-                return false;
-            }
             let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
             let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
-            if !(ctrl && alt) {
+            let Some(index) = display_switch_index(vk, ctrl, alt) else {
                 return false;
-            }
+            };
             // 长按的重复消息只吃掉、不重复发
             let repeat = (lparam.0 >> 30) & 1 != 0;
             if !repeat {
-                let index = (vk - u32::from(b'1')) as u8;
                 log::info!("快捷键 Ctrl+Alt+{} → 请求切换显示输出 #{index}", index + 1);
                 self.shared
                     .send(Message::SelectDisplay(SelectDisplay { index }).encode());
@@ -1536,6 +1545,19 @@ mod tests {
             version: 1,
             drawn: None,
         }
+    }
+
+    #[test]
+    fn display_switch_shortcut_matching() {
+        // Ctrl+Alt+1..9 → 0..8
+        assert_eq!(display_switch_index(u32::from(b'1'), true, true), Some(0));
+        assert_eq!(display_switch_index(u32::from(b'9'), true, true), Some(8));
+        // 缺修饰键不算
+        assert_eq!(display_switch_index(u32::from(b'2'), false, true), None);
+        assert_eq!(display_switch_index(u32::from(b'2'), true, false), None);
+        // 非数字键不算
+        assert_eq!(display_switch_index(u32::from(b'0'), true, true), None);
+        assert_eq!(display_switch_index(u32::from(b'A'), true, true), None);
     }
 
     #[test]
