@@ -3,6 +3,10 @@
 //!
 //! 由 windows-gfx 实现（spike 阶段）。接口先放这里，host/client 下一轮接入。
 
+pub mod ffmpeg;
+
+pub use ffmpeg::{DecoderConfig, FfmpegDecoder, FfmpegEncoder, resolve_ffmpeg};
+
 use std::fmt;
 
 /// 编码器配置。

@@ -136,6 +136,37 @@ remote_y = client_y * remote_h / client_h
 另外主控端在收到首帧（flags FULL）后，**把窗口客户区调成被控端的宽高比**（保持当前宽度、按比例算高度），
 这样拉伸失真在常规使用下不存在。非 16:9 被控端（如 1920×1200）也不会点不准。
 
+## 4.6 M2：视频通道（设计草案，接口待定稿）
+
+**问题**：块内 JPEG 对"视频/照片/整屏重绘"内容必然爆带宽（实测 6–50 Mbps、CPU 174 ms/帧）。
+
+**方案**：双模式 + 自动切换。
+
+```
+每帧统计变化块数与变化面积比
+  ├─ 变化块 < 25% 且面积 < 40%  → 块模式（当前路径，文字无损最划算）
+  └─ 连续 K 帧（K=3）超过阈值   → 视频模式：
+       整帧 BGRA → NVENC（HEVC 优先，回落 H.264）
+       → 线格式 Message::VideoAu { ts_ms, seq, codec, key, data }
+       → 客户端 ffmpeg/解码器 → BGRA → 直接 update_full
+回落到块模式：连续 M 帧（M=30）变化块 < 5% 且面积 < 10%
+```
+
+要点：
+- **视频模式只在"确实是视频类内容"时打开**，否则文字会被有损编码（这是 ToDesk 用 COMPOUND 逐块分割解决的问题；我们先做帧级开关，够用）。
+- 视频模式期间 **光标照旧走独立消息**（不进码流）。
+- 码率由简单的目标值 + 帧率阶梯控制（M2 先不做完整 GCC）：`video_bitrate` 由 `--quality` 档位映射，帧率 30/20/15。
+- 关键帧只在建链/切换模式时请求（`-g 60` + `-bf 0` + low-delay）。
+- 客户端解码失败/丢包 → 发 `RequestFull`，host 请求 IDR。
+
+**线格式新增（proto v1 向后兼容，新增消息类型 0x14）**：
+
+```
+VideoAu { ts_ms:u32, seq:u32, codec:u8, flags:u8, data:blob }
+codec: 3 = H264, 4 = HEVC
+flags: bit0 = key
+```
+
 ## 5. 输入
 
 - 被控端 `SendInput`：鼠标走 `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE` 以

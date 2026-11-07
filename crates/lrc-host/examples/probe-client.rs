@@ -26,6 +26,10 @@ struct Opts {
     bad_password: bool,
     /// 鉴权后把鼠标移到"采集画面本地坐标"并退出（验证输入注入链路）
     move_to: Option<(i32, i32)>,
+    /// 用 InputEvent 让被控端挪鼠标，回看是否收到 CursorPos/CursorShape（光标全链路自测）
+    wiggle: bool,
+    /// 第 N 秒发一次 RequestFull（验证静止桌面的整帧兜底）
+    request_full_at: Option<f64>,
 }
 
 impl Default for Opts {
@@ -37,6 +41,8 @@ impl Default for Opts {
             frames: 100_000,
             bad_password: false,
             move_to: None,
+            wiggle: false,
+            request_full_at: None,
         }
     }
 }
@@ -59,6 +65,8 @@ fn parse_args() -> Result<Opts, Box<dyn std::error::Error>> {
             "--seconds" => opts.seconds = value()?.parse::<u64>()?,
             "--frames" => opts.frames = value()?.parse::<usize>()?,
             "--bad-password" => opts.bad_password = true,
+            "--wiggle" => opts.wiggle = true,
+            "--request-full-at" => opts.request_full_at = Some(value()?.parse::<f64>()?),
             "--move" => {
                 let raw = value()?;
                 let (x, y) = raw
@@ -67,7 +75,9 @@ fn parse_args() -> Result<Opts, Box<dyn std::error::Error>> {
                 opts.move_to = Some((x.trim().parse::<i32>()?, y.trim().parse::<i32>()?));
             }
             "-h" | "--help" => {
-                println!("probe-client --addr <IP:PORT> --password <PASS> [--seconds N] [--frames N] [--bad-password]");
+                println!(
+                    "probe-client --addr <IP:PORT> --password <PASS> [--seconds N] [--frames N] [--bad-password] [--move X,Y] [--wiggle] [--request-full-at SECS]"
+                );
                 std::process::exit(0);
             }
             other => return Err(format!("未知参数 {other}").into()),
@@ -159,7 +169,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stride = (screen_w as usize) * 4;
     let mut fb = vec![0u8; stride * screen_h as usize];
 
-    let deadline = Instant::now() + Duration::from_secs(opts.seconds);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(opts.seconds);
     let mut frames = 0usize;
     let mut full_frames = 0usize;
     let mut blocks = 0usize;
@@ -173,10 +184,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sec_bytes = 0u64;
     let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
 
+    // 光标全链路自测状态
+    let wiggle_at = [1.0f64, 1.35, 1.7, 2.05];
+    let wiggle_pos = [(120, 120), (500, 320), (1100, 620), (300, 800)];
+    let mut wiggle_step = 0usize;
+    let mut cursor_pos_msgs = 0usize;
+    let mut cursor_shape_msgs = 0usize;
+    let mut shape_geometry_ok = true;
+    let mut last_cursor_pos: Option<(i16, i16, bool)> = None;
+    let mut cursor_at_settle: Option<usize> = None;
+    let mut request_full_sent_at: Option<f64> = None;
+    let mut full_frames_after_request = 0usize;
+
     while Instant::now() < deadline && frames < opts.frames {
         if last_ping.elapsed() >= Duration::from_secs(1) {
             writer.send(&Message::Ping(Ping { ts_ms: 424242 }).encode())?;
             last_ping = Instant::now();
+        }
+        let elapsed = started.elapsed().as_secs_f64();
+        // 用被控端的输入通道挪鼠标：正常的 CursorPos 应该原路回传
+        if opts.wiggle && wiggle_step < wiggle_at.len() && elapsed >= wiggle_at[wiggle_step] {
+            let (x, y) = wiggle_pos[wiggle_step];
+            writer.send(&Message::Input(InputEvent::MouseMove { x, y }).encode())?;
+            println!("WIGGLE step={wiggle_step} move=({x},{y}) t={elapsed:.2}");
+            wiggle_step += 1;
+        }
+        // 全部挪完 + 0.4 秒后记下计数，之后静止 1.2 秒看还有没有多余的光标消息
+        if opts.wiggle
+            && wiggle_step >= wiggle_at.len()
+            && cursor_at_settle.is_none()
+            && elapsed >= wiggle_at[wiggle_at.len() - 1] + 0.4
+        {
+            cursor_at_settle = Some(cursor_pos_msgs);
+        }
+        if let Some(t) = opts.request_full_at {
+            if request_full_sent_at.is_none() && elapsed >= t {
+                writer.send(&Message::RequestFull.encode())?;
+                request_full_sent_at = Some(elapsed);
+                println!("REQUEST_FULL sent at t={elapsed:.2}");
+            }
         }
         match reader.recv(&mut buf) {
             Ok(Some(n)) => {
@@ -198,6 +244,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sec_bytes += n as u64;
                         if vf.flags & frame_flags::FULL != 0 {
                             full_frames += 1;
+                            if request_full_sent_at.is_some() {
+                                full_frames_after_request += 1;
+                            }
                         }
                         match vf.grid() {
                             Some(grid) => {
@@ -234,7 +283,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         )?;
                     }
                     Message::Pong(_) => {}
-                    Message::CursorPos(_) => {}
+                    Message::CursorPos(pos) => {
+                        cursor_pos_msgs += 1;
+                        last_cursor_pos = Some((pos.x, pos.y, pos.visible));
+                        if cursor_pos_msgs <= 3 {
+                            println!("CursorPos {} {} visible={}", pos.x, pos.y, pos.visible);
+                        }
+                    }
+                    Message::CursorShape(shape) => {
+                        cursor_shape_msgs += 1;
+                        let expect = 4 * shape.width as usize * shape.height as usize;
+                        if shape.rgba.len() != expect {
+                            shape_geometry_ok = false;
+                            println!(
+                                "CursorShape 长度不对: {}x{} len={} 期望 {}",
+                                shape.width,
+                                shape.height,
+                                shape.rgba.len(),
+                                expect
+                            );
+                        }
+                        println!(
+                            "CursorShape {}x{} hotspot=({}, {}) bytes={}",
+                            shape.width,
+                            shape.height,
+                            shape.hotspot_x,
+                            shape.hotspot_y,
+                            shape.rgba.len()
+                        );
+                    }
                     other => println!("收到其它消息 type=0x{:02x}", other.msg_type()),
                 }
             }
@@ -270,6 +347,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "SUMMARY frames={frames} full_frames={full_frames} blocks={blocks} bytes={bytes} decode_err={decode_err} bad_message={bad_message} recv_total={recv_total} nonzero_bytes={nonzero} fb_bytes={}",
         fb.len()
     );
+    println!(
+        "CURSOR pos_msgs={cursor_pos_msgs} shape_msgs={cursor_shape_msgs} last_pos={last_cursor_pos:?} shape_geometry_ok={shape_geometry_ok}"
+    );
+    if let Some(at_settle) = cursor_at_settle {
+        println!(
+            "CURSOR idle_window pos_msgs_after_settle={} (期望 0)",
+            cursor_pos_msgs.saturating_sub(at_settle)
+        );
+    }
+    if let Some(t) = request_full_sent_at {
+        println!(
+            "REQUEST_FULL sent_at={t:.2} full_frames_after_request={full_frames_after_request}"
+        );
+    }
     writer.shutdown();
     Ok(())
 }

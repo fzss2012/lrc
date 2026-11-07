@@ -251,6 +251,7 @@ fn run() -> Result<()> {
     }
 
     print_bandwidth_table(&reports, &args);
+    print_lossless_mode_table(&reports);
     print_strategy_table(&reports);
     print_footnotes(&reports, &opts);
     Ok(())
@@ -352,6 +353,8 @@ struct ScenarioReport {
     jpg_bytes: Vec<usize>,
     enc_us: Vec<u64>,
     tags: [usize; 3],
+    /// 无损块内部模式：0=左预测 1=原样 2=palette8 3=palette4
+    loss_modes: [usize; 4],
     verify_blocks: usize,
     verify_fail: usize,
     cross_fail: usize,
@@ -368,6 +371,7 @@ impl ScenarioReport {
             jpg_bytes: Vec::new(),
             enc_us: Vec::new(),
             tags: [0; 3],
+            loss_modes: [0; 4],
             verify_blocks: 0,
             verify_fail: 0,
             cross_fail: 0,
@@ -432,6 +436,8 @@ struct FrameStats {
     jpg_bytes: usize,
     enc_us: u64,
     tags: [usize; 3],
+    /// 无损块内部用的模式分布：0=左预测 1=原样 2=palette8 3=palette4
+    loss_modes: [usize; 4],
     verify_blocks: usize,
     verify_fail: usize,
     cross_fail: usize,
@@ -445,7 +451,6 @@ struct Work {
     dst: Vec<u8>,
     ll: Vec<u8>,
     jpg: Vec<u8>,
-    predicted: Vec<u8>,
 }
 
 fn wire_bytes(blocks: usize, payload: usize) -> usize {
@@ -464,7 +469,6 @@ fn run_scenario(
     opts: &Options,
 ) -> Result<ScenarioReport> {
     let mut scenario = Scenario::new(kind, base.clone())?;
-    let mut force = ForceEncoders::new(opts.zstd_level, opts.jpeg_quality)?;
     let mut work = Work::default();
     let mut report = ScenarioReport::new(kind);
 
@@ -488,7 +492,6 @@ fn run_scenario(
             opts,
             &mut prev,
             &mut work,
-            &mut force,
             args.verify,
         )?;
         report.frames += 1;
@@ -498,6 +501,9 @@ fn run_scenario(
         report.jpg_bytes.push(st.jpg_bytes);
         report.enc_us.push(st.enc_us);
         for (dst, src) in report.tags.iter_mut().zip(st.tags.iter()) {
+            *dst += *src;
+        }
+        for (dst, src) in report.loss_modes.iter_mut().zip(st.loss_modes.iter()) {
             *dst += *src;
         }
         report.verify_blocks += st.verify_blocks;
@@ -516,7 +522,6 @@ fn measure_frame(
     opts: &Options,
     prev: &mut [u64],
     work: &mut Work,
-    force: &mut ForceEncoders,
     verify: bool,
 ) -> Result<FrameStats> {
     let mut enc_ns = 0u128;
@@ -527,6 +532,7 @@ fn measure_frame(
         jpg_bytes: 0,
         enc_us: 0,
         tags: [0; 3],
+        loss_modes: [0; 4],
         verify_blocks: 0,
         verify_fail: 0,
         cross_fail: 0,
@@ -585,22 +591,35 @@ fn measure_frame(
             _ => {}
         }
 
-        // 2) 强制策略（bench 内复刻容器格式）
-        force.lossless_into(
-            &work.tile,
-            rect.w as u16,
-            rect.h as u16,
-            &mut work.predicted,
+        // 2) 强制策略：直接调 lrc-codec 的对照入口（只编码、不做策略选择）
+        lrc_codec::encode_lossless_block(
+            &frame.data[off..],
+            frame.stride,
+            rect.w,
+            rect.h,
+            opts.zstd_level,
             &mut work.ll,
-        )?;
+        )
+        .with_context(|| format!("块 {idx} 无损对照编码失败"))?;
         payload_ll += work.ll.len();
-        force.jpeg_into(&work.tile, rect.w as u16, rect.h as u16, &mut work.jpg)?;
+        lrc_codec::encode_jpeg_block(
+            &frame.data[off..],
+            frame.stride,
+            rect.w,
+            rect.h,
+            opts.jpeg_quality,
+            &mut work.jpg,
+        )
+        .with_context(|| format!("块 {idx} JPEG 对照编码失败"))?;
         payload_jpg += work.jpg.len();
 
-        // 3) 交叉校验：复刻格式必须和真实 codec 的输出逐字节一致
+        // 3) 口径自检：策略选中某个 codec 时，对照口径的字节数必须一致
         let same = match tag {
-            codec_tag::LOSSLESS => work.ll == work.out,
-            codec_tag::JPEG => work.jpg == work.out,
+            codec_tag::LOSSLESS => {
+                stats.loss_modes[usize::from(work.out[0]).min(3)] += 1;
+                work.ll.len() == work.out.len()
+            }
+            codec_tag::JPEG => work.jpg.len() == work.out.len(),
             _ => true,
         };
         if !same {
@@ -638,83 +657,6 @@ fn measure_frame(
     Ok(stats)
 }
 
-// ---------------------------------------------------------------- 强制策略编码器
-
-/// 复刻 lrc-codec 的两种块容器格式，用来算"全无损 / 全 JPEG"策略的字节数。
-///
-/// 这是纯测量用的旁路实现（不改 lrc-codec、不引新非工作区依赖）：
-/// 每个块的输出都会和真实 `encode_block` 的结果做逐字节交叉校验，
-/// 一旦 codec 改了格式，bench 会在输出里报"交叉校验不一致"。
-struct ForceEncoders {
-    quality: u8,
-    compressor: zstd::bulk::Compressor<'static>,
-}
-
-impl ForceEncoders {
-    fn new(level: i32, quality: u8) -> Result<Self> {
-        let compressor = zstd::bulk::Compressor::new(level)
-            .map_err(|e| anyhow!("zstd 压缩器初始化失败（level={level}）: {e}"))?;
-        Ok(Self {
-            quality: quality.clamp(1, 100),
-            compressor,
-        })
-    }
-
-    /// u8 mode + u16 w + u16 h + zstd(payload)，左预测/原样两种模式取小。
-    fn lossless_into(
-        &mut self,
-        tile: &[u8],
-        w: u16,
-        h: u16,
-        predicted: &mut Vec<u8>,
-        out: &mut Vec<u8>,
-    ) -> Result<()> {
-        let row = usize::from(w) * 4;
-        predicted.clear();
-        predicted.reserve(tile.len());
-        for y in 0..usize::from(h) {
-            let line = &tile[y * row..(y + 1) * row];
-            let first = line.len().min(4);
-            predicted.extend_from_slice(&line[..first]);
-            for i in first..line.len() {
-                predicted.push(line[i].wrapping_sub(line[i - 1]));
-            }
-        }
-        let z_pred = self
-            .compressor
-            .compress(predicted)
-            .map_err(|e| anyhow!("zstd(左预测) 压缩失败: {e}"))?;
-        let z_raw = self
-            .compressor
-            .compress(tile)
-            .map_err(|e| anyhow!("zstd(原样) 压缩失败: {e}"))?;
-        let (mode, payload) = if z_pred.len() <= z_raw.len() {
-            (0u8, z_pred)
-        } else {
-            (1u8, z_raw)
-        };
-        out.clear();
-        out.push(mode);
-        out.extend_from_slice(&w.to_le_bytes());
-        out.extend_from_slice(&h.to_le_bytes());
-        out.extend_from_slice(&payload);
-        Ok(())
-    }
-
-    /// u8 quality + u16 w + u16 h + 基线 JPEG（4:4:4）。
-    fn jpeg_into(&mut self, tile: &[u8], w: u16, h: u16, out: &mut Vec<u8>) -> Result<()> {
-        out.clear();
-        out.push(self.quality);
-        out.extend_from_slice(&w.to_le_bytes());
-        out.extend_from_slice(&h.to_le_bytes());
-        let mut encoder = jpeg_encoder::Encoder::new(out, self.quality);
-        encoder.set_sampling_factor(jpeg_encoder::SamplingFactor::F_1_1);
-        encoder
-            .encode(tile, w, h, jpeg_encoder::ColorType::Bgra)
-            .map_err(|e| anyhow!("jpeg 编码失败: {e}"))?;
-        Ok(())
-    }
-}
 
 // ---------------------------------------------------------------- 输出
 
@@ -749,6 +691,35 @@ fn print_bandwidth_table(reports: &[ScenarioReport], args: &Args) {
     }
 }
 
+fn print_lossless_mode_table(reports: &[ScenarioReport]) {
+    println!();
+    println!("=== 无损块内部模式分布（codec=0 的块）===");
+    println!(
+        "{:<10} {:>10} {:>12} {:>12} {:>13} {:>13} {:>12}",
+        "scenario", "lossless", "mode0 预测", "mode1 原样", "mode2 pal8", "mode3 pal4", "palette 占比"
+    );
+    for r in reports {
+        let total: usize = r.loss_modes.iter().sum();
+        let pal = r.loss_modes[2] + r.loss_modes[3];
+        let pct = if total == 0 {
+            0.0
+        } else {
+            pal as f64 * 100.0 / total as f64
+        };
+        println!(
+            "{:<10} {:>10} {:>12} {:>12} {:>13} {:>13} {:>11.1}%",
+            r.kind.name(),
+            total,
+            r.loss_modes[0],
+            r.loss_modes[1],
+            r.loss_modes[2],
+            r.loss_modes[3],
+            pct
+        );
+    }
+    println!();
+    println!("（mode2/3 是调色板：每像素 8bit / 4bit 索引后 zstd；命中率 = 无损块里走调色板的比例）");
+}
 fn print_strategy_table(reports: &[ScenarioReport]) {
     println!();
     println!("=== 编码策略对比（同一批脏块，每帧线上字节均值）===");
@@ -822,28 +793,32 @@ mod tests {
         assert_eq!(percentile(&[], 0.95), 0);
     }
 
-    /// 强制策略的容器格式必须和 lrc-codec 的真实输出逐字节一致，
-    /// 否则策略对比表就是错的。
+    /// 对照口径必须和 lrc-codec 真实选择一致：
+    /// 策略选中无损时，encode_lossless_block 的字节数要等于 encode_block 的输出；
+    /// 选中 JPEG 时同理。否则「全无损 / 全 JPEG」两行就不是同一批块的对照。
     #[test]
-    fn forced_encoders_match_codec_output() {
+    fn forced_encoders_match_codec_choice() {
         let opts = Options::default();
-        let mut force = ForceEncoders::new(opts.zstd_level, opts.jpeg_quality).unwrap();
-        let mut work = Work::default();
+        let mut out = Vec::new();
+        let mut ll = Vec::new();
+        let mut jpg = Vec::new();
         let mut rng = Rng::new(0x1234_5678);
         let (w, h) = (64u32, 64u32);
         let row = (w * 4) as usize;
+        let mut saw_lossless = false;
+        let mut saw_jpeg = false;
 
-        for case in 0..5 {
+        for case in 0..4 {
             let mut tile = vec![0u8; row * h as usize];
             match case {
                 0 => {
-                    // 纯色：走无损
+                    // 纯色：走无损（原样 zstd）
                     for px in tile.chunks_exact_mut(4) {
                         px.copy_from_slice(&[0x1E, 0x1E, 0x1E, 0xFF]);
                     }
                 }
-                1 => {
-                    // 细线文字：走无损
+                1 | 2 => {
+                    // 细线文字：走无损调色板
                     for y in 0..h as usize {
                         for x in 0..w as usize {
                             let i = (y * row) + x * 4;
@@ -867,36 +842,72 @@ mod tests {
                 }
             }
 
-            let tag = encode_block(&tile, row, w, h, &opts, &mut work.out).unwrap();
-            force
-                .lossless_into(&tile, w as u16, h as u16, &mut work.predicted, &mut work.ll)
-                .unwrap();
-            force.jpeg_into(&tile, w as u16, h as u16, &mut work.jpg).unwrap();
-
+            let tag = encode_block(&tile, row, w, h, &opts, &mut out).unwrap();
+            lrc_codec::encode_lossless_block(&tile, row, w, h, opts.zstd_level, &mut ll).unwrap();
+            lrc_codec::encode_jpeg_block(&tile, row, w, h, opts.jpeg_quality, &mut jpg).unwrap();
             match tag {
                 codec_tag::LOSSLESS => {
-                    assert_eq!(work.ll, work.out, "case {case}: 无损复刻必须与 lrc-codec 一致")
+                    saw_lossless = true;
+                    assert_eq!(ll, out, "case {case}: 无损对照必须与 encode_block 一致");
                 }
                 codec_tag::JPEG => {
-                    assert_eq!(work.jpg, work.out, "case {case}: JPEG 复刻必须与 lrc-codec 一致")
+                    saw_jpeg = true;
+                    assert_eq!(jpg, out, "case {case}: JPEG 对照必须与 encode_block 一致");
                 }
                 _ => {}
             }
         }
-
-        // 噪声块必须真的走到 JPEG，否则上面的 JPEG 分支没被覆盖
-        let mut noise = vec![0u8; row * h as usize];
-        for b in noise.iter_mut() {
-            *b = (rng.next_u32() & 0xFF) as u8;
-        }
-        let tag = encode_block(&noise, row, w, h, &opts, &mut work.out).unwrap();
-        assert_eq!(tag, codec_tag::JPEG, "随机噪声块应该走 JPEG");
-        force
-            .jpeg_into(&noise, w as u16, h as u16, &mut work.jpg)
-            .unwrap();
-        assert_eq!(work.jpg, work.out);
+        assert!(saw_lossless, "样本里应该有无损块");
+        assert!(saw_jpeg, "样本里应该有 JPEG 块");
     }
-
+    /// 真实帧逐块往返（无损块必须逐字节一致）。
+    /// 这条测试就是 T10 抓出"差分全 0 不等于同色"那个 bug 的入口，别删。
+    #[test]
+    fn real_frame_lossless_roundtrip() {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../captures/frame0.bgra");
+        if !p.is_file() {
+            println!("[roundtrip] 没有真实帧，跳过");
+            return;
+        }
+        let raw = std::fs::read(&p).unwrap();
+        let (w, h, bs) = (1920usize, 1080usize, 64usize);
+        let stride = w * 4;
+        if raw.len() < stride * h {
+            println!("[roundtrip] 帧长度不符，跳过");
+            return;
+        }
+        let grid = Grid::new(bs as u16, w as u32, h as u32).unwrap();
+        let opts = Options::default();
+        let mut out = Vec::new();
+        let mut modes = [0usize; 4];
+        let mut lossless = 0usize;
+        for idx in 0..grid.count() {
+            let Some(rect) = grid.block_rect(idx, w as u32, h as u32) else {
+                continue;
+            };
+            let off = rect.y as usize * stride + rect.x as usize * 4;
+            let row = rect.w as usize * 4;
+            let mut tile = Vec::with_capacity(row * rect.h as usize);
+            for y in 0..rect.h as usize {
+                let s = off + y * stride;
+                tile.extend_from_slice(&raw[s..s + row]);
+            }
+            let tag = encode_block(&raw[off..], stride, rect.w, rect.h, &opts, &mut out).unwrap();
+            let mut dst = vec![0u8; row * rect.h as usize];
+            decode_block(tag, &out, rect.w, rect.h, &mut dst, row).unwrap();
+            match tag {
+                codec_tag::LOSSLESS => {
+                    lossless += 1;
+                    modes[usize::from(out[0]).min(3)] += 1;
+                    assert_eq!(dst, tile, "块 {idx} 无损往返不一致（mode {}）", out[0]);
+                }
+                codec_tag::RAW => assert_eq!(dst, tile, "块 {idx} RAW 往返不一致"),
+                _ => {} // JPEG 有损，不逐字节比
+            }
+        }
+        println!("[roundtrip] 真实帧 {lossless} 个无损块逐字节一致，模式分布 {modes:?}");
+        assert!(modes[2] + modes[3] > 0, "真实帧上应该至少有些块走调色板");
+    }
     #[test]
     fn degenerate_frame_detects_placeholder() {
         let zero = Frame::new(64, 64).unwrap();
@@ -926,9 +937,9 @@ fn print_footnotes(reports: &[ScenarioReport], opts: &Options) {
     }
     let cross_fail: usize = reports.iter().map(|r| r.cross_fail).sum();
     if cross_fail == 0 {
-        println!("- 强制策略的容器字节已与 lrc-codec 真实输出逐字节交叉校验（不一致 0 块），可以直接和混合策略比较。");
+        println!("- 「全无损 / 全 JPEG」两行直接调 lrc-codec 的对照入口（encode_lossless_block / encode_jpeg_block），与混合策略是同一批块、同一份编码实现。");
     } else {
-        println!("- ⚠ 强制策略复刻与 lrc-codec 输出有 {cross_fail} 块不一致：codec 格式可能改过，策略对比表需重新核对。");
+        println!("- ⚠ 对照口径自检发现 {cross_fail} 块与 encode_block 的选择不一致，策略对比表需要核对。");
     }
 
     // 混合策略在个别内容上可能比全 JPEG 更差（无损阈值过早接受），这里点名。

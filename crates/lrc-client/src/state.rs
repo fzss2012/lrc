@@ -4,7 +4,8 @@
 //! 由 8ms 定时器在主线程 drain。
 
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -24,6 +25,29 @@ pub struct BlockUpdate {
     pub w: u32,
     pub h: u32,
     pub data: Vec<u8>,
+}
+
+/// 被主控端拥有的光标位图（BGRA，行连续，长度 = 4*w*h）。
+///
+/// 线上 `CursorShape.rgba` 实际存的是 BGRA（proto 字段名不准），alpha 在第 4 字节。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CursorShapeOwned {
+    pub width: u32,
+    pub height: u32,
+    pub hotspot_x: i32,
+    pub hotspot_y: i32,
+    pub bgra: Vec<u8>,
+}
+
+/// 某一时刻的光标状态。
+///
+/// `x`/`y` 是**被控端帧像素坐标**（热点位置，与 VideoFrame 的块坐标同一坐标系）。
+#[derive(Clone, Debug, Default)]
+pub struct CursorSnapshot {
+    pub x: i32,
+    pub y: i32,
+    pub visible: bool,
+    pub shape: Option<Arc<CursorShapeOwned>>,
 }
 
 /// 加锁，但把"毒锁"当成正常情况处理（某个线程 panic 后仍要能继续显示画面）。
@@ -60,6 +84,15 @@ pub struct Shared {
     failure: Mutex<Option<String>>,
     /// 窗口句柄（isize 形式，避免把非 Send 的 HWND 存进来）
     hwnd: AtomicIsize,
+    /// 光标状态 + 版本号（版本变了主线程才重绘光标）
+    cursor: Mutex<CursorSnapshot>,
+    cursor_version: AtomicU64,
+    /// 最近一次 Ping 的 (ts_ms, 发出时刻)，只保留一条（1 秒一个，RTT 远小于 1 秒）
+    ping_pending: Mutex<Option<(u64, Instant)>>,
+    /// 最近一次测得的 RTT（微秒），0 = 还没测到
+    rtt_micros: AtomicU64,
+    /// 单调时钟原点（Ping 的 ts_ms 用它算；两个线程共用）
+    epoch: Instant,
 }
 
 impl Shared {
@@ -78,6 +111,11 @@ impl Shared {
             quit: AtomicBool::new(false),
             failure: Mutex::new(None),
             hwnd: AtomicIsize::new(0),
+            cursor: Mutex::new(CursorSnapshot::default()),
+            cursor_version: AtomicU64::new(0),
+            ping_pending: Mutex::new(None),
+            rtt_micros: AtomicU64::new(0),
+            epoch: Instant::now(),
         }
     }
 
@@ -163,6 +201,71 @@ impl Shared {
     /// 是否已经收到过整帧。
     pub fn has_first_full_frame(&self) -> bool {
         self.first_full_frame.load(Ordering::SeqCst)
+    }
+
+    // ---- 光标 ----
+
+    /// 更新光标位置/可见性（收到 CursorPos）。没变化就不动版本号。
+    pub fn set_cursor_pos(&self, x: i32, y: i32, visible: bool) {
+        {
+            let mut cursor = lock_or_recover(&self.cursor);
+            if cursor.x == x && cursor.y == y && cursor.visible == visible {
+                return;
+            }
+            cursor.x = x;
+            cursor.y = y;
+            cursor.visible = visible;
+        }
+        self.cursor_version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 更新光标位图（收到 CursorShape）；`None` 表示隐藏/清空。
+    pub fn set_cursor_shape(&self, shape: Option<CursorShapeOwned>) {
+        {
+            let mut cursor = lock_or_recover(&self.cursor);
+            cursor.shape = shape.map(Arc::new);
+        }
+        self.cursor_version.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// 取光标快照 + 版本号。主线程只在版本变化时重绘光标。
+    pub fn cursor_snapshot(&self) -> (CursorSnapshot, u64) {
+        let version = self.cursor_version.load(Ordering::SeqCst);
+        let snapshot = lock_or_recover(&self.cursor).clone();
+        (snapshot, version)
+    }
+
+    // ---- RTT（Ping/Pong）----
+
+    /// 单调时钟（毫秒），作为 Ping 的 `ts_ms`。
+    pub fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// 记录一次 Ping，返回要发到线上的 `ts_ms`。
+    pub fn begin_ping(&self) -> u64 {
+        let ts = self.now_ms();
+        *lock_or_recover(&self.ping_pending) = Some((ts, Instant::now()));
+        ts
+    }
+
+    /// 收到 Pong：匹配上最近一次 Ping 就记下 RTT（微秒）并返回。
+    pub fn finish_ping(&self, ts: u64) -> Option<u64> {
+        let mut slot = lock_or_recover(&self.ping_pending);
+        let elapsed = match slot.as_ref() {
+            Some((sent_ts, sent_at)) if *sent_ts == ts => Some(sent_at.elapsed()),
+            _ => None,
+        };
+        let elapsed = elapsed?;
+        *slot = None;
+        let micros = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.rtt_micros.store(micros, Ordering::Relaxed);
+        Some(micros)
+    }
+
+    /// 最近一次 RTT（微秒）；0 表示还没测到。
+    pub fn rtt_micros(&self) -> u64 {
+        self.rtt_micros.load(Ordering::Relaxed)
     }
 
     pub fn add_recv_bytes(&self, n: u64) {
@@ -263,6 +366,59 @@ mod tests {
         }]);
         assert!(shared.take_want_full());
         assert_eq!(shared.take_blocks().len(), MAX_PENDING_BLOCKS);
+    }
+
+    #[test]
+    fn cursor_version_bumps_only_on_change() {
+        let shared = Shared::new();
+        let (snapshot, v0) = shared.cursor_snapshot();
+        assert_eq!(v0, 0);
+        assert!(!snapshot.visible);
+
+        shared.set_cursor_pos(100, 200, true);
+        let (snapshot, v1) = shared.cursor_snapshot();
+        assert_eq!((snapshot.x, snapshot.y, snapshot.visible), (100, 200, true));
+        assert_eq!(v1, v0 + 1);
+
+        // 同样的位置不该再涨版本号（避免每帧重绘光标）
+        shared.set_cursor_pos(100, 200, true);
+        assert_eq!(shared.cursor_snapshot().1, v1);
+
+        shared.set_cursor_pos(101, 200, true);
+        assert_eq!(shared.cursor_snapshot().1, v1 + 1);
+
+        let shape = CursorShapeOwned {
+            width: 2,
+            height: 2,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bgra: vec![1u8; 16],
+        };
+        shared.set_cursor_shape(Some(shape));
+        let (snapshot, v2) = shared.cursor_snapshot();
+        assert!(snapshot.shape.is_some());
+        assert_eq!(v2, v1 + 2);
+
+        shared.set_cursor_shape(None);
+        assert!(shared.cursor_snapshot().0.shape.is_none());
+    }
+
+    #[test]
+    fn rtt_roundtrip() {
+        let shared = Shared::new();
+        assert_eq!(shared.rtt_micros(), 0);
+        // 没有 Ping 时收到 Pong：忽略
+        assert!(shared.finish_ping(123).is_none());
+
+        let ts = shared.begin_ping();
+        assert!(shared.now_ms() >= ts, "Ping ts 不应来自未来");
+        let rtt = shared.finish_ping(ts).expect("rtt");
+        assert_eq!(shared.rtt_micros(), rtt);
+        // 重放同一个 Pong 不再更新（这一条 Ping 已经消费掉）
+        assert!(shared.finish_ping(ts).is_none());
+        // 不匹配的 ts 也忽略
+        let _ = shared.begin_ping();
+        assert!(shared.finish_ping(ts.wrapping_add(1)).is_none());
     }
 
     #[test]

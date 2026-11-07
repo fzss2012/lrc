@@ -6,17 +6,14 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use lrc_capture::{CaptureError, Capturer, ScreenInfo};
+use lrc_capture::cursor::CursorWatcher;
+use lrc_capture::{CaptureError, Capturer, Frame, ScreenInfo};
 use lrc_codec::{self, Options};
 use lrc_proto::{
-    auth_reason, frame_flags, AuthResult, BlockEntry, ClientHello, CursorPos, Grid, Message, Pong,
-    Rect, ServerHello, VideoFrame, PROTO_VERSION,
+    auth_reason, frame_flags, AuthResult, BlockEntry, ClientHello, CursorPos, CursorShape, Grid,
+    Message, Pong, Rect, ServerHello, VideoFrame, PROTO_VERSION,
 };
 use lrc_transport::{Conn, ConnReader, ConnWriter};
-use windows::Win32::Foundation::POINT;
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorInfo, GetCursorPos, CURSORINFO, CURSOR_SHOWING,
-};
 
 use crate::auth;
 use crate::cli::Args;
@@ -37,6 +34,9 @@ const IDLE_POLL: Duration = Duration::from_millis(2);
 const MAX_THROTTLE_SLEEP: Duration = Duration::from_millis(20);
 /// 采集器连续重建失败的次数上限，超过就结束这条会话。
 const CAPTURE_REOPEN_TRIES: u32 = 20;
+/// CursorShape 消息的边长上限：lrc-proto 的 MAX_CURSOR_BYTES = 256*256*4，
+/// 超过客户端会解不动（更大会话就断），所以宁可不发形状只发位置。
+const MAX_CURSOR_SHAPE_DIM: u32 = 256;
 
 /// 会话期的共享状态：写端 + 客户端反馈 + 停止标志。
 struct Shared {
@@ -479,7 +479,9 @@ fn capture_loop(
     let mut seq: u32 = 0;
     let mut force_full = true;
     let mut next_grab_at = Instant::now();
-    let mut last_cursor: Option<(i16, i16, bool)> = None;
+    let mut cursor = CursorTracker::new((info.origin_x, info.origin_y), (info.width, info.height));
+    // 最近一帧像素：RequestFull 在静止桌面时靠它补整帧（不 clone，整体换出/换回）
+    let mut cached: Option<Frame> = None;
     let mut slots: Vec<BlockSlot> = Vec::new();
     let mut cand: Vec<u32> = Vec::new();
     let mut rects: Vec<Rect> = Vec::new();
@@ -523,17 +525,16 @@ fn capture_loop(
         let grabbed = capturer.grab();
         let capture_ms = t_cap.elapsed().as_secs_f64() * 1000.0;
 
-        let frame = match grabbed {
-            Ok(Some(f)) => f,
+        let mut has_new_frame = false;
+        match grabbed {
+            Ok(Some(f)) => {
+                has_new_frame = true;
+                // 缓存最近一帧像素（整体换出，不 clone）；RequestFull 静止时用它重发
+                cached = Some(f);
+            }
             Ok(None) => {
-                // 没有任何像素变化：一个字节都不发（零变化零发送的源头）
+                // 没有任何像素变化：一个字节的画面数据都不发（零变化零发送的源头）
                 sec.idle += 1;
-                if let Err(e) = maybe_send_cursor(&shared, &mut last_cursor, &mut sec) {
-                    log_send_failure(&shared, "发送光标", &e);
-                    break;
-                }
-                std::thread::sleep(IDLE_POLL);
-                continue;
             }
             Err(e @ (CaptureError::Lost | CaptureError::Runtime(_))) => {
                 log::warn!("采集出错：{e}");
@@ -550,6 +551,11 @@ fn capture_loop(
                         track = Track::new(fresh_info.width, fresh_info.height).ok_or_else(|| {
                             format!("重建后尺寸非法 {}x{}", fresh_info.width, fresh_info.height)
                         })?;
+                        cached = None;
+                        cursor.set_mapping(
+                            (fresh_info.origin_x, fresh_info.origin_y),
+                            (fresh_info.width, fresh_info.height),
+                        );
                         shared.set_origin((fresh_info.origin_x, fresh_info.origin_y));
                         reopen_failures = 0;
                         log::info!(
@@ -569,17 +575,54 @@ fn capture_loop(
             Err(CaptureError::Init(m)) => return Err(format!("采集初始化失败：{m}")),
         };
 
+        // 整帧请求：有新帧就用新帧；静止桌面（grab 返回 None）用缓存帧补发整帧，
+        // 否则客户端在完全静止时会一直等不到 full 帧。
+        let mut request_full_now = shared.request_full.swap(false, Ordering::Relaxed);
+        if request_full_now && !has_new_frame && cached.is_none() {
+            // 还没抓到过任何像素（刚连上且桌面一直没变）：把请求放回去，下一轮再补
+            shared.request_full.store(true, Ordering::Relaxed);
+            request_full_now = false;
+        }
+        if request_full_now {
+            force_full = true;
+        }
+        let resend_from_cache = request_full_now && !has_new_frame;
+
+        if !has_new_frame && !resend_from_cache {
+            // 静止且没有整帧请求：只转发光标，画面 0 字节
+            if let Err(e) = cursor.poll_and_send(&shared, &mut sec) {
+                log_send_failure(&shared, "发送光标", &e);
+                break;
+            }
+            std::thread::sleep(IDLE_POLL);
+            continue;
+        }
+
+        let Some(frame) = cached.as_ref() else {
+            // 没有像素可用：只转发光标
+            if let Err(e) = cursor.poll_and_send(&shared, &mut sec) {
+                log_send_failure(&shared, "发送光标", &e);
+                break;
+            }
+            std::thread::sleep(IDLE_POLL);
+            continue;
+        };
+
         // 流控：客户端没确认的字节太多 → 丢这一帧、不排队。
         // 这一帧的 dirty rect 已经消费掉了，所以下一帧必须全盘重扫（否则变化块永久丢失）。
         if shared.ack_seen() && shared.inflight_bytes() > MAX_INFLIGHT_BYTES {
             sec.dropped += 1;
             track.scan_all = true;
+            if request_full_now {
+                // 整帧请求没满足，放回去下轮再试
+                shared.request_full.store(true, Ordering::Relaxed);
+            }
             next_grab_at = Instant::now() + frame_interval;
             log::debug!("流控丢帧：未确认字节 {} ", shared.inflight_bytes());
             continue;
         }
 
-        // 分辨率 / 显示切换
+        // 分辨率 / 显示切换（只会发生在新帧上：缓存帧的尺寸就是 track 的尺寸）
         if frame.width != track.width || frame.height != track.height {
             log::info!(
                 "采集尺寸变化 {}x{} → {}x{}，重建块网格",
@@ -590,10 +633,7 @@ fn capture_loop(
             );
             track = Track::new(frame.width, frame.height)
                 .ok_or_else(|| format!("帧尺寸非法 {}x{}", frame.width, frame.height))?;
-        }
-
-        if shared.request_full.swap(false, Ordering::Relaxed) {
-            force_full = true;
+            cursor.set_mapping((info.origin_x, info.origin_y), (frame.width, frame.height));
         }
 
         // 首帧 / 客户端请求整帧 / 刚重建过 → 整帧发，flags 带 FULL|KEY
@@ -638,9 +678,9 @@ fn capture_loop(
         }
 
         if changed.is_empty() {
-            // 采集到了帧，但候选块内容没变：依然一个字节都不发
+            // 采集到了帧，但候选块内容没变：依然一个字节的画面数据都不发
             sec.idle += 1;
-            if let Err(e) = maybe_send_cursor(&shared, &mut last_cursor, &mut sec) {
+            if let Err(e) = cursor.poll_and_send(&shared, &mut sec) {
                 log_send_failure(&shared, "发送光标", &e);
                 break;
             }
@@ -737,6 +777,18 @@ fn capture_loop(
                 track.have_prev = true;
                 track.scan_all = false;
                 force_full = false;
+                if request_full_now {
+                    sec.full_resends += 1;
+                    log::debug!(
+                        "已响应整帧请求（{}，{} 块）",
+                        if resend_from_cache {
+                            "静止桌面用缓存帧"
+                        } else {
+                            "新帧"
+                        },
+                        used
+                    );
+                }
             }
             Err(e) => {
                 log_send_failure(&shared, "发送帧", &e);
@@ -744,7 +796,7 @@ fn capture_loop(
             }
         }
 
-        if let Err(e) = maybe_send_cursor(&shared, &mut last_cursor, &mut sec) {
+        if let Err(e) = cursor.poll_and_send(&shared, &mut sec) {
             log_send_failure(&shared, "发送光标", &e);
             break;
         }
@@ -758,6 +810,14 @@ fn capture_loop(
     } else {
         total.capture_ms_sum / total.frames as f64
     };
+    let cs = cursor.stats();
+    log::info!(
+        "光标轮询 polls={} changes={} shape_captures={} last_shape_us={}",
+        cs.polls,
+        cs.changes,
+        cs.shape_captures,
+        cs.last_shape_capture_us
+    );
     log::info!(
         "会话结束，总计 {} capture_ms_avg={capture_avg:.2}",
         stats::format_summary(&total, session_secs)
@@ -843,52 +903,137 @@ fn norm_hash(h: u64) -> u64 {
     }
 }
 
-/// 光标位置变化才发一条 CursorPos（光标不进码流，DESIGN §2.4）。
-/// 光标位图（Message::CursorShape）按计划留到 M1.5，M1 只用系统光标。
-fn maybe_send_cursor(
-    shared: &Shared,
-    last: &mut Option<(i16, i16, bool)>,
-    sec: &mut Stats,
-) -> io::Result<()> {
-    let Some(cur) = poll_cursor() else {
-        return Ok(());
-    };
-    if *last == Some(cur) {
-        return Ok(());
-    }
-    let payload = Message::CursorPos(CursorPos {
-        x: cur.0,
-        y: cur.1,
-        visible: cur.2,
-    })
-    .encode();
-    shared.send(&payload)?;
-    *last = Some(cur);
-    sec.bytes += payload.len() as u64 + 4;
-    Ok(())
+/// 光标转发：位置/可见性变化发一条 CursorPos，形状真的变了再补一条 CursorShape。
+///
+/// 坐标系：CursorWatcher 给的是**虚拟桌面物理像素**，减掉采集输出原点才是客户端
+/// 需要的"画面本地坐标"；出了采集区域就当不可见（多屏时另一块屏上的光标不该画过来）。
+struct CursorTracker {
+    watcher: CursorWatcher,
+    last_pos: Option<(i16, i16, bool)>,
+    last_shape: Option<Arc<lrc_capture::CursorShape>>,
+    /// 采集输出在虚拟桌面里的原点
+    origin: (i32, i32),
+    /// 采集画面尺寸
+    region: (u32, u32),
 }
 
-/// 读物理像素的光标位置与可见性（main 里已声明 PER_MONITOR_AWARE_V2）。
-fn poll_cursor() -> Option<(i16, i16, bool)> {
-    // SAFETY: 两个调用只写本栈上的结构体，指针来自 &mut。
-    unsafe {
-        let mut pt = POINT::default();
-        if GetCursorPos(&mut pt).is_err() {
-            return None;
+impl CursorTracker {
+    fn new(origin: (i32, i32), region: (u32, u32)) -> Self {
+        Self {
+            watcher: CursorWatcher::new(),
+            last_pos: None,
+            last_shape: None,
+            origin,
+            region,
         }
-        let mut ci = CURSORINFO {
-            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
-            ..Default::default()
+    }
+
+    fn stats(&self) -> lrc_capture::CursorWatcherStats {
+        self.watcher.stats()
+    }
+
+    /// 采集器重建 / 分辨率变化时更新映射口径。
+    fn set_mapping(&mut self, origin: (i32, i32), region: (u32, u32)) {
+        self.origin = origin;
+        self.region = region;
+    }
+
+    /// 主循环每轮调一次；只有真的有变化才发消息（静止时 0 字节）。
+    fn poll_and_send(&mut self, shared: &Shared, sec: &mut Stats) -> io::Result<()> {
+        let Some(state) = self.watcher.poll() else {
+            return Ok(());
         };
-        let visible = match GetCursorInfo(&mut ci) {
-            Ok(()) => (ci.flags.0 & CURSOR_SHOWING.0) != 0 && !ci.hCursor.is_invalid(),
-            Err(_) => true,
-        };
-        Some((clamp_i16(pt.x), clamp_i16(pt.y), visible))
+
+        let ((sx, sy), inside) = map_cursor_pos((state.x, state.y), self.origin, self.region);
+        let pos = (clamp_i16(sx), clamp_i16(sy), state.visible && inside);
+        if self.last_pos != Some(pos) {
+            let payload = Message::CursorPos(CursorPos {
+                x: pos.0,
+                y: pos.1,
+                visible: pos.2,
+            })
+            .encode();
+            shared.send(&payload)?;
+            self.last_pos = Some(pos);
+            sec.cursor_msgs += 1;
+            sec.bytes += payload.len() as u64 + 4;
+        }
+
+        // 形状：Arc 指针变了才是新形状（capture 侧内容没变会复用同一个 Arc）
+        if let Some(shape) = state.shape {
+            let changed = match &self.last_shape {
+                Some(prev) => !Arc::ptr_eq(prev, &shape),
+                None => true,
+            };
+            if changed {
+                self.last_shape = Some(Arc::clone(&shape));
+                if let Some(payload) = encode_cursor_shape(&shape) {
+                    shared.send(&payload)?;
+                    sec.cursor_msgs += 1;
+                    sec.bytes += payload.len() as u64 + 4;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
-/// CursorPos 的 x/y 是 i16：虚拟桌面坐标可能为负，超出就夹紧。
+/// 组 CursorShape 消息。proto 里字段叫 rgba，但内容就是 capture 给的 BGRA，直接塞不转换。
+fn encode_cursor_shape(shape: &lrc_capture::CursorShape) -> Option<Vec<u8>> {
+    let expect = usize::try_from(shape.width)
+        .ok()?
+        .checked_mul(usize::try_from(shape.height).ok()?)?;
+    if shape.width == 0 || shape.height == 0 || expect.checked_mul(4)? != shape.bgra.len() {
+        log::warn!(
+            "光标位图尺寸异常 {}x{} len={}",
+            shape.width,
+            shape.height,
+            shape.bgra.len()
+        );
+        return None;
+    }
+    if shape.width > MAX_CURSOR_SHAPE_DIM || shape.height > MAX_CURSOR_SHAPE_DIM {
+        log::warn!(
+            "光标位图 {}x{} 超过协议上限 {}，只发位置不发形状",
+            shape.width,
+            shape.height,
+            MAX_CURSOR_SHAPE_DIM
+        );
+        return None;
+    }
+    let msg = Message::CursorShape(CursorShape {
+        width: u16::try_from(shape.width).ok()?,
+        height: u16::try_from(shape.height).ok()?,
+        hotspot_x: i16::try_from(shape.hotspot_x).unwrap_or(0),
+        hotspot_y: i16::try_from(shape.hotspot_y).unwrap_or(0),
+        rgba: shape.bgra.as_slice(),
+    });
+    Some(msg.encode())
+}
+
+/// 虚拟桌面的光标坐标 → 采集画面本地坐标 + 是否在画面内。
+///
+/// 在别的屏上时夹到本屏边缘（配合 visible=false，客户端不会画错位置）。
+fn map_cursor_pos(
+    desk: (i32, i32),
+    origin: (i32, i32),
+    region: (u32, u32),
+) -> ((i32, i32), bool) {
+    let local_x = desk.0.saturating_sub(origin.0);
+    let local_y = desk.1.saturating_sub(origin.1);
+    let inside = local_x >= 0
+        && local_y >= 0
+        && (local_x as u32) < region.0
+        && (local_y as u32) < region.1;
+    if inside {
+        return ((local_x, local_y), true);
+    }
+    let max_x = region.0.saturating_sub(1) as i32;
+    let max_y = region.1.saturating_sub(1) as i32;
+    ((local_x.clamp(0, max_x), local_y.clamp(0, max_y)), false)
+}
+
+/// CursorPos 的 x/y 是 i16：本地坐标理论上在屏幕内，夹一下更安全。
 fn clamp_i16(v: i32) -> i16 {
     v.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16
 }
@@ -961,6 +1106,66 @@ mod tests {
         let r = Rect::new(64, 128, 32, 32);
         assert_eq!(pixel_offset(&r, stride), Some(128 * stride + 64 * 4));
         assert_eq!(pixel_offset(&Rect::new(-1, 0, 1, 1), stride), None);
+    }
+
+    #[test]
+    fn cursor_mapping_single_screen() {
+        // 单屏 1920x1080，origin=(0,0)
+        let ((x, y), inside) = map_cursor_pos((100, 200), (0, 0), (1920, 1080));
+        assert_eq!((x, y), (100, 200));
+        assert!(inside);
+        // 右下角最后一个像素仍算在内
+        let ((x, y), inside) = map_cursor_pos((1919, 1079), (0, 0), (1920, 1080));
+        assert_eq!((x, y), (1919, 1079));
+        assert!(inside);
+        // 刚好越界一个像素
+        let ((x, _), inside) = map_cursor_pos((1920, 0), (0, 0), (1920, 1080));
+        assert_eq!(x, 1919);
+        assert!(!inside);
+        let ((_, y), inside) = map_cursor_pos((0, 1080), (0, 0), (1920, 1080));
+        assert_eq!(y, 1079);
+        assert!(!inside);
+    }
+
+    #[test]
+    fn cursor_mapping_second_screen_uses_origin() {
+        // 双屏并排：采集第 2 块屏，origin=(1920,0)
+        let origin = (1920, 0);
+        let region = (1920u32, 1080u32);
+        let ((x, y), inside) = map_cursor_pos((1920, 0), origin, region);
+        assert_eq!((x, y), (0, 0));
+        assert!(inside);
+        let ((x, y), inside) = map_cursor_pos((3839, 1079), origin, region);
+        assert_eq!((x, y), (1919, 1079));
+        assert!(inside);
+        // 光标跑到第 1 块屏 → 本地坐标为负、不在画面内
+        let ((x, y), inside) = map_cursor_pos((1000, 500), origin, region);
+        assert_eq!((x, y), (0, 500));
+        assert!(!inside);
+        // 坐标负得更多也不会溢出
+        let ((x, _), inside) = map_cursor_pos((i32::MIN, 0), origin, region);
+        assert_eq!(x, 0);
+        assert!(!inside);
+    }
+
+    #[test]
+    fn encode_cursor_shape_checks_geometry() {
+        let mk = |w: u32, h: u32| lrc_capture::CursorShape {
+            width: w,
+            height: h,
+            hotspot_x: 1,
+            hotspot_y: 2,
+            bgra: vec![0u8; (w as usize) * (h as usize) * 4],
+        };
+        assert!(encode_cursor_shape(&mk(32, 32)).is_some());
+        assert!(encode_cursor_shape(&mk(256, 256)).is_some());
+        // 超过协议 256 上限：不发形状
+        assert!(encode_cursor_shape(&mk(257, 257)).is_none());
+        // 尺寸为 0 / 长度不匹配：不 panic、返回 None
+        assert!(encode_cursor_shape(&mk(0, 0)).is_none());
+        let mut bad = mk(16, 16);
+        bad.bgra.truncate(4);
+        assert!(encode_cursor_shape(&bad).is_none());
     }
 
     #[test]

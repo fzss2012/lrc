@@ -12,6 +12,8 @@ pub const MSG_VIDEO_FRAME: u8 = 0x10;
 pub const MSG_CURSOR_SHAPE: u8 = 0x11;
 pub const MSG_CURSOR_POS: u8 = 0x12;
 pub const MSG_VIDEO_ACK: u8 = 0x13;
+/// M2 视频通道：一个完整访问单元（一帧可解码码流）
+pub const MSG_VIDEO_AU: u8 = 0x14;
 pub const MSG_INPUT_EVENT: u8 = 0x20;
 pub const MSG_REQUEST_FULL: u8 = 0x30;
 pub const MSG_PING: u8 = 0x40;
@@ -21,6 +23,8 @@ pub const MSG_PONG: u8 = 0x41;
 pub const MAX_BLOCK_BLOB: usize = 1024 * 1024;
 /// 光标位图上限 256×256 RGBA。
 pub const MAX_CURSOR_BYTES: usize = 256 * 256 * 4;
+/// 单个视频访问单元上限（4K 关键帧留余量）。
+pub const MAX_VIDEO_AU: usize = 8 * 1024 * 1024;
 /// 单帧最多块数。
 pub const MAX_BLOCKS_PER_FRAME: usize = 65_535;
 
@@ -93,6 +97,28 @@ impl<'a> VideoFrame<'a> {
     }
 }
 
+/// M2 视频通道的一帧码流（H.264/HEVC 访问单元）。
+///
+/// 与 `VideoFrame`（块增量）互斥：同一时刻一路连接只有一种在跑。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VideoAu<'a> {
+    /// host 采集完成时刻（毫秒，跨端只用差值）
+    pub ts_ms: u32,
+    /// 与 VideoFrame 同一 seq 语义，客户端 ack 用
+    pub seq: u32,
+    /// `crate::codec_tag::H264` 或 `HEVC`
+    pub codec: u8,
+    /// bit0 = keyframe（IDR）
+    pub flags: u8,
+    pub data: &'a [u8],
+}
+
+impl<'a> VideoAu<'a> {
+    pub fn is_key(&self) -> bool {
+        self.flags & 1 != 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorPos {
     pub x: i16,
@@ -144,6 +170,7 @@ pub enum Message<'a> {
     AuthRequest(AuthRequest),
     AuthResult(AuthResult),
     VideoFrame(VideoFrame<'a>),
+    VideoAu(VideoAu<'a>),
     CursorShape(CursorShape<'a>),
     CursorPos(CursorPos),
     VideoAck(FrameAck),
@@ -161,6 +188,7 @@ impl<'a> Message<'a> {
             Message::AuthRequest(_) => MSG_AUTH_REQUEST,
             Message::AuthResult(_) => MSG_AUTH_RESULT,
             Message::VideoFrame(_) => MSG_VIDEO_FRAME,
+            Message::VideoAu(_) => MSG_VIDEO_AU,
             Message::CursorShape(_) => MSG_CURSOR_SHAPE,
             Message::CursorPos(_) => MSG_CURSOR_POS,
             Message::VideoAck(_) => MSG_VIDEO_ACK,
@@ -209,6 +237,13 @@ impl<'a> Message<'a> {
                     w.u8(entry.codec);
                     w.blob(entry.data);
                 }
+            }
+            Message::VideoAu(au) => {
+                w.u32(au.ts_ms);
+                w.u32(au.seq);
+                w.u8(au.codec);
+                w.u8(au.flags);
+                w.blob(au.data);
             }
             Message::CursorShape(shape) => {
                 w.u16(shape.width);
@@ -284,6 +319,13 @@ impl<'a> Message<'a> {
                     entries,
                 })
             }
+            MSG_VIDEO_AU => Message::VideoAu(VideoAu {
+                ts_ms: r.u32()?,
+                seq: r.u32()?,
+                codec: r.u8()?,
+                flags: r.u8()?,
+                data: r.blob(MAX_VIDEO_AU)?,
+            }),
             MSG_CURSOR_SHAPE => {
                 let width = r.u16()?;
                 let height = r.u16()?;
@@ -427,6 +469,29 @@ mod tests {
         let ping = Message::Ping(Ping { ts_ms: 1_234 });
         let buf = ping.encode();
         assert_eq!(Message::decode(&buf).expect("decode"), ping);
+    }
+
+    #[test]
+    fn roundtrip_video_au() {
+        let data = [0x42u8; 64];
+        let au = Message::VideoAu(VideoAu {
+            ts_ms: 1_234_567,
+            seq: 9,
+            codec: crate::codec_tag::HEVC,
+            flags: 1,
+            data: &data,
+        });
+        let buf = au.encode();
+        let decoded = Message::decode(&buf).expect("decode");
+        assert_eq!(decoded, au);
+        match decoded {
+            Message::VideoAu(a) => {
+                assert!(a.is_key());
+                assert_eq!(a.codec, crate::codec_tag::HEVC);
+                assert_eq!(a.data.len(), 64);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

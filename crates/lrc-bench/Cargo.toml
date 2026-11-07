@@ -15,7 +15,3 @@ xxhash-rust.workspace = true
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
-# 仅用于「全无损 / 全 JPEG」策略对比：bench 内复刻 lrc-codec 的容器格式，
-# 并与真实 codec 输出做逐字节交叉校验。
-zstd.workspace = true
-jpeg-encoder.workspace = true

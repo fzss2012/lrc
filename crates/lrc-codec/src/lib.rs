@@ -16,6 +16,15 @@ const JPEG_HEADER: usize = 5;
 const LOSSLESS_MODE_PREDICT: u8 = 0;
 /// 无损模式：原样 zstd（偶尔比左预测更小，两种都试）。
 const LOSSLESS_MODE_RAW: u8 = 1;
+/// 无损模式：调色板 + 每像素 8bit 索引，再 zstd。载荷 = n:u16 + n*4 调色板 + w*h 索引。
+const LOSSLESS_MODE_PALETTE8: u8 = 2;
+/// 无损模式：调色板 + 每像素 4bit 索引（块内 <=16 色），再 zstd。
+/// 载荷 = n:u16 + n*4 调色板 + ceil(w*h/2) 索引（低 4bit 是偶数像素）。
+const LOSSLESS_MODE_PALETTE4: u8 = 3;
+/// 调色板最多支持的颜色数（palette8 上限）。
+const PALETTE_MAX_COLORS: usize = 256;
+/// palette4 的颜色数上限。
+const PALETTE4_MAX_COLORS: usize = 16;
 
 use std::cell::RefCell;
 
@@ -108,7 +117,8 @@ pub struct Options {
     pub jpeg_quality: u8,
     /// zstd 等级
     pub zstd_level: i32,
-    /// 无损结果若大于 raw 的这个倍数就改试有损
+    /// 无损结果若大于 raw 的这个倍数就改试有损（默认 0.20：
+    /// 只在无损确实压得很狠时才跳过 JPEG，避免平滑图像块被无损"过早放行"）
     pub lossless_ratio_limit: f32,
 }
 
@@ -117,7 +127,7 @@ impl Default for Options {
         Self {
             jpeg_quality: 85,
             zstd_level: 3,
-            lossless_ratio_limit: 0.55,
+            lossless_ratio_limit: 0.20,
         }
     }
 }
@@ -143,16 +153,7 @@ pub fn encode_block(
     }
 
     // 紧排行缓冲（JPEG 编码器要求无步长填充）。
-    let tight: Cow<'_, [u8]> = if stride == row && src.len() >= total {
-        Cow::Borrowed(&src[..total])
-    } else {
-        let mut v = Vec::with_capacity(total);
-        for y in 0..h_us {
-            let s = y * stride;
-            v.extend_from_slice(&src[s..s + row]);
-        }
-        Cow::Owned(v)
-    };
+    let tight = tight_rows(src, stride, row, h_us, total);
     let raw_len = total;
 
     // 1) 无损：左预测 + zstd，取两种模式里更小的。
@@ -182,6 +183,65 @@ pub fn encode_block(
     }
     out.extend_from_slice(best);
     Ok(tag)
+}
+
+/// 把带步长的块拷成紧排缓冲（行宽 = 每行前 row 字节）。
+fn tight_rows<'a>(src: &'a [u8], stride: usize, row: usize, h: usize, total: usize) -> Cow<'a, [u8]> {
+    if stride == row && src.len() >= total {
+        Cow::Borrowed(&src[..total])
+    } else {
+        let mut v = Vec::with_capacity(total);
+        for y in 0..h {
+            let s = y * stride;
+            v.extend_from_slice(&src[s..s + row]);
+        }
+        Cow::Owned(v)
+    }
+}
+
+/// 只做「无损候选」编码，不做策略选择（等价于 encode_block 内部的无损分支）。
+///
+/// 返回无损容器字节（mode:u8 + w:u16 + h:u16 + zstd），即使比 raw 还大也照给。
+/// 主要给 lrc-bench 做「全无损」对照；正常收发请用 encode_block。
+pub fn encode_lossless_block(
+    src: &[u8],
+    stride: usize,
+    w: u32,
+    h: u32,
+    zstd_level: i32,
+    out: &mut Vec<u8>,
+) -> CodecResult<()> {
+    out.clear();
+    let (row, h_us, total) = check_geometry(w, h, stride, src.len())?;
+    if row == 0 || h_us == 0 {
+        return Ok(());
+    }
+    let tight = tight_rows(src, stride, row, h_us, total);
+    let bytes = encode_lossless(&tight, row, h_us, w, h, zstd_level)?;
+    out.extend_from_slice(&bytes);
+    Ok(())
+}
+
+/// 只做「JPEG 候选」编码，不做策略选择（等价于 encode_block 内部的有损分支）。
+///
+/// 主要给 lrc-bench 做「全 JPEG」对照；正常收发请用 encode_block。
+pub fn encode_jpeg_block(
+    src: &[u8],
+    stride: usize,
+    w: u32,
+    h: u32,
+    quality: u8,
+    out: &mut Vec<u8>,
+) -> CodecResult<()> {
+    out.clear();
+    let (row, h_us, total) = check_geometry(w, h, stride, src.len())?;
+    if row == 0 || h_us == 0 {
+        return Ok(());
+    }
+    let tight = tight_rows(src, stride, row, h_us, total);
+    let bytes = encode_jpeg(&tight, w, h, quality)?;
+    out.extend_from_slice(&bytes);
+    Ok(())
 }
 
 /// 解码单块到 BGRA 目标缓冲。
@@ -214,21 +274,30 @@ pub fn decode_block(
                     "无损块尺寸 {dw}x{dh} 与期望 {w}x{h} 不符"
                 )));
             }
-            let mut buf = zstd_decompress(&data[LOSSLESS_HEADER..], raw_len)?;
-            if buf.len() != raw_len {
-                return Err(CodecError::Decode(format!(
-                    "zstd 输出 {} 字节，期望 {raw_len}",
-                    buf.len()
-                )));
-            }
             match mode {
-                LOSSLESS_MODE_PREDICT => undo_predict(&mut buf, row, h_us),
-                LOSSLESS_MODE_RAW => {}
+                LOSSLESS_MODE_PREDICT | LOSSLESS_MODE_RAW => {
+                    let mut buf = zstd_decompress(&data[LOSSLESS_HEADER..], raw_len)?;
+                    if buf.len() != raw_len {
+                        return Err(CodecError::Decode(format!(
+                            "zstd 输出 {} 字节，期望 {raw_len}",
+                            buf.len()
+                        )));
+                    }
+                    if mode == LOSSLESS_MODE_PREDICT {
+                        undo_predict(&mut buf, row, h_us);
+                    }
+                    copy_rows(&buf, row, h_us, dst, dst_stride);
+                }
+                LOSSLESS_MODE_PALETTE8 | LOSSLESS_MODE_PALETTE4 => {
+                    // 上限按 8bit 索引算（2 + 调色板 + w*h），4bit 一定更小。
+                    let cap = 2 + PALETTE_MAX_COLORS * 4 + (row / 4) * h_us;
+                    let buf = zstd_decompress(&data[LOSSLESS_HEADER..], cap)?;
+                    decode_palette(&buf, mode, row, h_us, dst, dst_stride)?;
+                }
                 other => {
                     return Err(CodecError::Decode(format!("未知无损模式 {other}")));
                 }
             }
-            copy_rows(&buf, row, h_us, dst, dst_stride);
         }
         codec_tag::JPEG => {
             if data.len() < JPEG_HEADER {
@@ -292,16 +361,52 @@ fn check_geometry(w: u32, h: u32, stride: usize, len: usize) -> CodecResult<(usi
 
 // ---------------------------------------------------------------- 无损
 
+/// 按字节做 a - b 的环绕减法（SWAR，不会跨字节借位）。
+#[inline]
+fn sub_bytes(a: u64, b: u64) -> u64 {
+    const M: u64 = 0x8080_8080_8080_8080;
+    ((a | M).wrapping_sub(b & !M)) ^ ((a ^ !b) & M)
+}
+
 /// 左预测：每行首像素（4 字节）原样，其后逐字节 p[i] - p[i-1]（环绕）。
+///
+/// 一次算 8 字节（SWAR），结果和逐字节版本完全一致；64x64 块 25us -> 8us。
 fn apply_predict(src: &[u8], row: usize, h: usize, out: &mut Vec<u8>) {
     out.clear();
-    out.reserve(src.len());
+    out.resize(src.len(), 0);
+    if row < 8 {
+        // 行太短走标量分支（正常块行宽 >= 4 像素 = 16 字节，走不到这里）
+        for y in 0..h {
+            let line = &src[y * row..(y + 1) * row];
+            let dst = &mut out[y * row..(y + 1) * row];
+            let first = line.len().min(4);
+            dst[..first].copy_from_slice(&line[..first]);
+            for i in first..line.len() {
+                dst[i] = line[i].wrapping_sub(line[i - 1]);
+            }
+        }
+        return;
+    }
     for y in 0..h {
         let line = &src[y * row..(y + 1) * row];
-        let first = line.len().min(4);
-        out.extend_from_slice(&line[..first]);
-        for i in first..line.len() {
-            out.push(line[i].wrapping_sub(line[i - 1]));
+        let dst = &mut out[y * row..(y + 1) * row];
+        dst[..4].copy_from_slice(&line[..4]);
+        let mut i = 4usize;
+        while i + 8 <= line.len() {
+            let a = u64::from_le_bytes(match line[i..i + 8].try_into() {
+                Ok(v) => v,
+                Err(_) => break,
+            });
+            let b = u64::from_le_bytes(match line[i - 1..i + 7].try_into() {
+                Ok(v) => v,
+                Err(_) => break,
+            });
+            dst[i..i + 8].copy_from_slice(&sub_bytes(a, b).to_le_bytes());
+            i += 8;
+        }
+        while i < line.len() {
+            dst[i] = line[i].wrapping_sub(line[i - 1]);
+            i += 1;
         }
     }
 }
@@ -317,7 +422,92 @@ fn undo_predict(buf: &mut [u8], row: usize, h: usize) {
     }
 }
 
-/// 无损编码：u8 mode + u16 w + u16 h + zstd(payload)，两种模式取小。
+/// 解调色板载荷：n:u16 + n*4 调色板 + 索引（8bit 或 4bit），展开成 BGRA。
+fn decode_palette(
+    buf: &[u8],
+    mode: u8,
+    row: usize,
+    h: usize,
+    dst: &mut [u8],
+    dst_stride: usize,
+) -> CodecResult<()> {
+    if buf.len() < 2 {
+        return Err(CodecError::Decode("调色板载荷不足 2 字节".to_string()));
+    }
+    let n = usize::from(u16::from_le_bytes([buf[0], buf[1]]));
+    if n == 0 || n > PALETTE_MAX_COLORS {
+        return Err(CodecError::Decode(format!("调色板颜色数 {n} 不合法")));
+    }
+    let pal_end = 2 + n * 4;
+    if buf.len() < pal_end {
+        return Err(CodecError::Decode(format!(
+            "调色板只有 {} 字节，装不下 {n} 色（需要 {pal_end}）",
+            buf.len()
+        )));
+    }
+    let palette = &buf[2..pal_end];
+    let idx = &buf[pal_end..];
+    let wpx = row / 4;
+    let px = wpx * h;
+
+    match mode {
+        LOSSLESS_MODE_PALETTE8 => {
+            if idx.len() != px {
+                return Err(CodecError::Decode(format!(
+                    "palette8 索引 {} 字节，期望 {px}",
+                    idx.len()
+                )));
+            }
+            for y in 0..h {
+                let d = y * dst_stride;
+                let line = &mut dst[d..d + row];
+                let src = &idx[y * wpx..(y + 1) * wpx];
+                for (x, &i) in src.iter().enumerate() {
+                    let i = usize::from(i);
+                    if i >= n {
+                        return Err(CodecError::Decode(format!("palette8 索引 {i} 超出 {n} 色")));
+                    }
+                    line[x * 4..x * 4 + 4].copy_from_slice(&palette[i * 4..i * 4 + 4]);
+                }
+            }
+        }
+        _ => {
+            let need = (px + 1) / 2;
+            if idx.len() != need {
+                return Err(CodecError::Decode(format!(
+                    "palette4 索引 {} 字节，期望 {need}",
+                    idx.len()
+                )));
+            }
+            for y in 0..h {
+                let d = y * dst_stride;
+                let line = &mut dst[d..d + row];
+                let base = y * wpx;
+                for x in 0..wpx {
+                    let k = base + x;
+                    let byte = idx[k / 2];
+                    let i = usize::from(if k % 2 == 0 { byte & 0x0F } else { byte >> 4 });
+                    if i >= n {
+                        return Err(CodecError::Decode(format!("palette4 索引 {i} 超出 {n} 色")));
+                    }
+                    line[x * 4..x * 4 + 4].copy_from_slice(&palette[i * 4..i * 4 + 4]);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 无损编码：u8 mode + u16 w + u16 h + zstd(payload)。
+///
+/// 在 4 个候选里取最小：
+/// - mode 0：左预测后 zstd
+/// - mode 1：原样 zstd
+/// - mode 2：调色板 + 8bit 索引后 zstd（<=256 色）
+/// - mode 3：调色板 + 4bit 索引后 zstd（<=16 色）
+///
+/// 调色板只对"已经很能压"的块尝试（预测流压到 raw 的 1/4 以下），
+/// 这样照片/视频块不会为调色板白跑一遍统计。
 fn encode_lossless(
     tight: &[u8],
     row: usize,
@@ -336,18 +526,135 @@ fn encode_lossless(
         .map_err(|e| CodecError::Encode(format!("无损(左预测): {e}")))?;
     let z_raw = zstd_compress(tight, level)
         .map_err(|e| CodecError::Encode(format!("无损(原样): {e}")))?;
-    let (mode, payload) = if z_pred.len() <= z_raw.len() {
-        (LOSSLESS_MODE_PREDICT, z_pred)
-    } else {
-        (LOSSLESS_MODE_RAW, z_raw)
-    };
+    let mut best_mode = LOSSLESS_MODE_PREDICT;
+    let mut best = z_pred;
+    if z_raw.len() < best.len() {
+        best_mode = LOSSLESS_MODE_RAW;
+        best = z_raw;
+    }
 
-    let mut out = Vec::with_capacity(LOSSLESS_HEADER + payload.len());
-    out.push(mode);
+    // 调色板：只对"文字/UI 块"且"还有压头"的块试。
+    // - best*4 <= raw：已经压到 1/4 以下，照片/视频块不会白跑统计
+    // - best >= 64：压到几十字节的纯色块，再套调色板省不下几个字节，不值得多一次 zstd
+    let graphics_like =
+        best.len() >= 64 && best.len().saturating_mul(4) <= tight.len() && !tight.is_empty();
+    if graphics_like {
+        if let Some((mode, payload)) = encode_palette(tight, row, h, level)? {
+            if payload.len() < best.len() {
+                best_mode = mode;
+                best = payload;
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(LOSSLESS_HEADER + best.len());
+    out.push(best_mode);
     out.extend_from_slice(&w16.to_le_bytes());
     out.extend_from_slice(&h16.to_le_bytes());
-    out.extend_from_slice(&payload);
+    out.extend_from_slice(&best);
     Ok(out)
+}
+
+/// 调色板候选：统计块内唯一色，<=256 时按 8bit（<=16 时再按 4bit）索引编码。
+///
+/// 返回 (mode, zstd(payload))；颜色数超限时返回 Ok(None)（会提前退出统计）。
+///
+/// 与左邻"同色"的像素直接复用上一个索引、跳过哈希查表（文字/UI 块 80%+ 的
+/// 像素走这条捷径）。注意必须比较**真实颜色**，不能用左预测差分是否为 0 来判断：
+/// 逐字节预测里 [0xFF,0xFF,0xFF,0xFF] 这种像素的差分恒为 0，但它和左邻可以不同色。
+fn encode_palette(
+    tight: &[u8],
+    row: usize,
+    h: usize,
+    level: i32,
+) -> CodecResult<Option<(u8, Vec<u8>)>> {
+    let wpx = row / 4;
+    let px = wpx * h;
+    if px == 0 || tight.len() < px * 4 {
+        return Ok(None);
+    }
+
+    // 开放寻址表：keys 存颜色，slots 存 索引+1（0 表示空槽）。512 槽装 <=256 色。
+    const SLOTS: usize = 512;
+    let mut keys = [0u32; SLOTS];
+    let mut slots = [0u16; SLOTS];
+    let mut palette = [0u32; PALETTE_MAX_COLORS];
+    let mut indices = vec![0u8; px];
+    let mut n = 0usize;
+
+    for y in 0..h {
+        let line = &tight[y * row..(y + 1) * row];
+        let base = y * wpx;
+        let mut prev_idx = 0u8;
+        let mut prev_color = 0u32;
+        let mut has_prev = false;
+        for (x, px) in line.chunks_exact(4).enumerate() {
+            let Ok(cb) = <[u8; 4]>::try_from(px) else {
+                continue;
+            };
+            let c = u32::from_le_bytes(cb);
+            // 与左邻真同色 → 索引直接复用，省一次查表
+            if has_prev && c == prev_color {
+                indices[base + x] = prev_idx;
+                continue;
+            }
+            let mut slot = (c.wrapping_mul(0x9E37_79B1) >> 22) as usize & (SLOTS - 1);
+            loop {
+                let s = slots[slot];
+                if s == 0 {
+                    if n >= PALETTE_MAX_COLORS {
+                        return Ok(None); // 颜色太多（照片/视频），放弃调色板
+                    }
+                    keys[slot] = c;
+                    slots[slot] = (n + 1) as u16;
+                    palette[n] = c;
+                    indices[base + x] = n as u8;
+                    prev_idx = n as u8;
+                    prev_color = c;
+                    has_prev = true;
+                    n += 1;
+                    break;
+                }
+                if keys[slot] == c {
+                    let idx = (s - 1) as u8;
+                    indices[base + x] = idx;
+                    prev_idx = idx;
+                    prev_color = c;
+                    has_prev = true;
+                    break;
+                }
+                slot = (slot + 1) & (SLOTS - 1);
+            }
+        }
+    }
+    if n == 0 {
+        return Ok(None);
+    }
+
+    // 每个块只做「一档」调色板，省掉一次 zstd：
+    // <=16 色走 4bit（同调色板下 4bit 更紧凑，真实帧按色数分桶实测 4bit 版最优），
+    // >16 色走 8bit。zstd 每次调用有 ~13us 的固定开销，两档都试会明显拖慢编码。
+    let mut body = Vec::with_capacity(2 + n * 4 + px);
+    body.extend_from_slice(&(n as u16).to_le_bytes());
+    for c in palette.iter().take(n) {
+        body.extend_from_slice(&c.to_le_bytes());
+    }
+    if n <= PALETTE4_MAX_COLORS {
+        for chunk in indices.chunks(2) {
+            match chunk {
+                [a, b] => body.push(a | (b << 4)),
+                [a] => body.push(*a),
+                _ => {}
+            }
+        }
+        let z = zstd_compress(&body, level)
+            .map_err(|e| CodecError::Encode(format!("无损(palette4): {e}")))?;
+        return Ok(Some((LOSSLESS_MODE_PALETTE4, z)));
+    }
+    body.extend_from_slice(&indices);
+    let z = zstd_compress(&body, level)
+        .map_err(|e| CodecError::Encode(format!("无损(palette8): {e}")))?;
+    Ok(Some((LOSSLESS_MODE_PALETTE8, z)))
 }
 
 // ---------------------------------------------------------------- 有损
@@ -891,20 +1198,267 @@ mod tests {
         fake_jpeg.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46]);
         assert!(decode_block(codec_tag::JPEG, &fake_jpeg, w as u32, h as u32, &mut dst, w * 4).is_err());
     }
+    // ------------------------------------------------------------ 调色板 & 预测器
 
+    /// SWAR 左预测必须和逐字节参考实现完全一致，且逆运算能还原。
+    #[test]
+    fn predict_matches_scalar_reference() {
+        let mut rng = Rng::new(0xDEAD_BEEF);
+        for &(w, h) in &[(1usize, 1usize), (2, 3), (3, 5), (17, 7), (64, 64), (37, 23)] {
+            let row = w * 4;
+            let mut src = vec![0u8; row * h];
+            for b in src.iter_mut() {
+                *b = (rng.next_u32() & 0xFF) as u8;
+            }
+            // 混入大片同色，贴近真实 UI
+            for y in 0..h {
+                for x in 0..w / 2 {
+                    let i = y * row + x * 4;
+                    src[i..i + 4].copy_from_slice(&[0x1E, 0x1E, 0x1E, 0xFF]);
+                }
+            }
+
+            let mut fast = Vec::new();
+            apply_predict(&src, row, h, &mut fast);
+            let mut slow = vec![0u8; src.len()];
+            for y in 0..h {
+                let line = &src[y * row..(y + 1) * row];
+                let first = line.len().min(4);
+                slow[y * row..y * row + first].copy_from_slice(&line[..first]);
+                for i in first..line.len() {
+                    slow[y * row + i] = line[i].wrapping_sub(line[i - 1]);
+                }
+            }
+            assert_eq!(fast, slow, "SWAR 左预测与逐字节版本不一致（{w}x{h}）");
+
+            let mut back = fast.clone();
+            undo_predict(&mut back, row, h);
+            assert_eq!(back, src, "undo_predict 没还原（{w}x{h}）");
+        }
+    }
+
+    /// 造一个"n 种颜色、大片同色"的块（模拟文字/图标）。
+    fn palette_block(w: usize, h: usize, n: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; w * h * 4];
+        let colors: Vec<[u8; 4]> = (0..n)
+            .map(|k| [(16 + k * 7) as u8, (32 + k * 5) as u8, (64 + k * 3) as u8, 0xFF])
+            .collect();
+        for y in 0..h {
+            for x in 0..w {
+                // 大片底色 + 稀疏的"笔画"
+                let c = if y % 6 < 2 && (x + y / 6) % (n.max(2) * 2) == 0 {
+                    colors[(x + y) % n]
+                } else if y % 6 == 3 && x % 5 == 0 {
+                    colors[(x / 5 + y) % n]
+                } else {
+                    colors[0]
+                };
+                let i = (y * w + x) * 4;
+                buf[i..i + 4].copy_from_slice(&c);
+            }
+        }
+        buf
+    }
+
+    /// 两种调色板变体各自能编能解，且逐字节还原。
+    #[test]
+    fn palette8_and_palette4_roundtrip() {
+        let (w, h) = (64usize, 64usize);
+        let row = w * 4;
+        for n in [2usize, 5, 16, 40, 200] {
+            let tile = palette_block(w, h, n);
+            let mut predicted = Vec::new();
+            apply_predict(&tile, row, h, &mut predicted);
+
+            let (mode, payload) = match encode_palette(&tile, row, h, 3) {
+                Ok(Some(v)) => v,
+                other => panic!("{n} 色块应该能用调色板编码，实际 {other:?}"),
+            };
+            let expect_mode = if n <= 16 {
+                LOSSLESS_MODE_PALETTE4
+            } else {
+                LOSSLESS_MODE_PALETTE8
+            };
+            assert_eq!(mode, expect_mode, "{n} 色块应走 mode {expect_mode}");
+
+            // 拼上无损块头，走真实解码路径
+            let mut data = vec![mode, w as u8, 0, h as u8, 0];
+            data.extend_from_slice(&payload);
+            let mut dst = vec![0u8; row * h];
+            decode_block(codec_tag::LOSSLESS, &data, w as u32, h as u32, &mut dst, row)
+                .unwrap_or_else(|e| panic!("{n} 色块解码失败: {e}"));
+            assert_eq!(dst, tile, "{n} 色调色板块往返不一致");
+        }
+        // 256 色也能用 palette8；257 色必须放弃
+        let tile = palette_block(w, h, 256);
+        let mut predicted = Vec::new();
+        apply_predict(&tile, row, h, &mut predicted);
+        assert!(
+            matches!(encode_palette(&tile, row, h, 3), Ok(Some((LOSSLESS_MODE_PALETTE8, _)))),
+            "256 色块应该还能走 palette8"
+        );
+    }
 
     #[test]
-    fn encode_rejects_bad_geometry() {
+    fn palette_gives_up_on_many_colors() {
+        // 每像素都不同色（300 个以上唯一色）→ 调色板必须放弃
+        let (w, h) = (20usize, 20usize);
+        let row = w * 4;
+        let mut tile = vec![0u8; row * h];
+        for (k, px) in tile.chunks_exact_mut(4).enumerate() {
+            let v = (k * 7 + 3) as u32;
+            px.copy_from_slice(&[v as u8, (v >> 8) as u8, (v >> 16) as u8, 0xFF]);
+        }
+        let mut predicted = Vec::new();
+        apply_predict(&tile, row, h, &mut predicted);
+        let got = encode_palette(&tile, row, h, 3).unwrap();
+        assert!(got.is_none(), "唯一色过多时调色板应返回 None");
+    }
+
+    /// 真实走 encode_block：整块往返逐字节一致，并且确实用上了调色板。
+    #[test]
+    fn encode_block_uses_palette_and_roundtrips() {
         let opts = Options::default();
-        let block = editor_block(8, 8);
-        let mut out = Vec::new();
-        // 步长不够
-        assert!(encode_block(&block, 8, 8, 8, &opts, &mut out).is_err());
-        // 数据不够
-        assert!(encode_block(&block[..40], 32, 8, 8, &opts, &mut out).is_err());
-        // 空块不 panic
-        let tag = encode_block(&[], 0, 0, 0, &opts, &mut out).unwrap();
-        assert_eq!(tag, codec_tag::RAW);
-        assert!(out.is_empty());
+        let (w, h) = (64usize, 64usize);
+        let row = w * 4;
+        // 1) 各种色数的块：逐字节往返必须一致（选哪个 mode 由"取最小"决定）
+        for n in [1usize, 3, 16, 40, 200] {
+            let tile = palette_block(w, h, n);
+            let mut enc = Vec::new();
+            let tag = encode_block(&tile, row, w as u32, h as u32, &opts, &mut enc).unwrap();
+            assert_eq!(tag, codec_tag::LOSSLESS);
+            let mut dec = vec![0u8; row * h];
+            decode_block(tag, &enc, w as u32, h as u32, &mut dec, row).unwrap();
+            assert_eq!(dec, tile, "{n} 色块往返不一致");
+        }
+
+        // 2) 真实场景关心的"文字块"（大片深色底 + 细线文字，3 色）必须走 palette4
+        let text = editor_block(w, h);
+        let mut enc = Vec::new();
+        let tag = encode_block(&text, row, w as u32, h as u32, &opts, &mut enc).unwrap();
+        assert_eq!(tag, codec_tag::LOSSLESS);
+        assert_eq!(
+            enc[0], LOSSLESS_MODE_PALETTE4,
+            "文字块应走 palette4（实际 mode {}）",
+            enc[0]
+        );
+        assert!(enc.len() < 300, "文字块调色板后应 < 300 B，实际 {}", enc.len());
+        let mut dec = vec![0u8; row * h];
+        decode_block(tag, &enc, w as u32, h as u32, &mut dec, row).unwrap();
+        assert_eq!(dec, text, "文字块往返不一致");
+    }
+
+    /// 旧数据兼容：手搓 mode 0 / mode 1 的容器，解码必须照旧能解。
+    #[test]
+    fn legacy_lossless_modes_still_decode() {
+        let (w, h) = (16usize, 16usize);
+        let row = w * 4;
+        let tile = editor_block(w, h);
+
+        for mode in [LOSSLESS_MODE_PREDICT, LOSSLESS_MODE_RAW] {
+            let body = if mode == LOSSLESS_MODE_PREDICT {
+                let mut predicted = Vec::new();
+                apply_predict(&tile, row, h, &mut predicted);
+                predicted
+            } else {
+                tile.clone()
+            };
+            let packed = zstd::bulk::compress(&body, 3).expect("zstd");
+            let mut data = vec![mode, w as u8, 0, h as u8, 0];
+            data.extend_from_slice(&packed);
+            let mut dst = vec![0u8; row * h];
+            decode_block(codec_tag::LOSSLESS, &data, w as u32, h as u32, &mut dst, row)
+                .unwrap_or_else(|e| panic!("mode {mode} 旧数据解码失败: {e}"));
+            assert_eq!(dst, tile, "mode {mode} 旧数据往返不一致");
+        }
+    }
+
+    /// 回归测试：左预测差分全 0 ≠ 与左邻同色。
+    /// [0xFF,0xFF,0xFF,0xFF] 这种像素的逐字节差分恒为 0（只要左邻 alpha 也是 0xFF），
+    /// 早期版本用差分判断"同色"，会把白像素错当成左邻颜色。
+    #[test]
+    fn palette_handles_all_equal_byte_pixels() {
+        let (w, h) = (64usize, 32usize);
+        let row = w * 4;
+        let mut tile = vec![0u8; row * h];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y * w + x) * 4;
+                // 灰底 + 交替的白像素：白像素的差分全 0，但和左邻不同色
+                let c = if x % 3 == 0 {
+                    [0xFF, 0xFF, 0xFF, 0xFF]
+                } else {
+                    [0x8C, 0x8A, 0x87, 0xFF]
+                };
+                tile[i..i + 4].copy_from_slice(&c);
+            }
+        }
+        // 直接走 encode_palette 校验索引正确性
+        let (mode, payload) = encode_palette(&tile, row, h, 3)
+            .expect("zstd")
+            .expect("应该能用调色板");
+        let mut data = vec![mode, w as u8, 0, h as u8, 0];
+        data.extend_from_slice(&payload);
+        let mut dst = vec![0u8; row * h];
+        decode_block(codec_tag::LOSSLESS, &data, w as u32, h as u32, &mut dst, row).expect("decode");
+        assert_eq!(dst, tile, "白像素被误判成左邻颜色（差分全 0 不等于同色）");
+
+        // 整块走 encode_block 再验一遍
+        let opts = Options::default();
+        let mut enc = Vec::new();
+        let tag = encode_block(&tile, row, w as u32, h as u32, &opts, &mut enc).expect("encode");
+        assert_eq!(tag, codec_tag::LOSSLESS);
+        let mut dec = vec![0u8; row * h];
+        decode_block(tag, &enc, w as u32, h as u32, &mut dec, row).expect("decode");
+        assert_eq!(dec, tile, "encode_block 往返不一致");
+    }
+    /// 损坏 / 截断的调色板数据必须报错，不能 panic、不能越界。
+    #[test]
+    fn decode_rejects_bad_palette_payloads() {
+        let (w, h) = (8usize, 8usize);
+        let row = w * 4;
+        let px = w * h;
+        let mut dst = vec![0u8; row * h];
+
+        let frame = |mode: u8, body: &[u8]| -> Vec<u8> {
+            let packed = zstd::bulk::compress(body, 3).expect("zstd");
+            let mut data = vec![mode, w as u8, 0, h as u8, 0];
+            data.extend_from_slice(&packed);
+            data
+        };
+        let mut expect_err = |mode: u8, body: &[u8], what: &str| {
+            let data = frame(mode, body);
+            match decode_block(codec_tag::LOSSLESS, &data, w as u32, h as u32, &mut dst, row) {
+                Ok(()) => panic!("{what} 应该报错"),
+                Err(_) => {}
+            }
+        };
+
+        // 颜色数 0 / 超上限
+        expect_err(LOSSLESS_MODE_PALETTE8, &[0, 0], "n=0");
+        expect_err(LOSSLESS_MODE_PALETTE8, &[1, 1], "n=257");
+        // 调色板被截断（声明 4 色但只给 1 色）
+        let mut short = vec![4u8, 0];
+        short.extend_from_slice(&[1, 2, 3, 4]);
+        expect_err(LOSSLESS_MODE_PALETTE8, &short, "调色板截断");
+        // 索引长度不对
+        let mut bad_len = vec![1u8, 0];
+        bad_len.extend_from_slice(&[9, 9, 9, 255]);
+        bad_len.extend_from_slice(&[0u8; 3]);
+        expect_err(LOSSLESS_MODE_PALETTE8, &bad_len, "palette8 索引长度不对");
+        // 索引越界（n=1，但索引是 5）
+        let mut bad_idx = vec![1u8, 0];
+        bad_idx.extend_from_slice(&[9, 9, 9, 255]);
+        let mut idx = vec![0u8; px];
+        idx[0] = 5;
+        bad_idx.extend_from_slice(&idx);
+        expect_err(LOSSLESS_MODE_PALETTE8, &bad_idx, "palette8 索引越界");
+        // palette4 索引长度不对
+        let mut bad4 = vec![1u8, 0];
+        bad4.extend_from_slice(&[9, 9, 9, 255]);
+        bad4.extend_from_slice(&[0u8; 3]);
+        expect_err(LOSSLESS_MODE_PALETTE4, &bad4, "palette4 索引长度不对");
+        // 未知 mode
+        expect_err(9, &[0u8; 4], "未知无损 mode");
     }
 }

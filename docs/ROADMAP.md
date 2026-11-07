@@ -3,15 +3,15 @@
 对齐 `ToDesk-逆向调研与自建远控方案.md` §6.3，但把"验收"落到可测量的命令上。
 **M1 是唯一必须立刻完成的目标**；后面每一条都标了它到底省多少带宽，方便砍。
 
-## M1 最小可用（当前）
+## M1 最小可用（已完成，实测见 docs/MEASUREMENTS.md）
 
-- [ ] DXGI 采集 + dirty rect（`lrc-capture`）
-- [ ] 64×64 块哈希差分（`lrc-host`）
-- [ ] 文字块无损（zstd+左预测）/ 图像块 JPEG，逐块取小（`lrc-codec`）
-- [ ] TCP 长度前缀传输 + ack 流控（`lrc-transport`）
-- [ ] SendInput 输入回放（`lrc-host`）
-- [ ] 主控端窗口 + 呈现 + 输入转发（`lrc-client`/`lrc-render`）
-- [ ] 光标位置独立消息 + 本地合成
+- [x] DXGI 采集 + dirty rect（`lrc-capture`）
+- [x] 64×64 块哈希差分（`lrc-host`）
+- [x] 文字块无损（zstd+左预测）/ 图像块 JPEG，逐块取小（`lrc-codec`）
+- [x] TCP 长度前缀传输 + ack 流控（`lrc-transport`）
+- [x] SendInput 输入回放（`lrc-host`）
+- [x] 主控端窗口 + 呈现 + 输入转发（`lrc-client`/`lrc-render`）
+- [x] 光标位置/形状消息（host 发送；客户端本地合成 —— 本轮进行中）
 
 **验收（本机双屏实测）**
 

@@ -309,12 +309,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "env_logger",
- "jpeg-encoder",
  "log",
  "lrc-codec",
  "lrc-proto",
  "xxhash-rust",
- "zstd",
 ]
 
 [[package]]
@@ -393,6 +391,16 @@ dependencies = [
  "log",
  "lrc-proto",
  "thiserror",
+]
+
+[[package]]
+name = "lrc-video"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "log",
+ "lrc-proto",
 ]
 
 [[package]]

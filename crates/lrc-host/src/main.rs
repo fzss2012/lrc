@@ -19,10 +19,6 @@ use std::net::TcpListener;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use windows::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-};
-
 use crate::cli::{Args, Cli};
 
 fn main() -> ExitCode {
@@ -56,10 +52,11 @@ fn main() -> ExitCode {
 }
 
 /// PER_MONITOR_AWARE_V2；失败（例如宿主进程已经设置过）就忽略。
+///
+/// 采集和光标坐标都要求物理像素：不设的话 GetCursorInfo 拿到的是 DPI 虚拟化坐标，
+/// 多屏时 CursorPos 会错位。统一走 lrc-capture 的实现，保证全进程只设一次同一口径。
 fn enable_dpi_awareness() {
-    unsafe {
-        let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    }
+    lrc_capture::set_dpi_aware();
 }
 
 fn init_logger() {

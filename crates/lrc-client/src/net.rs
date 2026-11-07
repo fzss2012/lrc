@@ -20,7 +20,7 @@ use sha2::Sha256;
 use windows::Win32::Security::Cryptography::{BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG};
 
 use crate::cli::Config;
-use crate::state::{BlockUpdate, Shared};
+use crate::state::{BlockUpdate, CursorShapeOwned, Shared};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -184,10 +184,40 @@ fn video_loop(
             Ok(Message::Ping(ping)) => {
                 send(tx, Message::Pong(Pong { ts_ms: ping.ts_ms }).encode());
             }
-            Ok(Message::Pong(_)) => {}
-            Ok(Message::CursorPos(pos)) => log::trace!("CursorPos {pos:?}"),
+            Ok(Message::Pong(pong)) => {
+                if let Some(micros) = shared.finish_ping(pong.ts_ms) {
+                    log::trace!("RTT {:.3} ms", micros as f64 / 1000.0);
+                }
+            }
+            Ok(Message::CursorPos(pos)) => {
+                // 坐标是**被控端帧像素**（与块坐标同一坐标系），y 轴向下
+                shared.set_cursor_pos(i32::from(pos.x), i32::from(pos.y), pos.visible);
+                log::trace!("CursorPos {pos:?}");
+            }
             Ok(Message::CursorShape(shape)) => {
-                log::trace!("CursorShape {}x{}", shape.width, shape.height);
+                // 线上字段叫 rgba，实际是 BGRA（alpha 在第 4 字节）
+                let owned = if shape.width == 0 || shape.height == 0 || shape.rgba.is_empty() {
+                    None
+                } else {
+                    Some(CursorShapeOwned {
+                        width: u32::from(shape.width),
+                        height: u32::from(shape.height),
+                        hotspot_x: i32::from(shape.hotspot_x),
+                        hotspot_y: i32::from(shape.hotspot_y),
+                        bgra: shape.rgba.to_vec(),
+                    })
+                };
+                match &owned {
+                    Some(s) => log::info!(
+                        "光标位图 {}x{} 热点=({},{})",
+                        s.width,
+                        s.height,
+                        s.hotspot_x,
+                        s.hotspot_y
+                    ),
+                    None => log::info!("光标位图被清空（隐藏）"),
+                }
+                shared.set_cursor_shape(owned);
             }
             Ok(Message::ServerHello(hello)) => {
                 if shared.set_remote_size(hello.width, hello.height) {

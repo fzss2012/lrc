@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use lrc_proto::input::mouse_button;
-use lrc_proto::{FrameAck, InputEvent, Message};
+use lrc_proto::{FrameAck, InputEvent, Message, Ping, Rect};
 use lrc_render::Presenter;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
@@ -31,18 +31,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
     MessageBoxW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPos,
     ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_STYLE,
-    GWLP_USERDATA, HICON, IDC_ARROW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MSG, SW_SHOWNORMAL,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    GWLP_USERDATA, HICON, IDC_ARROW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MSG,
+    SetCursor, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WM_CREATE, WM_DESTROY,
+    WM_ERASEBKGND, WM_KEYDOWN,
     WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
     WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
-    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    WM_SETCURSOR, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::cli::Config;
 use crate::mapping;
 use crate::net;
-use crate::state::{BlockUpdate, Shared, WM_APP_FAILURE};
+use crate::state::{BlockUpdate, CursorShapeOwned, Shared, WM_APP_FAILURE};
 
 /// 呈现定时器：8 ms 拉一次脏块队列（≈125 Hz 上限）。
 const TIMER_PRESENT: usize = 1;
@@ -198,23 +199,21 @@ impl SoftCanvas {
         }
     }
 
-    fn blit(&mut self, block: &BlockUpdate) {
-        if block.x < 0 || block.y < 0 || block.w == 0 || block.h == 0 || self.w == 0 {
+    /// 把一块紧排 BGRA（行步长 `src_stride`）贴到 (x, y)，自动裁到画布内。
+    fn blit_rect(&mut self, x: i32, y: i32, w: u32, h: u32, data: &[u8], src_stride: usize) {
+        if x < 0 || y < 0 || w == 0 || h == 0 || self.w == 0 || src_stride == 0 {
             return;
         }
-        let Some(src_stride) = (block.w as usize).checked_mul(4) else {
-            return;
-        };
         let Some(dst_stride) = (self.w as usize).checked_mul(4) else {
             return;
         };
-        let bx = block.x as usize;
-        let by = block.y as usize;
+        let bx = x as usize;
+        let by = y as usize;
         if bx >= self.w as usize || by >= self.h as usize {
             return;
         }
-        let copy_w = (block.w as usize).min(self.w as usize - bx);
-        let copy_h = (block.h as usize).min(self.h as usize - by);
+        let copy_w = (w as usize).min(self.w as usize - bx);
+        let copy_h = (h as usize).min(self.h as usize - by);
         for row in 0..copy_h {
             let Some(src_off) = row.checked_mul(src_stride) else {
                 return;
@@ -226,14 +225,17 @@ impl SoftCanvas {
                 return;
             };
             let bytes = copy_w * 4;
-            let (Some(src_end), Some(dst_end)) = (src_off.checked_add(bytes), dst_off.checked_add(bytes))
+            let (Some(src_end), Some(dst_end)) =
+                (src_off.checked_add(bytes), dst_off.checked_add(bytes))
             else {
                 return;
             };
-            if src_end > block.data.len() || dst_end > self.bgra.len() {
+            let (Some(src), Some(dst)) =
+                (data.get(src_off..src_end), self.bgra.get_mut(dst_off..dst_end))
+            else {
                 return;
-            }
-            self.bgra[dst_off..dst_end].copy_from_slice(&block.data[src_off..src_end]);
+            };
+            dst.copy_from_slice(src);
         }
     }
 
@@ -310,6 +312,12 @@ struct AppState {
     gpu_disabled: bool,
     /// 首帧 FULL 后按被控端宽高比调整过一次客户区
     aspect_fixed: bool,
+    /// 干净的解码帧（被控端像素，BGRA 行连续）—— 光标合成的底图
+    clean: Vec<u8>,
+    /// 光标合成用的临时缓冲（只有矩形与光标有交集时才用）
+    scratch: Vec<u8>,
+    /// 光标本地合成状态
+    cursor: CursorRender,
     stats: Stats,
 }
 
@@ -342,6 +350,9 @@ impl AppState {
             need_present: false,
             gpu_disabled: false,
             aspect_fixed: false,
+            clean: Vec::new(),
+            scratch: Vec::new(),
+            cursor: CursorRender::default(),
             stats: Stats::new(),
         }
     }
@@ -370,8 +381,16 @@ impl AppState {
     fn on_present_timer(&mut self) {
         self.sync_surface();
         self.fit_window_aspect_once();
+        // 1) 解码块先进干净帧（光标不进码流，合成前必须先有"无光标"的底图）
         let blocks = self.shared.take_blocks();
-        self.render(blocks);
+        let mut damage: Vec<Rect> = Vec::with_capacity(blocks.len() + 4);
+        for block in &blocks {
+            self.apply_block_to_clean(block, &mut damage);
+        }
+        // 2) 光标位置/形状/可见性变了：旧包围盒要擦、新包围盒要画
+        self.refresh_cursor(&mut damage);
+        // 3) 逐矩形合成（干净帧 + 光标）并提交
+        self.render(damage);
     }
 
     /// 收到首帧（flags FULL）后，把客户区调成被控端的宽高比。
@@ -508,6 +527,15 @@ impl AppState {
         }
 
         self.surface_size = Some((w, h));
+        // 干净帧缓冲按新尺寸重建（旧内容作废）；光标包围盒也作废，下个 tick 重画。
+        // 末尾多留一行 padding：Presenter::update_block 要求 len >= stride*h，
+        // 而零拷贝提交的窗口切片最后一行的后半段会越过逻辑宽高。
+        let stride = (w as usize).saturating_mul(4);
+        let len = stride.saturating_mul(h as usize + 1);
+        self.clean.clear();
+        self.clean.resize(len, 0);
+        self.scratch.clear();
+        self.cursor.reset();
         self.need_present = true;
         // 旧画面作废（或呈现面重建），向被控端要一帧整屏。
         self.shared.request_full();
@@ -535,33 +563,139 @@ impl AppState {
         }
     }
 
-    /// 把脏块推给呈现面并提交一帧。
-    fn render(&mut self, blocks: Vec<BlockUpdate>) {
-        if blocks.is_empty() && !self.need_present {
+    /// 把一个解码块拷进干净帧，并把它的矩形记入本次要重绘的区域。
+    fn apply_block_to_clean(&mut self, block: &BlockUpdate, damage: &mut Vec<Rect>) {
+        let Some((screen_w, screen_h)) = self.surface_size else {
+            return;
+        };
+        if block.x < 0 || block.y < 0 || block.w == 0 || block.h == 0 {
+            return;
+        }
+        let Some(src_stride) = (block.w as usize).checked_mul(4) else {
+            return;
+        };
+        let Some(dst_stride) = (screen_w as usize).checked_mul(4) else {
+            return;
+        };
+        let bx = block.x as usize;
+        let by = block.y as usize;
+        if bx >= screen_w as usize || by >= screen_h as usize {
+            return;
+        }
+        let copy_w = (block.w as usize).min(screen_w as usize - bx);
+        let copy_h = (block.h as usize).min(screen_h as usize - by);
+        for row in 0..copy_h {
+            let Some(src_off) = row.checked_mul(src_stride) else {
+                return;
+            };
+            let Some(dst_off) = (by + row)
+                .checked_mul(dst_stride)
+                .and_then(|v| v.checked_add(bx * 4))
+            else {
+                return;
+            };
+            let bytes = copy_w * 4;
+            let (Some(src_end), Some(dst_end)) =
+                (src_off.checked_add(bytes), dst_off.checked_add(bytes))
+            else {
+                return;
+            };
+            let (Some(src), Some(dst)) = (
+                block.data.get(src_off..src_end),
+                self.clean.get_mut(dst_off..dst_end),
+            ) else {
+                return;
+            };
+            dst.copy_from_slice(src);
+        }
+        if let Some(rect) = clipped_rect_pixels(
+            block.x,
+            block.y,
+            copy_w as i32,
+            copy_h as i32,
+            (screen_w, screen_h),
+        ) {
+            damage.push(rect);
+        }
+    }
+
+    /// 光标状态变了：把旧包围盒擦回干净帧，并把新包围盒纳入重绘。
+    fn refresh_cursor(&mut self, damage: &mut Vec<Rect>) {
+        let (snapshot, version) = self.shared.cursor_snapshot();
+        if version == self.cursor.version {
+            return;
+        }
+        self.cursor.version = version;
+
+        let Some(screen) = self.surface_size else {
+            // 呈现面还没建好：等 sync_surface 建好后会重置版本号再重画
+            self.cursor.drawn = None;
+            return;
+        };
+        if let Some(old) = self.cursor.drawn.take() {
+            damage.push(old);
+        }
+        self.cursor.shape = snapshot.shape;
+        self.cursor.pos = (snapshot.x, snapshot.y);
+        self.cursor.visible = snapshot.visible;
+        let bbox = self.cursor.bbox(screen);
+        self.cursor.drawn = bbox;
+        if let Some(rect) = bbox {
+            damage.push(rect);
+        }
+        log::trace!(
+            "光标 pos={:?} visible={} size={:?} bbox={bbox:?}",
+            self.cursor.pos,
+            self.cursor.visible,
+            self.cursor.shape.as_ref().map(|s| (s.width, s.height))
+        );
+    }
+
+    /// 把 damage 矩形逐块合成（干净帧 + 光标）并提交。
+    ///
+    /// 没有光标覆盖的矩形直接引用干净帧（零拷贝）；有覆盖的才拷进 scratch 混一次。
+    fn render(&mut self, damage: Vec<Rect>) {
+        if damage.is_empty() && !self.need_present {
             return;
         }
         self.need_present = false;
 
+        let Some((screen_w, screen_h)) = self.surface_size else {
+            return;
+        };
+        let Some(screen_stride) = (screen_w as usize).checked_mul(4) else {
+            return;
+        };
+        if self.clean.len() < screen_stride.saturating_mul(screen_h as usize) {
+            return;
+        }
+
+        let hwnd = self.hwnd;
+        // 分字段借用：surface 要 &mut，其余是只读底图 / 光标状态 / 临时缓冲
+        let clean = &self.clean[..];
+        let cursor = &self.cursor;
+        let scratch = &mut self.scratch;
+
         let mut degrade = false;
         match &mut self.surface {
             Surface::Gpu(presenter) => {
-                let drawn = catch_unwind(AssertUnwindSafe(|| {
-                    for block in &blocks {
-                        let stride = (block.w as usize).saturating_mul(4);
+                let update = catch_unwind(AssertUnwindSafe(|| {
+                    for rect in &damage {
+                        let Some((data, stride)) =
+                            compose_rect(clean, scratch, cursor, screen_stride, *rect)
+                        else {
+                            log::warn!("脏矩形无法合成: {rect:?}");
+                            continue;
+                        };
                         if let Err(e) =
-                            presenter.update_block(block.x, block.y, block.w, block.h, &block.data, stride)
+                            presenter.update_block(rect.x, rect.y, rect.w, rect.h, data, stride)
                         {
-                            log::warn!(
-                                "update_block 失败 ({},{},{:?}): {e}",
-                                block.x,
-                                block.y,
-                                (block.w, block.h)
-                            );
+                            log::warn!("update_block 失败 {rect:?}: {e}");
                         }
                     }
                     presenter.present()
                 }));
-                match drawn {
+                match update {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => {
                         log::warn!("present 失败: {e}");
@@ -574,14 +708,19 @@ impl AppState {
                 }
             }
             Surface::Gdi(canvas) => {
-                for block in &blocks {
-                    canvas.blit(block);
+                for rect in &damage {
+                    let Some((data, stride)) =
+                        compose_rect(clean, scratch, cursor, screen_stride, *rect)
+                    else {
+                        continue;
+                    };
+                    canvas.blit_rect(rect.x, rect.y, rect.w, rect.h, data, stride);
                 }
-                let _ = unsafe { InvalidateRect(Some(self.hwnd), None, false) };
+                let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
             }
             Surface::None => {
-                if !blocks.is_empty() {
-                    log::debug!("呈现面未就绪，丢弃 {} 个脏块", blocks.len());
+                if !damage.is_empty() {
+                    log::debug!("呈现面未就绪，丢弃 {} 个脏矩形", damage.len());
                 }
             }
         }
@@ -632,6 +771,9 @@ impl AppState {
                 recv_bytes: self.shared.recv_bytes.load(Ordering::Relaxed),
             };
             let _ = self.out_tx.send(Message::VideoAck(ack).encode());
+            // RTT：每秒一个 Ping，Pong 回来算最近一次往返（loopback 亚毫秒级）
+            let ts = self.shared.begin_ping();
+            let _ = self.out_tx.send(Message::Ping(Ping { ts_ms: ts }).encode());
         }
         if self.shared.take_want_full() {
             log::debug!("请求整帧");
@@ -657,9 +799,15 @@ impl AppState {
         }
         let fps = dframes as f64 / dt;
         let kbps = dbytes as f64 * 8.0 / 1000.0 / dt;
+        let rtt_ms = self.shared.rtt_micros() as f64 / 1000.0;
         // 每秒一行，便于重定向到文件后逐行看
-        println!("fps={fps:.0} recv_kbps={kbps:.1} decoded_blocks={blocks}");
+        println!("fps={fps:.0} recv_kbps={kbps:.1} decoded_blocks={blocks} rtt_ms={rtt_ms:.3}");
         let _ = std::io::stdout().flush();
+    }
+
+    /// 是否已经拿到远端光标位图（拿到后就不再画本地系统光标）。
+    fn remote_cursor_active(&self) -> bool {
+        self.cursor.shape.is_some()
     }
 
     // ---- 输入转发 ----
@@ -771,6 +919,187 @@ impl AppState {
     }
 }
 
+/// 光标本地合成状态（只在窗口线程用）。
+#[derive(Default)]
+struct CursorRender {
+    shape: Option<Arc<CursorShapeOwned>>,
+    pos: (i32, i32),
+    visible: bool,
+    /// 已应用的 Shared 光标版本号（变了才重绘）
+    version: u64,
+    /// 当前已经画进呈现面的光标包围盒（被控端像素，已裁到屏幕内）
+    drawn: Option<Rect>,
+}
+
+impl CursorRender {
+    /// 呈现面重建后调用：光标需要重画到新面上。
+    fn reset(&mut self) {
+        self.drawn = None;
+        self.version = 0;
+    }
+
+    /// 光标在**被控端屏幕**上占的矩形（按热点定位，裁到屏幕内）。
+    ///
+    /// 位图按被控端像素 1:1 画进 remote 分辨率的纹理，Presenter 把整张纹理
+    /// 拉伸到客户区时，光标就和画面同比例缩放（等效于屏幕上按 client/remote 缩放），
+    /// 不会出现"光标比画面大/小"的失真。
+    fn bbox(&self, screen: (u32, u32)) -> Option<Rect> {
+        if !self.visible {
+            return None;
+        }
+        let shape = self.shape.as_ref()?;
+        if shape.width == 0 || shape.height == 0 {
+            return None;
+        }
+        let needed = (shape.width as usize)
+            .checked_mul(shape.height as usize)
+            .and_then(|n| n.checked_mul(4))?;
+        if shape.bgra.len() < needed {
+            return None;
+        }
+        let left = self.pos.0.checked_sub(shape.hotspot_x)?;
+        let top = self.pos.1.checked_sub(shape.hotspot_y)?;
+        clipped_rect_pixels(left, top, shape.width as i32, shape.height as i32, screen)
+    }
+
+    /// 把光标像素按 alpha 混合进 `dst`（`rect` 内的紧排 BGRA，行步长 `dst_stride`）。
+    fn blend_into(&self, rect: &Rect, dst: &mut [u8], dst_stride: usize) {
+        if !self.visible {
+            return;
+        }
+        let Some(shape) = self.shape.as_ref() else {
+            return;
+        };
+        let (Some(left), Some(top)) = (
+            self.pos.0.checked_sub(shape.hotspot_x),
+            self.pos.1.checked_sub(shape.hotspot_y),
+        ) else {
+            return;
+        };
+        let width = shape.width as i32;
+        let height = shape.height as i32;
+        if width <= 0 || height <= 0 {
+            return;
+        }
+        let rect_right = rect.x.saturating_add(rect.w as i32);
+        let rect_bottom = rect.y.saturating_add(rect.h as i32);
+        for py in 0..height {
+            let sy = top + py;
+            if sy < rect.y || sy >= rect_bottom {
+                continue;
+            }
+            for px in 0..width {
+                let sx = left + px;
+                if sx < rect.x || sx >= rect_right {
+                    continue;
+                }
+                let Some(src_off) =
+                    ((py as usize) * (width as usize) + px as usize).checked_mul(4)
+                else {
+                    continue;
+                };
+                let Some(src) = shape.bgra.get(src_off..src_off + 4) else {
+                    continue;
+                };
+                let alpha = u32::from(src[3]);
+                if alpha == 0 {
+                    continue;
+                }
+                let dx = (sx - rect.x) as usize;
+                let dy = (sy - rect.y) as usize;
+                let Some(dst_off) = dy
+                    .checked_mul(dst_stride)
+                    .and_then(|v| v.checked_add(dx.checked_mul(4)?))
+                else {
+                    continue;
+                };
+                let Some(px_dst) = dst.get_mut(dst_off..dst_off + 4) else {
+                    continue;
+                };
+                if alpha == 255 {
+                    px_dst.copy_from_slice(src);
+                } else {
+                    // 直通 alpha 混合；输出 alpha 记 255（纹理不做 alpha 混合）
+                    let inv = 255 - alpha;
+                    for channel in 0..3 {
+                        let fg = u32::from(src[channel]) * alpha;
+                        let bg = u32::from(px_dst[channel]) * inv;
+                        px_dst[channel] = ((fg + bg + 127) / 255) as u8;
+                    }
+                    px_dst[3] = 255;
+                }
+            }
+        }
+    }
+}
+
+/// 把矩形裁到屏幕内（`screen` = 被控端宽高）。
+fn clipped_rect_pixels(x: i32, y: i32, w: i32, h: i32, screen: (u32, u32)) -> Option<Rect> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let left = x.max(0);
+    let top = y.max(0);
+    let right = x.checked_add(w)?.min(screen.0 as i32);
+    let bottom = y.checked_add(h)?.min(screen.1 as i32);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some(Rect::new(
+        left,
+        top,
+        (right - left) as u32,
+        (bottom - top) as u32,
+    ))
+}
+
+/// 取某个脏矩形的提交数据：无光标覆盖时直接返回干净帧切片（零拷贝），
+/// 有覆盖时把干净帧 + 光标合成进 `scratch` 再返回。
+fn compose_rect<'a>(
+    clean: &'a [u8],
+    scratch: &'a mut Vec<u8>,
+    cursor: &CursorRender,
+    screen_stride: usize,
+    rect: Rect,
+) -> Option<(&'a [u8], usize)> {
+    if rect.w == 0 || rect.h == 0 || screen_stride == 0 {
+        return None;
+    }
+    let row = (rect.w as usize).checked_mul(4)?;
+    let cursor_hits = cursor
+        .drawn
+        .map(|bbox| !bbox.intersect(&rect).is_empty())
+        .unwrap_or(false);
+    let x = usize::try_from(rect.x).ok()?;
+    let y = usize::try_from(rect.y).ok()?;
+    if !cursor_hits {
+        let offset = y
+            .checked_mul(screen_stride)?
+            .checked_add(x.checked_mul(4)?)?;
+        // Presenter 要求 bgra.len() >= stride * h（哪怕最后一行只用 row 字节），
+        // clean 末尾预留了一行 padding，所以这里可以整段给到 stride*h。
+        let len = (rect.h as usize).checked_mul(screen_stride)?;
+        let end = offset.checked_add(len)?;
+        return Some((clean.get(offset..end)?, screen_stride));
+    }
+    let len = row.checked_mul(rect.h as usize)?;
+    scratch.clear();
+    scratch.resize(len, 0);
+    for line in 0..rect.h as usize {
+        let src_off = (y + line)
+            .checked_mul(screen_stride)?
+            .checked_add(x.checked_mul(4)?)?;
+        let dst_off = line.checked_mul(row)?;
+        let src_end = src_off.checked_add(row)?;
+        let dst_end = dst_off.checked_add(row)?;
+        let src = clean.get(src_off..src_end)?;
+        let dst = scratch.get_mut(dst_off..dst_end)?;
+        dst.copy_from_slice(src);
+    }
+    cursor.blend_into(&rect, scratch, row);
+    Some((scratch.as_slice(), row))
+}
+
 /// 没有画面时的黑底。
 fn paint_black(hwnd: HWND, client: (u32, u32)) {
     let mut ps = PAINTSTRUCT::default();
@@ -845,6 +1174,14 @@ unsafe extern "system" fn wndproc(
         },
         // 画面/黑底都是自己画的，别让系统再刷一遍背景（D3D 下会闪）。
         WM_ERASEBKGND => return LRESULT(1),
+        // 已经有远端光标位图时隐藏本地系统箭头（光标由我们自己画进画面，避免"双鼠标"）。
+        WM_SETCURSOR => {
+            if app.remote_cursor_active() {
+                let _ = unsafe { SetCursor(None) };
+                return LRESULT(1);
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
         WM_KEYDOWN | WM_SYSKEYDOWN => app.on_key(lparam, true),
         WM_KEYUP | WM_SYSKEYUP => app.on_key(lparam, false),
         WM_MOUSEMOVE => app.on_mouse_move(lparam),
@@ -866,18 +1203,45 @@ unsafe extern "system" fn wndproc(
 mod tests {
     use super::*;
 
+    fn rect(x: i32, y: i32, w: u32, h: u32) -> Rect {
+        Rect::new(x, y, w, h)
+    }
+
+    /// 2x2 光标：左上红、右上绿、左下蓝、右下全透明（BGRA）。
+    fn shape_2x2() -> CursorShapeOwned {
+        let mut bgra = vec![0u8; 16];
+        bgra[0..4].copy_from_slice(&[0, 0, 255, 255]);
+        bgra[4..8].copy_from_slice(&[0, 255, 0, 255]);
+        bgra[8..12].copy_from_slice(&[255, 0, 0, 255]);
+        bgra[12..16].copy_from_slice(&[0, 0, 0, 0]);
+        CursorShapeOwned {
+            width: 2,
+            height: 2,
+            hotspot_x: 0,
+            hotspot_y: 0,
+            bgra,
+        }
+    }
+
+    fn cursor_at(x: i32, y: i32, hotspot: (i32, i32), visible: bool) -> CursorRender {
+        let mut shape = shape_2x2();
+        shape.hotspot_x = hotspot.0;
+        shape.hotspot_y = hotspot.1;
+        CursorRender {
+            shape: Some(Arc::new(shape)),
+            pos: (x, y),
+            visible,
+            version: 1,
+            drawn: None,
+        }
+    }
+
     #[test]
-    fn soft_canvas_blit_clips_to_bounds() {
+    fn soft_canvas_blit_rect_clips_to_bounds() {
         let mut canvas = SoftCanvas::new(4, 2);
-        let block = BlockUpdate {
-            x: 2,
-            y: 0,
-            w: 4,
-            h: 2,
-            data: vec![7u8; 4 * 4 * 2],
-        };
-        canvas.blit(&block);
-        // 只填了最右边 2 列
+        // 4x2 的块放在 x=2：只该吃到右边 2 列
+        let data = vec![7u8; 4 * 4 * 2];
+        canvas.blit_rect(2, 0, 4, 2, &data, 4 * 4);
         assert_eq!(canvas.bgra.len(), 4 * 4 * 2);
         assert_eq!(&canvas.bgra[8..16], &[7u8; 8]);
         assert_eq!(&canvas.bgra[0..8], &[0u8; 8]);
@@ -885,40 +1249,128 @@ mod tests {
     }
 
     #[test]
-    fn soft_canvas_ignores_out_of_range_blocks() {
+    fn soft_canvas_ignores_out_of_range_blits() {
         let mut canvas = SoftCanvas::new(4, 4);
-        let block = BlockUpdate {
-            x: -2,
-            y: 0,
-            w: 4,
-            h: 4,
-            data: vec![1u8; 4 * 4 * 4],
-        };
-        canvas.blit(&block);
+        canvas.blit_rect(-2, 0, 4, 4, &[1u8; 64], 16);
         assert!(canvas.bgra.iter().all(|b| *b == 0));
-
-        let block = BlockUpdate {
-            x: 10,
-            y: 10,
-            w: 4,
-            h: 4,
-            data: vec![1u8; 4 * 4 * 4],
-        };
-        canvas.blit(&block);
+        canvas.blit_rect(10, 10, 4, 4, &[1u8; 64], 16);
         assert!(canvas.bgra.iter().all(|b| *b == 0));
     }
 
     #[test]
     fn soft_canvas_handles_short_input() {
         let mut canvas = SoftCanvas::new(64, 64);
-        let block = BlockUpdate {
-            x: 0,
-            y: 0,
-            w: 64,
-            h: 64,
-            data: vec![9u8; 8], // 数据不够，不能 panic
-        };
-        canvas.blit(&block);
+        // 数据远不够 64x64：不能 panic、也不能越界写
+        canvas.blit_rect(0, 0, 64, 64, &[9u8; 8], 64 * 4);
         assert!(canvas.bgra.iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn cursor_bbox_uses_hotspot_and_clips() {
+        let screen = (1920u32, 1080u32);
+        assert_eq!(cursor_at(10, 20, (0, 0), true).bbox(screen), Some(rect(10, 20, 2, 2)));
+        assert_eq!(cursor_at(10, 20, (1, 1), true).bbox(screen), Some(rect(9, 19, 2, 2)));
+        // 贴右下角：裁成 1x1
+        assert_eq!(
+            cursor_at(1919, 1079, (0, 0), true).bbox(screen),
+            Some(rect(1919, 1079, 1, 1))
+        );
+        // 完全在屏幕外 / 不可见 → 不画
+        assert_eq!(cursor_at(5000, 5000, (0, 0), true).bbox(screen), None);
+        assert_eq!(cursor_at(10, 20, (0, 0), false).bbox(screen), None);
+    }
+
+    #[test]
+    fn cursor_blend_respects_alpha() {
+        let cursor = cursor_at(0, 0, (0, 0), true);
+        // 白底 2x2
+        let mut dst = vec![255u8; 2 * 2 * 4];
+        cursor.blend_into(&rect(0, 0, 2, 2), &mut dst, 8);
+        assert_eq!(&dst[0..4], &[0, 0, 255, 255], "左上应变红");
+        assert_eq!(&dst[4..8], &[0, 255, 0, 255], "右上应变绿");
+        assert_eq!(&dst[8..12], &[255, 0, 0, 255], "左下应变蓝");
+        assert_eq!(&dst[12..16], &[255, 255, 255, 255], "全透明像素保持底色");
+    }
+
+    #[test]
+    fn cursor_blend_semi_transparent() {
+        let mut shape = shape_2x2();
+        // 让左上像素 alpha=128（红色），叠在白底上应得到 ~(255,127,127)
+        shape.bgra[0..4].copy_from_slice(&[0, 0, 255, 128]);
+        let cursor = CursorRender {
+            shape: Some(Arc::new(shape)),
+            pos: (0, 0),
+            visible: true,
+            version: 1,
+            drawn: None,
+        };
+        let mut dst = vec![255u8; 2 * 2 * 4];
+        cursor.blend_into(&rect(0, 0, 2, 2), &mut dst, 8);
+        // 半透明红叠在白底上：R≈255，G/B≈127
+        let (b, g, r) = (dst[0], dst[1], dst[2]);
+        assert!((125..=130).contains(&b), "b={b}");
+        assert!((125..=130).contains(&g), "g={g}");
+        assert!(r >= 250, "r={r}");
+    }
+
+    #[test]
+    fn compose_rect_without_cursor_is_zero_copy() {
+        // 4x4 屏幕，每行 16B；干净帧填 0x11
+        let clean = vec![0x11u8; 4 * 4 * 4];
+        let mut scratch = Vec::new();
+        let cursor = cursor_at(0, 0, (0, 0), false);
+        let (len, stride, all_clean) = {
+            // data 借着 scratch 的生命周期，先算完再放掉
+            let (data, stride) = compose_rect(&clean, &mut scratch, &cursor, 16, rect(1, 1, 2, 2))
+                .expect("compose");
+            (data.len(), stride, data.iter().all(|b| *b == 0x11))
+        };
+        assert_eq!(stride, 16, "无光标时直接用干净帧的 stride");
+        assert_eq!(len, 2 * 16, "两行 * stride（Presenter 要求 len >= stride*h）");
+        assert!(scratch.is_empty(), "不该动用 scratch");
+        assert!(all_clean);
+    }
+
+    #[test]
+    fn compose_rect_with_cursor_blends() {
+        // 干净帧全 0，光标画在 (0,0)
+        let clean = vec![0u8; 4 * 4 * 4];
+        let mut scratch = Vec::new();
+        let mut cursor = cursor_at(0, 0, (0, 0), true);
+        cursor.drawn = Some(rect(0, 0, 2, 2));
+        let (data, stride) = compose_rect(&clean, &mut scratch, &cursor, 16, rect(0, 0, 2, 2))
+            .expect("compose");
+        assert_eq!(stride, 8, "有光标时用紧排 stride");
+        assert_eq!(&data[0..4], &[0, 0, 255, 255]);
+        assert_eq!(&data[4..8], &[0, 255, 0, 255]);
+        assert_eq!(&data[8..12], &[255, 0, 0, 255]);
+        // alpha=0 的像素不写，保留干净帧原值（这里干净帧是 0）
+        assert_eq!(&data[12..16], &[0, 0, 0, 0], "全透明像素保留底色");
+    }
+
+    #[test]
+    fn compose_rect_cursor_elsewhere_is_direct() {
+        // 与真实 clean 一致：末尾多一行 padding
+        let clean = vec![0u8; 4 * 4 * 4 + 16];
+        let mut scratch = Vec::new();
+        let mut cursor = cursor_at(0, 0, (0, 0), true);
+        cursor.drawn = Some(rect(0, 0, 2, 2));
+        // 光标在 (0,0)，别处的脏矩形应该零拷贝
+        let (_, stride) =
+            compose_rect(&clean, &mut scratch, &cursor, 16, rect(2, 2, 2, 2)).expect("compose");
+        assert_eq!(stride, 16);
+        assert!(scratch.is_empty());
+    }
+
+    #[test]
+    fn clipped_rect_pixels_clips_to_screen() {
+        assert_eq!(clipped_rect_pixels(0, 0, 4, 4, (4, 4)), Some(rect(0, 0, 4, 4)));
+        assert_eq!(
+            clipped_rect_pixels(3, 3, 4, 4, (4, 4)),
+            Some(rect(3, 3, 1, 1))
+        );
+        assert_eq!(clipped_rect_pixels(-2, -2, 4, 4, (4, 4)), Some(rect(0, 0, 2, 2)));
+        assert_eq!(clipped_rect_pixels(10, 10, 4, 4, (4, 4)), None);
+        assert_eq!(clipped_rect_pixels(0, 0, 0, 0, (4, 4)), None);
     }
 }
