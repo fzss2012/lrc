@@ -25,6 +25,9 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_MOVE_RECT,
 };
 
+pub mod cursor;
+
+pub use cursor::{CursorShape, CursorState, CursorWatcher, CursorWatcherStats};
 pub use lrc_proto::Rect;
 
 /// dirty 面积超过屏幕的这个百分比就当成整帧。
@@ -74,6 +77,9 @@ pub struct FrameDebug {
     pub readback_full: bool,
     /// 本帧实际回读的像素数（整帧或脏区并集）
     pub readback_px: u64,
+    /// 累计：「有元数据但解析不出 dirty/move 矩形」而被迫整帧的帧数（正常应恒为 0，
+    /// 一旦非 0 说明线上某个驱动在丢元数据，需要换 GDI 兜底或放宽策略）
+    pub no_rect_frames: u64,
     /// 各阶段耗时（微秒）：查元数据 / CopyResource / Map / 逐行拷贝 / Unmap
     pub meta_us: u64,
     pub copy_us: u64,
@@ -270,8 +276,14 @@ pub struct Capturer {
     tex_h: u32,
     tex_format: DXGI_FORMAT,
     desktop_in_system_memory: bool,
-    /// 常驻全量底图（局部回读时只贴变化区，Frame 返回的是它的快照）
+    /// 常驻全量底图（局部回读时只贴变化区，Frame 返回的是它的快照）。
+    ///
+    /// TODO(M2): 每次 grab 返回 Frame 都要 clone 一次全屏（1080p = 8 MB memcpy，
+    /// 30fps 就有 240 MB/s 纯拷贝）。M2 换成双缓冲（mem::replace + 调用方 drop 后归还），
+    /// 或给 Frame 增加"只带脏区像素"的增量视图，彻底免掉全屏搬运。
     full_buf: Vec<u8>,
+    /// no_rect_frames 的累计值
+    no_rect_count: u64,
     /// 脏区回读用的 staging（尺寸 = 脏区并集，按需重建）
     region_tex: Option<ID3D11Texture2D>,
     region_w: u32,
@@ -383,6 +395,7 @@ impl Capturer {
             region_tex: None,
             region_w: 0,
             region_h: 0,
+            no_rect_count: 0,
             debug: FrameDebug::default(),
         })
     }
@@ -394,6 +407,23 @@ impl Capturer {
     /// 上一帧的 DXGI 诊断信息（probe / 调优用）。
     pub fn last_debug(&self) -> FrameDebug {
         self.debug
+    }
+
+    /// 桌面纹理尺寸是否变了（分辨率 / 模式切换）。这是唯一不看元数据的"必须整帧"例外。
+    /// 资源为空（纯鼠标更新）时无法判断，按未变处理。
+    fn desktop_dims_changed(&self, resource: Option<&IDXGIResource>, is_first: bool) -> bool {
+        if is_first {
+            return true;
+        }
+        let Some(res) = resource else {
+            return false;
+        };
+        let Ok(texture) = res.cast::<ID3D11Texture2D>() else {
+            return false;
+        };
+        let mut td = D3D11_TEXTURE2D_DESC::default();
+        unsafe { texture.GetDesc(&mut td) };
+        td.Width != self.tex_w || td.Height != self.tex_h
     }
 
     /// 取下一帧。没有新帧时返回 `Ok(None)`（**这是"零变化零发送"的源头**）。
@@ -451,24 +481,49 @@ impl Capturer {
             ..FrameDebug::default()
         };
 
-        // 先看元数据：TotalMetadataBufferSize == 0 时根本不会有 dirty/move rect。
+        // 分辨率/模式变化是不看元数据的例外：这时哪怕没有 dirty rect 也必须整帧重建。
+        let dims_changed = self.desktop_dims_changed(resource.as_ref(), is_first);
+
+        // 【零变化零发送的核心】DXGI 的 TotalMetadataBufferSize 覆盖 dirty/move/pointer 全部可见元数据，
+        // 非首帧为 0 就说明「presented 但没有任何可见变化」→ 直接丢，连 CopyResource 都不做。
+        if !is_first && info.TotalMetadataBufferSize == 0 && !dims_changed {
+            return Ok(None);
+        }
+
         let t_meta = Instant::now();
-        let (dirty, moves) = if info.TotalMetadataBufferSize == 0 && !is_first {
-            (Vec::new(), Vec::new())
-        } else {
-            let hint = info.TotalMetadataBufferSize;
+        let meta_present = info.TotalMetadataBufferSize > 0;
+        let (dirty, moves) = if meta_present {
             (
-                self.query_dirty_rects(sw, sh, hint)?,
-                self.query_move_rects(sw, sh, hint)?,
+                self.query_dirty_rects(sw, sh, info.TotalMetadataBufferSize)?,
+                self.query_move_rects(sw, sh, info.TotalMetadataBufferSize)?,
             )
+        } else {
+            (Vec::new(), Vec::new())
         };
         self.debug.meta_us = t_meta.elapsed().as_micros() as u64;
 
-        // AccumulatedFrames == 0 且首帧已过 ⇒ 这一帧只更新了鼠标/元数据，桌面像素没变。
-        // 直接返回 None：既不 CopyResource，也不产生任何消息（零变化零发送）。
-        if !is_first && info.AccumulatedFrames == 0 && dirty.is_empty() && moves.is_empty() {
+        // AccumulatedFrames == 0 且没有矩形 ⇒ 这一帧只更新了鼠标/元数据，桌面像素没变。
+        if !is_first && info.AccumulatedFrames == 0 && dirty.is_empty() && moves.is_empty() && !dims_changed
+        {
             return Ok(None);
         }
+
+        // 「有元数据却解析不出任何矩形」是异常分支：保守走整帧，但要留痕（否则线上会永远发整屏）。
+        let no_rects = meta_present
+            && !is_first
+            && !dims_changed
+            && dirty.is_empty()
+            && moves.is_empty();
+        if no_rects {
+            self.no_rect_count = self.no_rect_count.saturating_add(1);
+            log::warn!(
+                "capture: 元数据 {} 字节但解析出 0 个 dirty/move 矩形（acc={}），保守整帧，累计 {} 次",
+                info.TotalMetadataBufferSize,
+                info.AccumulatedFrames,
+                self.no_rect_count
+            );
+        }
+        self.debug.no_rect_frames = self.no_rect_count;
 
         let resource = resource
             .ok_or_else(|| CaptureError::Runtime("AcquireNextFrame 未返回桌面资源".into()))?;
@@ -504,13 +559,13 @@ impl Capturer {
         let height = self.tex_h;
         let stride = (width as usize).saturating_mul(4);
 
-        // 判定整帧：首帧 / AccumulatedFrames 过大 / 脏区面积超阈值 / 拿不到脏区（只能保守整帧）。
+        // 判定整帧：首帧 / 分辨率变化 / AccumulatedFrames 过大 / 脏区面积超阈值 / 元数据异常。
         let screen_area = u64::from(width) * u64::from(height);
         let dirty_area: u64 = dirty.iter().map(|r| r.area()).sum();
-        let no_hint = dirty.is_empty() && moves.is_empty();
         let full = is_first
+            || dims_changed
             || info.AccumulatedFrames > FULL_ACCUMULATED_FRAMES
-            || no_hint
+            || no_rects
             || (screen_area > 0
                 && dirty_area.saturating_mul(100) > screen_area * FULL_DIRTY_RATIO_PCT);
 
@@ -815,6 +870,16 @@ impl Capturer {
             }
         }
     }
+}
+
+/// 把当前进程设成 PER_MONITOR_AWARE_V2（物理像素坐标系）。
+///
+/// **采集和光标坐标都要求物理像素**，被控端启动时必须先调一次；已经 aware 或老系统上失败都无害。
+pub fn set_dpi_aware() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
 /// 块哈希（BGRA，按行做 xxh3 再混合）。未变块不参与编码。

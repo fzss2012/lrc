@@ -123,6 +123,19 @@ M1 用纯 Rust jpeg 编码器；M2 换 H.264/HEVC（NVENC 硬编）+ 流式视�
 - 无新帧（超时）→ 直接返回 `None`，不产生任何消息。
 - 兜底：GDI `BitBlt`（老系统/远程桌面嵌套）。
 
+## 4.5 画面缩放口径（钉死）
+
+**Presenter 用 `DXGI_SCALING_STRETCH` 把被控端画面铺满主控端客户区**（不 letterbox），
+因此主控端的鼠标映射必须用**等比拉伸**而不是 letterbox：
+
+```
+remote_x = client_x * remote_w / client_w     (再 clamp 到 [0, remote_w-1])
+remote_y = client_y * remote_h / client_h
+```
+
+另外主控端在收到首帧（flags FULL）后，**把窗口客户区调成被控端的宽高比**（保持当前宽度、按比例算高度），
+这样拉伸失真在常规使用下不存在。非 16:9 被控端（如 1920×1200）也不会点不准。
+
 ## 5. 输入
 
 - 被控端 `SendInput`：鼠标走 `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_MOVE` 以

@@ -19,21 +19,24 @@ use windows::Win32::Foundation::{
     GetLastError, COLORREF, HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, ScreenToClient,
-    StretchDIBits, UpdateWindow, ValidateRect, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, COLOR_WINDOW,
-    DIB_RGB_COLORS, HBRUSH, HGDIOBJ, PAINTSTRUCT, RGBQUAD, SRCCOPY,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetMonitorInfoW, InvalidateRect,
+    MonitorFromWindow, ScreenToClient, StretchDIBits, UpdateWindow, ValidateRect, BITMAPINFO,
+    BITMAPINFOHEADER, BI_RGB, COLOR_WINDOW, DIB_RGB_COLORS, HBRUSH, HGDIOBJ, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, RGBQUAD, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GetClientRect, GetMessageW, GetWindowLongPtrW, KillTimer, LoadCursorW, MessageBoxW,
-    PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, ShowWindow, TranslateMessage,
-    CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWLP_USERDATA, HICON, IDC_ARROW,
-    MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MSG, SW_SHOWNORMAL, WM_CREATE, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER,
-    WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    GetClientRect, GetMessageW, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW,
+    MessageBoxW, PostQuitMessage, RegisterClassW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, GWL_STYLE,
+    GWLP_USERDATA, HICON, IDC_ARROW, MB_ICONERROR, MB_OK, MB_SETFOREGROUND, MSG, SW_SHOWNORMAL,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, WM_CREATE, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_PAINT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
+    WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WINDOW_EX_STYLE, WINDOW_STYLE, WNDCLASSW,
+    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 use crate::cli::Config;
@@ -234,7 +237,7 @@ impl SoftCanvas {
         }
     }
 
-    /// WM_PAINT：黑底 + 等比居中贴图。
+    /// WM_PAINT：黑底 + 拉伸铺满客户区（与 D3D 的 `DXGI_SCALING_STRETCH` 口径一致）。
     unsafe fn paint(&self, hwnd: HWND, client: (u32, u32)) {
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
@@ -251,42 +254,41 @@ impl SoftCanvas {
         FillRect(hdc, &client_rect, brush);
         let _ = DeleteObject(HGDIOBJ(brush.0));
 
-        if self.w > 0 && self.h > 0 && !self.bgra.is_empty() {
-            if let Some((dx, dy, dw, dh)) = mapping::letterbox_rect(client, (self.w, self.h)) {
-                let header = BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: self.w as i32,
-                    // 负高度 = top-down DIB（我们的 BGRA 就是从上往下存的）
-                    biHeight: -(self.h as i32),
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
-                    biSizeImage: 0,
-                    biXPelsPerMeter: 0,
-                    biYPelsPerMeter: 0,
-                    biClrUsed: 0,
-                    biClrImportant: 0,
-                };
-                let info = BITMAPINFO {
-                    bmiHeader: header,
-                    bmiColors: [RGBQUAD::default()],
-                };
-                let _ = StretchDIBits(
-                    hdc,
-                    dx,
-                    dy,
-                    dw,
-                    dh,
-                    0,
-                    0,
-                    self.w as i32,
-                    self.h as i32,
-                    Some(self.bgra.as_ptr() as *const core::ffi::c_void),
-                    &info,
-                    DIB_RGB_COLORS,
-                    SRCCOPY,
-                );
-            }
+        let (dest_w, dest_h) = (client.0 as i32, client.1 as i32);
+        if dest_w > 0 && dest_h > 0 && self.w > 0 && self.h > 0 && !self.bgra.is_empty() {
+            let header = BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: self.w as i32,
+                // 负高度 = top-down DIB（我们的 BGRA 就是从上往下存的）
+                biHeight: -(self.h as i32),
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            };
+            let info = BITMAPINFO {
+                bmiHeader: header,
+                bmiColors: [RGBQUAD::default()],
+            };
+            let _ = StretchDIBits(
+                hdc,
+                0,
+                0,
+                dest_w,
+                dest_h,
+                0,
+                0,
+                self.w as i32,
+                self.h as i32,
+                Some(self.bgra.as_ptr() as *const core::ffi::c_void),
+                &info,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
         }
         let _ = EndPaint(hwnd, &ps);
     }
@@ -306,6 +308,8 @@ struct AppState {
     need_present: bool,
     /// D3D 初始化/呈现已经失败，后续只用 GDI
     gpu_disabled: bool,
+    /// 首帧 FULL 后按被控端宽高比调整过一次客户区
+    aspect_fixed: bool,
     stats: Stats,
 }
 
@@ -337,6 +341,7 @@ impl AppState {
             surface_size: None,
             need_present: false,
             gpu_disabled: false,
+            aspect_fixed: false,
             stats: Stats::new(),
         }
     }
@@ -364,8 +369,107 @@ impl AppState {
 
     fn on_present_timer(&mut self) {
         self.sync_surface();
+        self.fit_window_aspect_once();
         let blocks = self.shared.take_blocks();
         self.render(blocks);
+    }
+
+    /// 收到首帧（flags FULL）后，把客户区调成被控端的宽高比。
+    ///
+    /// 口径见 DESIGN §4.5：画面是"拉伸铺满"客户区的，把客户区比例对齐后
+    /// 常规使用就没有拉伸失真，鼠标也就自然点得准。只做一次。
+    fn fit_window_aspect_once(&mut self) {
+        if self.aspect_fixed || !self.shared.has_first_full_frame() {
+            return;
+        }
+        let Some(remote) = self.shared.remote_size() else {
+            return;
+        };
+        self.aspect_fixed = true;
+
+        let client = self.client_size();
+        if client.0 == 0 || client.1 == 0 {
+            return;
+        }
+        let deviation = mapping::aspect_deviation(client, remote);
+        if deviation <= mapping::ASPECT_TOLERANCE {
+            log::debug!(
+                "客户区 {:?} 与被控端 {:?} 宽高比一致（偏差 {:.2}%），不调整窗口",
+                client,
+                remote,
+                deviation * 100.0
+            );
+            return;
+        }
+
+        // 保持宽度按比例算高，再受显示器工作区限制（减去标题栏/边框占的高度）
+        let max_client_h = self
+            .work_area_height()
+            .map(|work| work.saturating_sub(self.window_chrome_height()))
+            .unwrap_or(0);
+        let new_h = mapping::client_height_for_remote(client.0, remote, max_client_h);
+        if new_h == 0 || new_h == client.1 {
+            return;
+        }
+        log::info!(
+            "首帧后自适应：客户区 {:?} → 宽 {} 高 {new_h}（被控端 {remote:?}，宽高比偏差 {:.2}%）",
+            client,
+            client.0,
+            deviation * 100.0
+        );
+        self.resize_client(client.0, new_h);
+    }
+
+    /// 客户区高度里有多少是窗口边框/标题栏（用于算工作区能容下多高的客户区）。
+    fn window_chrome_height(&self) -> u32 {
+        let (_, client_h) = self.client_size();
+        let mut outer = RECT::default();
+        if unsafe { GetWindowRect(self.hwnd, &mut outer) }.is_err() {
+            return 0;
+        }
+        let outer_h = (outer.bottom - outer.top).max(0) as u32;
+        outer_h.saturating_sub(client_h)
+    }
+
+    /// 窗口所在显示器的工作区高度（物理像素）。
+    fn work_area_height(&self) -> Option<u32> {
+        let monitor = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return None;
+        }
+        Some((info.rcWork.bottom - info.rcWork.top).max(0) as u32)
+    }
+
+    /// 按客户区尺寸设置窗口大小（保持位置）。
+    fn resize_client(&mut self, client_w: u32, client_h: u32) {
+        let style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(self.hwnd, GWL_STYLE) } as u32);
+        let mut frame = RECT {
+            left: 0,
+            top: 0,
+            right: client_w as i32,
+            bottom: client_h as i32,
+        };
+        if unsafe { AdjustWindowRectEx(&mut frame, style, false, WINDOW_EX_STYLE(0)) }.is_err() {
+            return;
+        }
+        let outer_w = frame.right - frame.left;
+        let outer_h = frame.bottom - frame.top;
+        let _ = unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                outer_w,
+                outer_h,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+        self.need_present = true;
     }
 
     /// 被控端尺寸变化时建立/调整呈现面，并请求一帧整屏。
@@ -591,18 +695,28 @@ impl AppState {
 
     fn on_mouse_move(&mut self, lparam: LPARAM) {
         let (cx, cy) = mapping::lparam_xy(lparam.0);
+        // 抓了鼠标后 client 坐标可能是负的/超界的（拖出窗口），这里记录原始值便于排查
+        log::debug!("WM_MOUSEMOVE client=({cx},{cy})");
         match self.remote_point(cx, cy) {
             Some((x, y)) => self.send_input(InputEvent::MouseMove { x, y }),
-            // 还没收到 ServerHello（不知道被控端分辨率）时映射不了，只记录原始坐标。
-            None => log::debug!("WM_MOUSEMOVE client=({cx},{cy})，被控端尺寸未知"),
+            // 还没收到 ServerHello（不知道被控端分辨率）时映射不了。
+            None => log::debug!("WM_MOUSEMOVE 无法映射：被控端尺寸未知"),
         }
     }
 
     fn on_mouse_button(&mut self, button: u8, down: bool, lparam: LPARAM) {
         let (cx, cy) = mapping::lparam_xy(lparam.0);
+        // 远控里"按住拖动到窗口外"太常见：按下时抓鼠标，松开时释放，
+        // 否则 WndProc 收不到客户区外的 WM_MOUSEMOVE，拖动会断。
+        if down {
+            unsafe { SetCapture(self.hwnd) };
+        } else {
+            let _ = unsafe { ReleaseCapture() };
+        }
+        log::debug!("WM_*BUTTON client=({cx},{cy}) button={button} down={down} capture={down}");
         match self.remote_point(cx, cy) {
             Some((x, y)) => self.send_input(InputEvent::MouseButton { button, down, x, y }),
-            None => log::debug!("WM_*BUTTON client=({cx},{cy}) button={button} down={down}，被控端尺寸未知"),
+            None => log::debug!("WM_*BUTTON 无法映射：被控端尺寸未知"),
         }
     }
 

@@ -107,11 +107,8 @@ fn main() {
 }
 
 fn dpi_aware() {
-    use windows::Win32::UI::HiDpi::{
-        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-    };
     // 已经是 DPI aware 或老系统上会失败，都不影响采集
-    let _ = unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    lrc_capture::set_dpi_aware();
 }
 
 /// 适配器 + 每个适配器的输出（判断走的是独显还是软件/远程适配器）。
@@ -260,6 +257,9 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut grab_sum_us: u64 = 0;
     let mut grab_max_us: u64 = 0;
     let mut all_sum_us: u64 = 0;
+    let mut none_sum_us: u64 = 0;
+    let mut none_max_us: u64 = 0;
+    let mut no_rect_total: u64 = 0;
     let mut dirty_total: u64 = 0;
     let mut dirty_max: usize = 0;
     let mut dirty_area_total: u64 = 0;
@@ -292,6 +292,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 let dbg = cap.last_debug();
+                no_rect_total = dbg.no_rect_frames;
                 if dbg.readback_full {
                     readback_full_n += 1;
                 }
@@ -341,6 +342,9 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 nones += 1;
                 none_run += 1;
                 max_none_run = max_none_run.max(none_run);
+                none_sum_us += elapsed;
+                none_max_us = none_max_us.max(elapsed);
+                no_rect_total = cap.last_debug().no_rect_frames;
             }
             Err(CaptureError::Lost) => {
                 eprintln!("[capture-probe] DXGI_ERROR_ACCESS_LOST（需要重建 Capturer）");
@@ -404,6 +408,18 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         "grab() 平均耗时    : {:.0}us (含等待 None 的调用)",
         all_sum_us as f64 / grabs.max(1) as f64
     );
+    println!(
+        "  ├ 有帧 n={frames:<6} : avg {:.0}us  max {}us",
+        if frames > 0 { grab_sum_us as f64 / frames as f64 } else { 0.0 },
+        grab_max_us
+    );
+    println!(
+        "  └ idle(None) n={nones:<5}: avg {:.0}us  max {}us   (--timeout {}ms)",
+        if nones > 0 { none_sum_us as f64 / nones as f64 } else { 0.0 },
+        none_max_us,
+        args.timeout_ms
+    );
+    println!("no_rect_frames     : {no_rect_total}  (有元数据但解析不出矩形的帧数，应为 0)");
     if frames > 0 {
         let n = frames as f64;
         println!(
@@ -473,6 +489,27 @@ fn report_first_frame(frame: &Frame, _args: &Args) {
         "[capture-probe] hash_block 全屏 {count} 块（{}x{}）: {}us",
         frame.width, frame.height, best
     );
+    // 脏区场景：只哈希少量块（host 侧会按脏区限制哈希范围）
+    for n in [1usize, 8, 50] {
+        let n = n.min(count as usize);
+        let mut best_n = u64::MAX;
+        for _ in 0..5 {
+            let t0 = Instant::now();
+            for idx in 0..n as u32 {
+                let Some(r) = grid.block_rect(idx, frame.width, frame.height) else {
+                    continue;
+                };
+                let off = r.y as usize * frame.stride + r.x as usize * 4;
+                std::hint::black_box(hash_block(&frame.bgra[off..], frame.stride, r.w, r.h));
+            }
+            best_n = best_n.min(t0.elapsed().as_micros() as u64);
+        }
+        println!(
+            "[capture-probe] hash_block 仅 {n} 块: {}us ({:.1}us/块)",
+            best_n,
+            best_n as f64 / n.max(1) as f64
+        );
+    }
     let nonzero = hashes.iter().filter(|h| **h != 0).count();
     println!("[capture-probe] 非零块哈希 {nonzero}/{count}");
 }

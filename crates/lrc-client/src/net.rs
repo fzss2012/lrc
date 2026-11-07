@@ -132,6 +132,8 @@ fn receiver_main(
 /// 连接失败时每秒重试一次（窗口还没关就会一直试）。
 fn connect_retry(addr: &str, shared: &Arc<Shared>) -> anyhow::Result<Conn> {
     let mut attempt = 0u32;
+    // 失败日志最多每 10 s 一条，免得一直连不上时刷屏
+    let mut next_log = std::time::Instant::now();
     loop {
         if shared.is_quit() {
             return Err(anyhow::anyhow!("窗口已关闭"));
@@ -143,8 +145,10 @@ fn connect_retry(addr: &str, shared: &Arc<Shared>) -> anyhow::Result<Conn> {
             }
             Err(e) => {
                 attempt = attempt.saturating_add(1);
-                if attempt == 1 || attempt % 10 == 0 {
+                let now = std::time::Instant::now();
+                if now >= next_log {
                     log::warn!("连接 {addr} 失败（第 {attempt} 次）: {e}；1s 后重试");
+                    next_log = now + Duration::from_secs(10);
                 }
                 std::thread::sleep(Duration::from_millis(1000));
             }
@@ -206,6 +210,9 @@ fn handle_frame(frame: &VideoFrame<'_>, shared: &Shared) {
         log::warn!("帧几何非法: block_size/blocks 为 0");
         return;
     };
+    if frame.is_full() {
+        shared.mark_first_full_frame();
+    }
     let (screen_w, screen_h) = match shared.remote_size() {
         Some(size) => size,
         None => {

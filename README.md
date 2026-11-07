@@ -7,32 +7,46 @@
 2. **块级脏区**：64×64 块，未变块不发
 3. **文字无损 / 图像有损逐块分流**：zstd(左预测) ⇄ JPEG，按块自动选小者
 
+## 实测（本机 1080p 双屏，详见 docs/MEASUREMENTS.md）
+
+| 场景 | 实测带宽 |
+|---|---|
+| 完全静止 | **0 B/s** |
+| 连续打字 | **16.8 kbps** |
+| 高速滚动 | 2.4 Mbps |
+| 网页视频流 | 6–50 Mbps（M2 换 H.264 硬编） |
+
 ## 布局
 
 | crate | 职责 |
 |---|---|
 | `lrc-proto` | 线格式（帧/消息/握手/输入事件），无第三方依赖 |
 | `lrc-codec` | 块编码：无损(zstd+左预测) / 有损(JPEG) / raw |
-| `lrc-capture` | Windows DXGI Desktop Duplication 采集 + dirty/move rect + 块哈希 |
-| `lrc-render` | D3D11 呈现 + 光标合成 |
+| `lrc-capture` | Windows DXGI Desktop Duplication 采集 + dirty/move rect + 块哈希 + 光标 |
+| `lrc-render` | D3D11 呈现 |
 | `lrc-transport` | 长度前缀帧收发（TCP 起步，后续 QUIC） |
 | `lrc-host` | 被控端：采集→差分流→编码→发送；回放输入（SendInput） |
 | `lrc-client` | 主控端：窗口 + 收流→解码→呈现；采集本地输入回传 |
+| `lrc-bench` | 离线带宽基准（真实桌面帧 + 五种场景） |
+| `lrc-video` | （M2）NVENC 视频通道 |
 
-设计与线格式见 `docs/DESIGN.md`。
+设计与线格式见 `docs/DESIGN.md`，里程碑见 `docs/ROADMAP.md`。
 
 ## 快速开始
 
 ```powershell
 cargo build --release
 # 被控端（需要能看到桌面/被采集的屏）
-cargo run --release -p lrc-host -- --listen 0.0.0.0:7800 --password 1234
+target\release\lrc-host.exe --listen 0.0.0.0:7800 --password 1234 --display 0 --stats
 # 主控端
-cargo run --release -p lrc-client -- --connect 127.0.0.1:7800 --password 1234
+target\release\lrc-client.exe --connect 127.0.0.1:7800 --password 1234 --stats
 ```
 
-## 验收（M1）
+## 验收脚本
 
-- 局域网 1080p 办公可用（打字/滚动/拖窗口）
-- **静止时 0 字节**（`lrc-host --stats` 输出 idle 期间 sent=0）
-- 办公场景平均码率 ≤ 1.0 Mbps
+```powershell
+scripts\verify-e2e-v2.ps1 -HostDisplay 1 -ObserveSeconds 8     # 像素 + 静止码率
+scripts\measure-phase.ps1 -Mode typing -HostDisplay 1           # 办公场景带宽
+target\release\capture-probe.exe --display 1 --seconds 3 --timeout 0
+cargo run --release -p lrc-bench -- --frames 120
+```

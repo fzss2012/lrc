@@ -9,6 +9,7 @@ members = [
     "crates/lrc-host",
     "crates/lrc-client",
     "crates/lrc-bench",
+    "crates/lrc-video",
 ]
 
 [workspace.package]

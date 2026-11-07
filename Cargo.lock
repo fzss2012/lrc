@@ -309,10 +309,12 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "env_logger",
+ "jpeg-encoder",
  "log",
  "lrc-codec",
  "lrc-proto",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

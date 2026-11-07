@@ -52,6 +52,8 @@ pub struct Shared {
     pub last_seq: AtomicU32,
     /// 队列积压时置位，主线程看到后发 RequestFull
     want_full: AtomicBool,
+    /// 是否已经收到过整帧（flags FULL）—— 主线程据此做一次窗口宽高比自适应
+    first_full_frame: AtomicBool,
     connected: AtomicBool,
     quit: AtomicBool,
     /// 需要弹框并退出的错误（握手失败、连接断开）
@@ -71,6 +73,7 @@ impl Shared {
             recv_bytes: AtomicU64::new(0),
             last_seq: AtomicU32::new(0),
             want_full: AtomicBool::new(false),
+            first_full_frame: AtomicBool::new(false),
             connected: AtomicBool::new(false),
             quit: AtomicBool::new(false),
             failure: Mutex::new(None),
@@ -150,6 +153,16 @@ impl Shared {
     /// 读取并清除"需要整帧"标记。
     pub fn take_want_full(&self) -> bool {
         self.want_full.swap(false, Ordering::Relaxed)
+    }
+
+    /// 收到整帧（flags FULL）时置位：主线程据此做首帧窗口宽高比自适应。
+    pub fn mark_first_full_frame(&self) {
+        self.first_full_frame.store(true, Ordering::SeqCst);
+    }
+
+    /// 是否已经收到过整帧。
+    pub fn has_first_full_frame(&self) -> bool {
+        self.first_full_frame.load(Ordering::SeqCst)
     }
 
     pub fn add_recv_bytes(&self, n: u64) {

@@ -1,0 +1,15 @@
+[package]
+name = "lrc-video"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lrc-video-probe"
+path = "src/bin/lrc-video-probe.rs"
+
+[dependencies]
+lrc-proto.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true

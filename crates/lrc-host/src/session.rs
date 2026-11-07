@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::auth;
 use crate::cli::Args;
 use crate::input;
-use crate::stats::Stats;
+use crate::stats::{self, Stats};
 
 /// 块边长（DESIGN §0：64×64 块）。
 const BLOCK_SIZE: u16 = 64;
@@ -31,7 +31,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(15);
 /// 未确认字节上限（DESIGN §1 的滑动窗口）：超过就丢帧、不排队。
 const MAX_INFLIGHT_BYTES: u64 = 8 * 1024 * 1024;
-/// 没有新帧时的轮询间隔：这是静止时线上 0 字节、CPU 接近 0 的来源。
+/// 没有新帧时的轮询间隔：Ok(None) 后睡一下再 grab（零发送 + 低 CPU 的来源）。
 const IDLE_POLL: Duration = Duration::from_millis(2);
 /// 帧率节流时单次睡眠的上限，保证停止标志/光标能被及时处理。
 const MAX_THROTTLE_SLEEP: Duration = Duration::from_millis(20);
@@ -365,7 +365,18 @@ fn reader_loop(mut reader: ConnReader, shared: Arc<Shared>) {
                 break;
             }
             Err(e) => {
-                if !shared.stop() {
+                // 对端断开的各种表现（含 wire-codec 强调的 UnexpectedEof）都算正常收尾
+                let kind = e.kind();
+                let peer_closed = matches!(
+                    kind,
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::BrokenPipe
+                );
+                if peer_closed || shared.stop() {
+                    log::info!("客户端连接结束（{e}）");
+                } else {
                     log::warn!("读取失败：{e}");
                 }
                 break;
@@ -493,7 +504,7 @@ fn capture_loop(
         if shared.stop() {
             break;
         }
-        report_if_due(args, &mut sec, &mut total, &mut last_report);
+        report_if_due(args, &mut sec, &mut total, &mut last_report, session_start);
 
         // 帧率节流：采集前等待。丢帧不能只丢"发送"，因为 dirty rect 一旦被
         // AcquireNextFrame 消费掉就补不回来了，所以宁可少采。
@@ -741,9 +752,15 @@ fn capture_loop(
     }
 
     total.add(&sec);
+    let session_secs = session_start.elapsed().as_secs_f64();
+    let capture_avg = if total.frames == 0 {
+        0.0
+    } else {
+        total.capture_ms_sum / total.frames as f64
+    };
     log::info!(
-        "会话结束，总计 {}",
-        total.format_line(session_start.elapsed().as_secs_f64())
+        "会话结束，总计 {} capture_ms_avg={capture_avg:.2}",
+        stats::format_summary(&total, session_secs)
     );
     Ok(())
 }
@@ -757,18 +774,28 @@ fn log_send_failure(shared: &Shared, what: &str, e: &io::Error) {
     }
 }
 
-/// 每秒一行统计（--stats）。
-fn report_if_due(args: &Args, sec: &mut Stats, total: &mut Stats, last_report: &mut Instant) {
+/// 每秒一行统计（--stats）。格式见 stats.rs，被 Lead 的验收脚本按 kbps= 抓数。
+fn report_if_due(
+    args: &Args,
+    sec: &mut Stats,
+    total: &mut Stats,
+    last_report: &mut Instant,
+    session_start: Instant,
+) {
     let now = Instant::now();
     let elapsed = now.saturating_duration_since(*last_report);
     if elapsed < Duration::from_secs(1) {
         return;
     }
+    total.add(sec);
     if args.stats {
-        println!("{}", sec.format_line(elapsed.as_secs_f64()));
+        let session_secs = now.saturating_duration_since(session_start).as_secs_f64();
+        println!(
+            "{}",
+            stats::format_line(total, sec, session_secs, elapsed.as_secs_f64())
+        );
         let _ = io::stdout().flush();
     }
-    total.add(sec);
     sec.reset();
     *last_report = now;
 }
@@ -946,15 +973,18 @@ mod tests {
 
     #[test]
     fn stats_line_has_all_keys() {
-        let line = Stats::default().format_line(1.0);
+        let zero = Stats::default();
+        let line = stats::format_line(&zero, &zero, 1.0, 1.0);
         for key in [
+            "t=",
             "fps=",
-            "capture_ms_avg=",
-            "blocks_changed=",
-            "bytes_sent=",
+            "blocks=",
+            "sent_frames=",
+            "bytes=",
             "kbps=",
             "idle_frames=",
             "dropped=",
+            "sec_bytes=",
         ] {
             assert!(line.contains(key), "统计行缺少 {key}: {line}");
         }
