@@ -1,0 +1,12 @@
+[package]
+name = "lrc-capture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lrc-proto.workspace = true
+windows.workspace = true
+xxhash-rust.workspace = true
+log.workspace = true
+thiserror.workspace = true

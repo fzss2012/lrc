@@ -1,0 +1,21 @@
+[package]
+name = "lrc-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lrc-host"
+path = "src/main.rs"
+
+[dependencies]
+lrc-proto.workspace = true
+lrc-codec.workspace = true
+lrc-capture.workspace = true
+lrc-transport.workspace = true
+windows.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+sha2.workspace = true
+hmac.workspace = true

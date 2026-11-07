@@ -1,0 +1,6 @@
+/target
+**/target
+*.pdb
+*.obj
+/tools/**/out
+/captures
