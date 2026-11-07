@@ -6,5 +6,6 @@ license.workspace = true
 
 [dependencies]
 lrc-proto.workspace = true
+lrc-udp.workspace = true
 log.workspace = true
 thiserror.workspace = true

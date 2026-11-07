@@ -10,6 +10,8 @@
 //!   注意它会在调用期间把套接字临时切成非阻塞（返回前恢复）。
 //! - sent_bytes / recv_bytes 统计线上字节数（含 4 字节长度前缀）。
 
+pub mod link;
+
 use std::io::{self, IoSlice, Read, Write};
 use std::net::{TcpListener, TcpStream};
 

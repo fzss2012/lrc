@@ -210,6 +210,33 @@ flags: bit0 = key
 - **DPI**：两端都 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`，
   坐标一律用物理像素，避免"点不准"。
 
+## 5.5 M4：P2P / relay 传输层
+
+目标：**打洞成功时媒体不经过 VPS**（省 100% 中转带宽），打洞失败时无损降级到 relay。
+
+```
+        ┌──────────────┐   ① REGISTER/CONNECT (UDP 7801)   ┌──────────────┐
+        │  被控端 host  │◄────────────────────────────────►│  lrc-relay   │
+        │              │   ② 交换对方公网地址                │  (公网 VPS)   │
+        │              │   ③ 双方同时发包打洞 (punch)         │              │
+        │              │◄════════ direct_udp ═════════════►│              │
+        └──────────────┘                                    └──────┬───────┘
+                ▲                                                   │ ④ 打洞失败
+                └──────────── relay_udp（relay 转发）────────────────┘
+```
+
+- **信令**：`lrc-relay` 服务端（UDP 7801）。房间号 = `--room`，单 host 单 client。
+- **打洞**：relay 把双方公网地址告之对方，两端同时向对方发探测包；收到即判定 direct 成功。
+- **降级**：打洞超时 → 两侧都用 `PeerMode::Relay`，数据包套一层 relay 信封由 VPS 转发。
+- **数据面**：`lrc-udp` 提供"可靠 + 有序 + 消息边界"的 UDP 传输，接口语义与 TCP 版 `lrc-transport` 对齐，
+  上层 `lrc-proto` 的帧不需要任何改动。
+- **路径优先级**：`direct_udp` → `relay_udp` → `tcp`（TCP 作为最终兜底，保留现有链路）。
+- `--stats` 里新增 `path=direct_udp|relay_udp|tcp`、`udp_rtt=`、`udp_loss=`。
+
+**验证方式（本机可复现）**：`lrc-relay` 跑在 127.0.0.1；host/client 用 `--signal 127.0.0.1:7801 --room 1`
+应报 `path=direct_udp`；用 `udp-proxy --loss 5 --delay-ms 20` 夹在中间验收重传；
+强制 relay（`--p2p relay`）验收降级路径。
+
 ## 6. M1 验收
 
 | 项 | 标准 |

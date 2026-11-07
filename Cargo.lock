@@ -397,6 +397,18 @@ name = "lrc-proto"
 version = "0.1.0"
 
 [[package]]
+name = "lrc-relay"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "env_logger",
+ "log",
+ "lrc-proto",
+ "lrc-udp",
+ "thiserror",
+]
+
+[[package]]
 name = "lrc-render"
 version = "0.1.0"
 dependencies = [
@@ -412,6 +424,15 @@ version = "0.1.0"
 dependencies = [
  "log",
  "lrc-proto",
+ "lrc-udp",
+ "thiserror",
+]
+
+[[package]]
+name = "lrc-udp"
+version = "0.1.0"
+dependencies = [
+ "log",
  "thiserror",
 ]
 

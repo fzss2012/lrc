@@ -12,6 +12,8 @@ members = [
     "crates/lrc-video",
     "crates/lrc-adapt",
     "crates/lrc-audio",
+    "crates/lrc-udp",
+    "crates/lrc-relay",
 ]
 
 [workspace.package]
@@ -29,6 +31,8 @@ lrc-transport = { path = "crates/lrc-transport" }
 lrc-video = { path = "crates/lrc-video" }
 lrc-adapt = { path = "crates/lrc-adapt" }
 lrc-audio = { path = "crates/lrc-audio" }
+lrc-udp = { path = "crates/lrc-udp" }
+lrc-relay = { path = "crates/lrc-relay" }
 
 anyhow = "1"
 thiserror = "2"
