@@ -14,6 +14,8 @@ pub const MSG_CURSOR_POS: u8 = 0x12;
 pub const MSG_VIDEO_ACK: u8 = 0x13;
 /// M2 视频通道：一个完整访问单元（一帧可解码码流）
 pub const MSG_VIDEO_AU: u8 = 0x14;
+/// M3 音频通道：一帧 Opus/PCM
+pub const MSG_AUDIO_FRAME: u8 = 0x15;
 pub const MSG_INPUT_EVENT: u8 = 0x20;
 pub const MSG_REQUEST_FULL: u8 = 0x30;
 pub const MSG_PING: u8 = 0x40;
@@ -25,6 +27,8 @@ pub const MAX_BLOCK_BLOB: usize = 1024 * 1024;
 pub const MAX_CURSOR_BYTES: usize = 256 * 256 * 4;
 /// 单个视频访问单元上限（4K 关键帧留余量）。
 pub const MAX_VIDEO_AU: usize = 8 * 1024 * 1024;
+/// 单个音频帧上限（Opus 20ms 通常 <200B；PCM 兜底 48k*2ch*2B*20ms≈3.8KB）。
+pub const MAX_AUDIO_FRAME: usize = 64 * 1024;
 /// 单帧最多块数。
 pub const MAX_BLOCKS_PER_FRAME: usize = 65_535;
 
@@ -119,6 +123,25 @@ impl<'a> VideoAu<'a> {
     }
 }
 
+/// M3 音频通道：一帧编码后的音频（默认 Opus 20ms）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioFrame<'a> {
+    /// 采集时刻（同机用 GetTickCount64，跨机只作参考）
+    pub ts_ms: u32,
+    pub seq: u32,
+    /// bit0 = Opus；bit1 = 裸 PCM s16le（调试用）
+    pub flags: u8,
+    pub sample_rate: u16,
+    pub channels: u8,
+    pub data: &'a [u8],
+}
+
+impl<'a> AudioFrame<'a> {
+    pub fn is_opus(&self) -> bool {
+        self.flags & 1 != 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CursorPos {
     pub x: i16,
@@ -171,6 +194,7 @@ pub enum Message<'a> {
     AuthResult(AuthResult),
     VideoFrame(VideoFrame<'a>),
     VideoAu(VideoAu<'a>),
+    AudioFrame(AudioFrame<'a>),
     CursorShape(CursorShape<'a>),
     CursorPos(CursorPos),
     VideoAck(FrameAck),
@@ -189,6 +213,7 @@ impl<'a> Message<'a> {
             Message::AuthResult(_) => MSG_AUTH_RESULT,
             Message::VideoFrame(_) => MSG_VIDEO_FRAME,
             Message::VideoAu(_) => MSG_VIDEO_AU,
+            Message::AudioFrame(_) => MSG_AUDIO_FRAME,
             Message::CursorShape(_) => MSG_CURSOR_SHAPE,
             Message::CursorPos(_) => MSG_CURSOR_POS,
             Message::VideoAck(_) => MSG_VIDEO_ACK,
@@ -244,6 +269,14 @@ impl<'a> Message<'a> {
                 w.u8(au.codec);
                 w.u8(au.flags);
                 w.blob(au.data);
+            }
+            Message::AudioFrame(af) => {
+                w.u32(af.ts_ms);
+                w.u32(af.seq);
+                w.u8(af.flags);
+                w.u16(af.sample_rate);
+                w.u8(af.channels);
+                w.blob(af.data);
             }
             Message::CursorShape(shape) => {
                 w.u16(shape.width);
@@ -325,6 +358,14 @@ impl<'a> Message<'a> {
                 codec: r.u8()?,
                 flags: r.u8()?,
                 data: r.blob(MAX_VIDEO_AU)?,
+            }),
+            MSG_AUDIO_FRAME => Message::AudioFrame(AudioFrame {
+                ts_ms: r.u32()?,
+                seq: r.u32()?,
+                flags: r.u8()?,
+                sample_rate: r.u16()?,
+                channels: r.u8()?,
+                data: r.blob(MAX_AUDIO_FRAME)?,
             }),
             MSG_CURSOR_SHAPE => {
                 let width = r.u16()?;
@@ -489,6 +530,30 @@ mod tests {
                 assert!(a.is_key());
                 assert_eq!(a.codec, crate::codec_tag::HEVC);
                 assert_eq!(a.data.len(), 64);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_audio_frame() {
+        let data = [0x11u8; 40];
+        let af = Message::AudioFrame(AudioFrame {
+            ts_ms: 999,
+            seq: 3,
+            flags: 1,
+            sample_rate: 48_000,
+            channels: 2,
+            data: &data,
+        });
+        let buf = af.encode();
+        let decoded = Message::decode(&buf).expect("decode");
+        assert_eq!(decoded, af);
+        match decoded {
+            Message::AudioFrame(a) => {
+                assert!(a.is_opus());
+                assert_eq!(a.sample_rate, 48_000);
+                assert_eq!(a.channels, 2);
             }
             other => panic!("unexpected {other:?}"),
         }

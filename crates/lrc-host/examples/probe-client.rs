@@ -30,6 +30,8 @@ struct Opts {
     wiggle: bool,
     /// 第 N 秒发一次 RequestFull（验证静止桌面的整帧兜底）
     request_full_at: Option<f64>,
+    /// 把视频 AU 裸流写到这里，方便事后用 ffmpeg 验证可解码
+    dump_video: Option<String>,
 }
 
 impl Default for Opts {
@@ -43,6 +45,7 @@ impl Default for Opts {
             move_to: None,
             wiggle: false,
             request_full_at: None,
+            dump_video: None,
         }
     }
 }
@@ -67,6 +70,7 @@ fn parse_args() -> Result<Opts, Box<dyn std::error::Error>> {
             "--bad-password" => opts.bad_password = true,
             "--wiggle" => opts.wiggle = true,
             "--request-full-at" => opts.request_full_at = Some(value()?.parse::<f64>()?),
+            "--dump-video" => opts.dump_video = Some(value()?),
             "--move" => {
                 let raw = value()?;
                 let (x, y) = raw
@@ -183,6 +187,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sec_frames = 0usize;
     let mut sec_bytes = 0u64;
     let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+    let mut dump: Option<std::fs::File> = match &opts.dump_video {
+        Some(path) => Some(std::fs::File::create(path)?),
+        None => None,
+    };
 
     // 光标全链路自测状态
     let wiggle_at = [1.0f64, 1.35, 1.7, 2.05];
@@ -195,6 +203,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cursor_at_settle: Option<usize> = None;
     let mut request_full_sent_at: Option<f64> = None;
     let mut full_frames_after_request = 0usize;
+    // 视频通道
+    let mut video_aus = 0u64;
+    let mut video_bytes = 0u64;
+    let mut video_keyframes = 0u64;
+    let mut video_codec = 0u8;
+    let mut video_ts_first: Option<u32> = None;
+    let mut video_ts_last = 0u32;
+    // 采集→客户端收到的延迟（GetTickCount64 低 32 位，同机可用）
+    let mut lat_min = u32::MAX;
+    let mut lat_max = 0u32;
+    let mut lat_sum = 0u64;
+    let mut lat_n = 0u64;
+    let mut sec_video_aus = 0u64;
+    let mut sec_video_bytes = 0u64;
 
     while Instant::now() < deadline && frames < opts.frames {
         if last_ping.elapsed() >= Duration::from_secs(1) {
@@ -282,6 +304,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .encode(),
                         )?;
                     }
+                    Message::VideoAu(au) => {
+                        video_aus += 1;
+                        sec_video_aus += 1;
+                        video_bytes += n as u64;
+                        sec_video_bytes += n as u64;
+                        video_codec = au.codec;
+                        if au.is_key() {
+                            video_keyframes += 1;
+                        }
+                        if video_ts_first.is_none() {
+                            video_ts_first = Some(au.ts_ms);
+                            println!(
+                                "VIDEO_AU first ts_ms={} seq={} codec={} key={} bytes={}",
+                                au.ts_ms,
+                                au.seq,
+                                au.codec,
+                                au.is_key(),
+                                au.data.len()
+                            );
+                        }
+                        if au.ts_ms != 0 {
+                            video_ts_last = au.ts_ms;
+                            // SAFETY: 只读系统计时器
+                            let now = unsafe {
+                                windows::Win32::System::SystemInformation::GetTickCount64()
+                            } as u32;
+                            let lat = now.wrapping_sub(au.ts_ms);
+                            lat_min = lat_min.min(lat);
+                            lat_max = lat_max.max(lat);
+                            lat_sum += u64::from(lat);
+                            lat_n += 1;
+                        }
+                        if let Some(f) = dump.as_mut() {
+                            use std::io::Write as _;
+                            f.write_all(au.data)?;
+                        }
+                    }
                     Message::Pong(_) => {}
                     Message::CursorPos(pos) => {
                         cursor_pos_msgs += 1;
@@ -330,15 +389,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if last_report.elapsed() >= Duration::from_secs(1) {
             let secs = last_report.elapsed().as_secs_f64();
             println!(
-                "recv fps={:.1} bytes/s={} blocks={} frames_total={}",
+                "recv fps={:.1} bytes/s={} blocks={} frames_total={} video_fps={:.1} video_bytes/s={}",
                 sec_frames as f64 / secs,
                 (sec_bytes as f64 / secs) as u64,
                 blocks,
-                frames
+                frames,
+                sec_video_aus as f64 / secs,
+                (sec_video_bytes as f64 / secs) as u64
             );
             last_report = Instant::now();
             sec_frames = 0;
             sec_bytes = 0;
+            sec_video_aus = 0;
+            sec_video_bytes = 0;
         }
     }
 
@@ -350,6 +413,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "CURSOR pos_msgs={cursor_pos_msgs} shape_msgs={cursor_shape_msgs} last_pos={last_cursor_pos:?} shape_geometry_ok={shape_geometry_ok}"
     );
+    println!(
+        "VIDEO aus={video_aus} bytes={video_bytes} keyframes={video_keyframes} codec={video_codec} ts_first={video_ts_first:?} ts_last={video_ts_last} ts_nonzero={}",
+        video_ts_last != 0
+    );
+    if lat_n > 0 {
+        println!(
+            "VIDEO_LAT ms min={} avg={:.1} max={} n={lat_n}（抓帧→客户端收到 AU，同机时钟）",
+            lat_min,
+            lat_sum as f64 / lat_n as f64,
+            lat_max
+        );
+    }
     if let Some(at_settle) = cursor_at_settle {
         println!(
             "CURSOR idle_window pos_msgs_after_settle={} (期望 0)",

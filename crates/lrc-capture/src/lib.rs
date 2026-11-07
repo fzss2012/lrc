@@ -17,7 +17,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_SAMPLE_DESC,
+    DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB, DXGI_MODE_ROTATION,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
@@ -32,6 +33,39 @@ pub use lrc_proto::Rect;
 
 /// dirty 面积超过屏幕的这个百分比就当成整帧。
 const FULL_DIRTY_RATIO_PCT: u64 = 60;
+/// 首帧全零时的重试预算（时间 / 次数，先到者为准）
+const BLANK_RETRY_BUDGET_MS: u64 = 500;
+const BLANK_RETRY_MAX: u32 = 20;
+
+/// 抽样判断一帧是否全零：每 4KB 取 1 字节，再额外看首尾各 4 字节，覆盖全图。
+///
+/// DXGI 刚 `DuplicateOutput` 之后的**第一帧经常是没填充的黑图**（实测约 70% 概率），
+/// 直接发出去客户端就黑屏，而且静止桌面上要等下一次真实变化才恢复。
+pub fn sample_is_blank(buf: &[u8]) -> bool {
+    if buf.is_empty() {
+        return true;
+    }
+    // 小缓冲直接全看
+    if buf.len() <= 64 {
+        return buf.iter().all(|b| *b == 0);
+    }
+    if buf.iter().take(4).any(|b| *b != 0) || buf.iter().rev().take(4).any(|b| *b != 0) {
+        return false;
+    }
+    let mut i = 0usize;
+    while i < buf.len() {
+        if buf[i] != 0 {
+            return false;
+        }
+        i += 4096;
+    }
+    true
+}
+
+/// 桌面纹理必须是 4 字节 BGRA 系；其它（HDR/10bit/浮点）不能按 BGRA 硬拷。
+fn is_bgra8_format(f: DXGI_FORMAT) -> bool {
+    f == DXGI_FORMAT_B8G8R8A8_UNORM || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+}
 /// `AccumulatedFrames` 超过这个值就当成整帧（DXGI 自身的建议阈值）。
 const FULL_ACCUMULATED_FRAMES: u32 = 4;
 
@@ -80,6 +114,10 @@ pub struct FrameDebug {
     /// 累计：「有元数据但解析不出 dirty/move 矩形」而被迫整帧的帧数（正常应恒为 0，
     /// 一旦非 0 说明线上某个驱动在丢元数据，需要换 GDI 兜底或放宽策略）
     pub no_rect_frames: u64,
+    /// 本帧抽样是否全零（首帧全零 = DXGI 桌面图像还没就绪）
+    pub sampled_blank: bool,
+    /// 拿到本帧（首帧）时一共 acquire 了几次；1 = 一次就成功
+    pub first_frame_attempts: u32,
     /// 各阶段耗时（微秒）：查元数据 / CopyResource / Map / 逐行拷贝 / Unmap
     pub meta_us: u64,
     pub copy_us: u64,
@@ -288,6 +326,10 @@ pub struct Capturer {
     region_tex: Option<ID3D11Texture2D>,
     region_w: u32,
     region_h: u32,
+    /// 首帧全零被丢弃重取的累计次数（诊断用）
+    blank_retries: u64,
+    /// 重试期间 AcquireNextFrame 超时的累计次数
+    retry_timeouts: u64,
     debug: FrameDebug,
 }
 
@@ -396,6 +438,8 @@ impl Capturer {
             region_w: 0,
             region_h: 0,
             no_rect_count: 0,
+            blank_retries: 0,
+            retry_timeouts: 0,
             debug: FrameDebug::default(),
         })
     }
@@ -407,6 +451,16 @@ impl Capturer {
     /// 上一帧的 DXGI 诊断信息（probe / 调优用）。
     pub fn last_debug(&self) -> FrameDebug {
         self.debug
+    }
+
+    /// 首帧全零被丢弃重取的累计次数。
+    pub fn blank_retries(&self) -> u64 {
+        self.blank_retries
+    }
+
+    /// 重试期间 AcquireNextFrame 超时的累计次数。
+    pub fn retry_timeouts(&self) -> u64 {
+        self.retry_timeouts
     }
 
     /// 桌面纹理尺寸是否变了（分辨率 / 模式切换）。这是唯一不看元数据的"必须整帧"例外。
@@ -427,38 +481,91 @@ impl Capturer {
     }
 
     /// 取下一帧。没有新帧时返回 `Ok(None)`（**这是"零变化零发送"的源头**）。
+    ///
+    /// 首帧会做**内容有效性检查**：DXGI 刚建好 Duplication 的第一帧经常是没填充的黑图
+    /// （本机实测 70% 仍为全零），直接发出去客户端会黑屏。检测到全零就丢弃重取，
+    /// 最多重试 BLANK_RETRY_MAX 次 / BLANK_RETRY_BUDGET_MS 毫秒；仍不行就告警后照常返回，
+    /// 绝不死等（静止桌面上可能迟迟等不到新帧）。
     pub fn grab(&mut self) -> CaptureResult<Option<Frame>> {
-        let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
-        let mut resource: Option<IDXGIResource> = None;
-        let acquired = unsafe {
-            self.dupl
-                .AcquireNextFrame(self.timeout_ms, &mut info, &mut resource as *mut _)
-        };
-        if let Err(e) = acquired {
-            let code = e.code();
-            if code == DXGI_ERROR_WAIT_TIMEOUT {
-                // 「零变化零发送」的关键：超时不是错误。
-                return Ok(None);
-            }
-            if code == DXGI_ERROR_ACCESS_LOST {
-                return Err(CaptureError::Lost);
-            }
-            return Err(CaptureError::Runtime(format!(
-                "AcquireNextFrame: {}",
-                hr_text(&e)
-            )));
-        }
+        let deadline = Instant::now() + std::time::Duration::from_millis(BLANK_RETRY_BUDGET_MS);
+        let mut attempts: u32 = 0;
+        // 重试期间要是等不到新帧，就把这张（全零的）帧交出去兜底
+        let mut blank_fallback: Option<Frame> = None;
 
-        let built = self.build_frame(&info, resource);
-        // 无论成功与否都必须 ReleaseFrame，否则下一次 AcquireNextFrame 直接失败。
-        match unsafe { self.dupl.ReleaseFrame() } {
-            Ok(()) => built,
-            Err(e) => {
-                log::warn!("capture: ReleaseFrame 失败: {}", hr_text(&e));
-                match built {
-                    Ok(f) => Ok(f),
-                    Err(err) => Err(err),
+        loop {
+            attempts = attempts.saturating_add(1);
+            let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource: Option<IDXGIResource> = None;
+            let acquired = unsafe {
+                self.dupl
+                    .AcquireNextFrame(self.timeout_ms, &mut info, &mut resource as *mut _)
+            };
+            if let Err(e) = acquired {
+                let code = e.code();
+                if code == DXGI_ERROR_WAIT_TIMEOUT {
+                    // 重试中没等到新帧：继续等到预算用完，仍然没有就把兜底帧交出去
+                    if attempts > 1 && attempts < BLANK_RETRY_MAX && Instant::now() < deadline {
+                        self.retry_timeouts = self.retry_timeouts.saturating_add(1);
+                        continue;
+                    }
+                    if let Some(f) = blank_fallback.take() {
+                        log::warn!(
+                            "capture: 首帧连续 {} 次全零且等不到新帧，返回该帧（客户端可能短暂黑屏）",
+                            attempts.saturating_sub(1)
+                        );
+                        return Ok(Some(f));
+                    }
+                    // 「零变化零发送」的关键：超时不是错误。
+                    return Ok(None);
                 }
+                if code == DXGI_ERROR_ACCESS_LOST {
+                    return Err(CaptureError::Lost);
+                }
+                return Err(CaptureError::Runtime(format!(
+                    "AcquireNextFrame: {}",
+                    hr_text(&e)
+                )));
+            }
+
+            let built = self.build_frame(&info, resource);
+            // 无论成功与否都必须 ReleaseFrame，否则下一次 AcquireNextFrame 直接失败。
+            if let Err(e) = unsafe { self.dupl.ReleaseFrame() } {
+                log::warn!("capture: ReleaseFrame 失败: {}", hr_text(&e));
+            }
+
+            match built {
+                Ok(Some(frame)) => {
+                    // 只对整帧（首帧一定是）做全零抽样检查；局部帧因为只贴了脏区，
+                    // 全量化检查没意义（未变化区域本来就该是旧内容）。
+                    let blank = frame.full && sample_is_blank(&frame.bgra);
+                    self.debug.sampled_blank = blank;
+                    self.debug.first_frame_attempts = if self.first_frame {
+                        attempts
+                    } else {
+                        self.debug.first_frame_attempts
+                    };
+                    if blank {
+                        self.blank_retries = self.blank_retries.saturating_add(1);
+                        if attempts < BLANK_RETRY_MAX && Instant::now() < deadline {
+                            log::debug!(
+                                "capture: 首帧全零（第 {} 次 acquire），丢弃重取",
+                                attempts
+                            );
+                            blank_fallback = Some(frame);
+                            continue;
+                        }
+                        log::warn!(
+                            "capture: 连续 {} 次拿到全零桌面图像（累计 {} 次），照常返回；                             若是 HDR/10bit 桌面请检查格式校验日志",
+                            attempts,
+                            self.blank_retries
+                        );
+                    } else if attempts > 1 {
+                        log::info!("capture: 首帧第 {} 次 acquire 才拿到有效图像", attempts);
+                    }
+                    return Ok(Some(frame));
+                }
+                Ok(None) => return Ok(None),
+                Err(err) => return Err(err),
             }
         }
     }
@@ -534,6 +641,18 @@ impl Capturer {
         // 分辨率/格式可能运行期变化（显示器切换、动态缩放），staging 要跟着重建。
         let mut tdesc = D3D11_TEXTURE2D_DESC::default();
         unsafe { texture.GetDesc(&mut tdesc) };
+
+        // 格式校验：HDR/10bit（R10G10B10A2、R16G16B16A16_FLOAT…）绝不能当 4 字节 BGRA 硬拷，
+        // 否则拿到的就是**看起来全零/花屏**的数据。宁可直接报错也不要静默产出坏帧。
+        if !is_bgra8_format(tdesc.Format) {
+            log::error!(
+                "capture: 桌面纹理格式 DXGI_FORMAT({}) 不是 B8G8R8A8_UNORM/_SRGB；请关闭 HDR 或改用 SDR 桌面",
+                tdesc.Format.0
+            );
+            return Err(CaptureError::Unsupported(
+                "桌面纹理格式不是 B8G8R8A8_UNORM 类（HDR/10bit 桌面暂不支持，请切到 SDR）",
+            ));
+        }
         if tdesc.Width != self.tex_w || tdesc.Height != self.tex_h || tdesc.Format != self.tex_format
         {
             log::info!(

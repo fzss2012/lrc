@@ -1,0 +1,16 @@
+[package]
+name = "lrc-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+lrc-proto.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
+anyhow.workspace = true
+log.workspace = true

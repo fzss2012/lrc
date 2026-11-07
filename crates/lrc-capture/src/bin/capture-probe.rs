@@ -267,6 +267,7 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut phase = [0u64; 5]; // meta / copy / map / blit / unmap
     let mut readback_full_n: u64 = 0;
     let mut readback_px_sum: u64 = 0;
+    let mut blank_full_frames: u64 = 0;
     let mut saved = false;
     let mut last_bucket = u64::MAX;
     let t_start = Instant::now();
@@ -286,6 +287,13 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 grab_max_us = grab_max_us.max(elapsed);
                 if first_grab_us == 0 {
                     first_grab_us = elapsed;
+                    let d = cap.last_debug();
+                    println!(
+                        "[capture-probe] 首帧有效性: 抽样全零={} acquire次数={} 丢弃重取累计={}",
+                        d.sampled_blank,
+                        d.first_frame_attempts.max(1),
+                        cap.blank_retries()
+                    );
                     report_first_frame(&frame, args);
                     if args.save {
                         saved = save_frame(&frame, &args.out)?;
@@ -293,6 +301,9 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let dbg = cap.last_debug();
                 no_rect_total = dbg.no_rect_frames;
+                if dbg.sampled_blank {
+                    blank_full_frames += 1;
+                }
                 if dbg.readback_full {
                     readback_full_n += 1;
                 }
@@ -442,8 +453,21 @@ fn run(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             phase[4] as f64 / n
         );
     }
+    println!(
+        "首帧全零重试       : 丢弃 {} 次 / 重试等待超时 {} 次 / 全零整帧 {} 个",
+        cap.blank_retries(),
+        cap.retry_timeouts(),
+        blank_full_frames
+    );
     if saved {
-        println!("首帧已保存         : {}", args.out);
+        // 直接把落盘文件的首字节也验一遍，防止"报告说好的但文件是黑的"
+        let file_blank = std::fs::read(&args.out)
+            .map(|d| lrc_capture::sample_is_blank(&d))
+            .unwrap_or(true);
+        println!(
+            "首帧已保存         : {} (落盘抽样全零={})",
+            args.out, file_blank
+        );
     }
     Ok(())
 }

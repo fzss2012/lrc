@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use lrc_capture::Frame;
-use lrc_proto::{codec_tag, Message, VideoAu};
+use lrc_proto::{Message, VideoAu};
 use lrc_video::{EncoderConfig, FfmpegEncoder, VideoEncoder};
 
 use crate::cli::{Args, VideoChoice};
@@ -72,10 +72,6 @@ impl ModeSwitch {
         self.mode
     }
 
-    pub fn video_available(&self) -> bool {
-        self.video_available
-    }
-
     /// 编码器不可用（探测失败 / 运行期失败）：永久回块模式。
     pub fn disable_video(&mut self) {
         self.video_available = false;
@@ -133,6 +129,8 @@ struct Job {
     frame: Arc<Frame>,
     seq: u32,
     generation: u32,
+    /// 抓帧完成时刻的 GetTickCount64() 低 32 位（客户端用同一时钟算 lat_ms）
+    ts_ms: u32,
 }
 
 /// 编码线程与采集线程共享的状态。
@@ -167,7 +165,6 @@ impl Pipe {
 pub struct VideoPipeline {
     pipe: Arc<Pipe>,
     handle: Option<std::thread::JoinHandle<()>>,
-    codec: u8,
     codec_name: String,
 }
 
@@ -190,7 +187,10 @@ impl VideoPipeline {
     }
 
     /// 把整帧交给编码线程（Arc 复用，不拷贝像素）。邮箱里已有的旧帧会被丢掉。
-    pub fn submit(&self, frame: Arc<Frame>, seq: u32, generation: u32) {
+    ///
+    /// ts_ms 是**抓帧完成时刻**的 GetTickCount64 低 32 位（不是发送时刻）：
+    /// 这样客户端算出的 lat_ms 才包含"排队 + 编码 + 网络 + 解码"的整条管线耗时。
+    pub fn submit(&self, frame: Arc<Frame>, seq: u32, generation: u32, ts_ms: u32) {
         {
             let mut slot = self.pipe.lock_slot();
             if slot.is_some() {
@@ -200,6 +200,7 @@ impl VideoPipeline {
                 frame,
                 seq,
                 generation,
+                ts_ms,
             });
         }
         self.pipe.cv.notify_one();
@@ -250,13 +251,19 @@ pub fn start(args: &Args, width: u32, height: u32, shared: Arc<Shared>) -> Optio
     if args.video.is_off() {
         return None;
     }
-    let (ffmpeg_codec, tag) = match args.video {
-        VideoChoice::H264 => ("h264_nvenc", codec_tag::H264),
+    let ffmpeg_codec = match args.video {
+        VideoChoice::H264 => "h264_nvenc",
         // auto / hevc 都先用 hevc_nvenc；探测失败就整条通道不可用（不会退回 h264）
-        _ => ("hevc_nvenc", codec_tag::HEVC),
+        _ => "hevc_nvenc",
+    };
+    let Some(tag) = lrc_video::codec_tag_of(ffmpeg_codec) else {
+        log::warn!("视频通道不可用（未知编码器 {ffmpeg_codec}），永久使用块模式");
+        return None;
     };
     let fps = args.video_max_fps.max(1);
     let cfg = EncoderConfig {
+        width,
+        height,
         bitrate_bps: args.video_bitrate,
         // 2 秒一个 IDR：既保证可恢复，又不会吃掉太多码率
         gop: fps.saturating_mul(2).max(1),
@@ -265,43 +272,24 @@ pub fn start(args: &Args, width: u32, height: u32, shared: Arc<Shared>) -> Optio
         ffmpeg_path: None,
     };
 
-    let mut encoder = match FfmpegEncoder::new(width, height, cfg) {
+    // new() 内部会先 probe（真跑一次最短编码）：不可用时返回 Unsupported，这里一次性告警后永久块模式
+    let t = Instant::now();
+    let encoder = match FfmpegEncoder::new(cfg) {
         Ok(e) => e,
         Err(e) => {
-            log::warn!("视频通道不可用（创建编码器失败，永久使用块模式）：{e}");
+            log::warn!("视频通道不可用（永久使用块模式）：{e}");
             return None;
         }
     };
-
-    // 预热探测：真喂一帧黑帧确认 NVENC 能用（否则第一次真编码要卡 2 秒才发现失败）
-    {
-        let stride = width as usize * 4;
-        let black = vec![0u8; stride.saturating_mul(height as usize)];
-        let t = Instant::now();
-        match encoder.encode(&black, stride) {
-            Ok(aus) => log::info!(
-                "视频通道就绪：{} {}x{} @{}fps {}kbps（预热 {} ms，探测 AU {} 个）",
-                ffmpeg_codec,
-                width,
-                height,
-                fps,
-                args.video_bitrate / 1000,
-                t.elapsed().as_millis(),
-                aus.len()
-            ),
-            Err(e) => {
-                log::warn!("视频通道不可用（预热编码失败，永久使用块模式）：{e}");
-                encoder.shutdown();
-                return None;
-            }
-        }
-    }
-    // 预热帧会成为参考帧；第一帧真正要发的内容必须重新开一个 IDR
-    if let Err(e) = encoder.request_keyframe() {
-        log::warn!("视频通道不可用（请求 IDR 失败，永久使用块模式）：{e}");
-        encoder.shutdown();
-        return None;
-    }
+    log::info!(
+        "视频通道就绪：{} {}x{} @{}fps {}kbps（探测+启动 {} ms）",
+        ffmpeg_codec,
+        width,
+        height,
+        fps,
+        args.video_bitrate / 1000,
+        t.elapsed().as_millis()
+    );
 
     let pipe = Arc::new(Pipe {
         slot: Mutex::new(None),
@@ -334,7 +322,6 @@ pub fn start(args: &Args, width: u32, height: u32, shared: Arc<Shared>) -> Optio
     Some(VideoPipeline {
         pipe,
         handle: Some(handle),
-        codec: tag,
         codec_name: ffmpeg_codec.to_string(),
     })
 }
@@ -384,17 +371,18 @@ fn encode_loop(mut encoder: FfmpegEncoder, pipe: Arc<Pipe>, shared: Arc<Shared>,
             if job.generation != pipe.generation.load(Ordering::Relaxed) {
                 break;
             }
-            if au.len() > lrc_proto::MAX_VIDEO_AU {
+            if au.len() > lrc_proto::message::MAX_VIDEO_AU {
                 log::warn!(
                     "视频 AU 过大 {} > {}，丢弃",
                     au.len(),
-                    lrc_proto::MAX_VIDEO_AU
+                    lrc_proto::message::MAX_VIDEO_AU
                 );
                 continue;
             }
             let msg = Message::VideoAu(VideoAu {
-                // Lead 要求：采集完成时刻（客户端据此算管线延迟）
-                ts_ms: job.frame.ts_ms as u32,
+                // Lead 要求：GetTickCount64 低 32 位（和客户端 lat_ms 的 now 同源）。
+                // ⚠ 只有同机测试才有意义（跨机时钟不同源，lat_ms 只能作参考）。
+                ts_ms: job.ts_ms,
                 seq: job.seq,
                 codec,
                 flags: if key { 1 } else { 0 },
@@ -482,7 +470,6 @@ mod tests {
             assert_eq!(sw.observe(500, total()), ModeEvent::None);
         }
         assert_eq!(sw.mode(), Mode::Blocks);
-        assert!(!sw.video_available());
     }
 
     #[test]
@@ -494,7 +481,6 @@ mod tests {
         assert_eq!(sw.mode(), Mode::Video);
         sw.disable_video();
         assert_eq!(sw.mode(), Mode::Blocks);
-        assert!(!sw.video_available());
         for _ in 0..100 {
             assert_eq!(sw.observe(500, total()), ModeEvent::None);
         }

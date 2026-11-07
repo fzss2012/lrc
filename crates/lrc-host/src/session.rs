@@ -14,11 +14,13 @@ use lrc_proto::{
     Message, Pong, Rect, ServerHello, VideoFrame, PROTO_VERSION,
 };
 use lrc_transport::{Conn, ConnReader, ConnWriter};
+use windows::Win32::System::SystemInformation::GetTickCount64;
 
 use crate::auth;
 use crate::cli::Args;
 use crate::input;
 use crate::stats::{self, Stats};
+use crate::video::{Mode, ModeEvent, ModeSwitch, VideoCounters, VideoPipeline};
 
 /// 块边长（DESIGN §0：64×64 块）。
 const BLOCK_SIZE: u16 = 64;
@@ -39,7 +41,9 @@ const CAPTURE_REOPEN_TRIES: u32 = 20;
 const MAX_CURSOR_SHAPE_DIM: u32 = 256;
 
 /// 会话期的共享状态：写端 + 客户端反馈 + 停止标志。
-struct Shared {
+///
+/// pub(crate) 是因为视频编码线程（crate::video）也要通过它写 socket。
+pub(crate) struct Shared {
     /// 收发线程共享同一个写端；一帧必须整条原子写入。
     writer: Mutex<ConnWriter>,
     /// 主线程要求结束（接收线程断开 / 发送失败）。
@@ -84,7 +88,7 @@ impl Shared {
     }
 
     /// 写一条已编码消息。
-    fn send(&self, payload: &[u8]) -> io::Result<()> {
+    pub(crate) fn send(&self, payload: &[u8]) -> io::Result<()> {
         self.writer_guard().send(payload)
     }
 
@@ -224,7 +228,12 @@ pub fn run(conn: Conn, args: &Args, nonce_seq: u64) -> Result<(), String> {
         writer.shutdown();
         return Ok(());
     }
-    log::info!("客户端已鉴权，开始推流");
+    log::info!(
+        "客户端已鉴权，开始推流（视频通道 --video={}，{}kbps，{}fps 上限）",
+        args.video.label(),
+        args.video_bitrate / 1000,
+        args.video_max_fps
+    );
 
     // 会话期间：读端永久阻塞（靠 shutdown 唤醒），写端保留超时
     if let Err(e) = reader.set_read_timeout(None) {
@@ -235,6 +244,9 @@ pub fn run(conn: Conn, args: &Args, nonce_seq: u64) -> Result<(), String> {
     }
 
     let shared = Arc::new(Shared::new(writer, (info.origin_x, info.origin_y)));
+    // 视频通道：会话建立时创建编码器 + 预热探测（失败就一直用块模式，不重试）
+    let pipeline = crate::video::start(args, info.width, info.height, Arc::clone(&shared));
+
     let spawned = {
         let sh = Arc::clone(&shared);
         std::thread::Builder::new()
@@ -250,7 +262,7 @@ pub fn run(conn: Conn, args: &Args, nonce_seq: u64) -> Result<(), String> {
         }
     };
 
-    let result = capture_loop(args, &mut capturer, &mut info, Arc::clone(&shared));
+    let result = capture_loop(args, &mut capturer, &mut info, Arc::clone(&shared), pipeline);
 
     // 收尾：先让接收线程的阻塞读返回，再等它退出
     shared.stop.store(true, Ordering::Relaxed);
@@ -466,6 +478,7 @@ fn capture_loop(
     capturer: &mut Capturer,
     info: &mut ScreenInfo,
     shared: Arc<Shared>,
+    pipeline: Option<VideoPipeline>,
 ) -> Result<(), String> {
     let mut track = Track::new(info.width, info.height)
         .ok_or_else(|| format!("采集尺寸非法 {}x{}", info.width, info.height))?;
@@ -474,14 +487,23 @@ fn capture_loop(
         ..Options::default()
     };
     let frame_interval = Duration::from_secs_f64(1.0 / f64::from(args.fps.max(1)));
+    // 视频模式不跟随 --fps，单独按 --video-max-fps 采集
+    let video_interval = Duration::from_secs_f64(1.0 / f64::from(args.video_max_fps.max(1)));
     let session_start = Instant::now();
 
     let mut seq: u32 = 0;
     let mut force_full = true;
     let mut next_grab_at = Instant::now();
     let mut cursor = CursorTracker::new((info.origin_x, info.origin_y), (info.width, info.height));
-    // 最近一帧像素：RequestFull 在静止桌面时靠它补整帧（不 clone，整体换出/换回）
-    let mut cached: Option<Frame> = None;
+    // 最近一帧像素：RequestFull 在静止桌面时靠它补整帧。
+    // 用 Arc 是为了视频模式能零拷贝地把同一帧交给编码线程（cached 自己还要留着补帧）。
+    let mut cached: Option<Arc<Frame>> = None;
+    // 块/视频模式判定
+    let mut mode_switch = ModeSwitch::new(pipeline.is_some());
+    let mut video_gen: u32 = 0;
+    // 一次性标志：本轮若没有新帧，就用缓存帧发一帧整帧（RequestFull / 模式退出）
+    let mut force_cache_resend = false;
+    let mut last_video = VideoCounters::default();
     let mut slots: Vec<BlockSlot> = Vec::new();
     let mut cand: Vec<u32> = Vec::new();
     let mut rects: Vec<Rect> = Vec::new();
@@ -506,7 +528,20 @@ fn capture_loop(
         if shared.stop() {
             break;
         }
-        report_if_due(args, &mut sec, &mut total, &mut last_report, session_start);
+        let video_now = pipeline
+            .as_ref()
+            .map(|p| p.counters())
+            .unwrap_or_default();
+        report_if_due(
+            args,
+            &mut sec,
+            &mut total,
+            &mut last_report,
+            session_start,
+            mode_switch.mode().label(),
+            video_now,
+            &mut last_video,
+        );
 
         // 帧率节流：采集前等待。丢帧不能只丢"发送"，因为 dirty rect 一旦被
         // AcquireNextFrame 消费掉就补不回来了，所以宁可少采。
@@ -526,11 +561,14 @@ fn capture_loop(
         let capture_ms = t_cap.elapsed().as_secs_f64() * 1000.0;
 
         let mut has_new_frame = false;
+        // 抓帧完成时刻（视频 AU 的 ts_ms 用它）：GetTickCount64 低 32 位。
+        // 和客户端 lat_ms 的 now 同源，**只在同机测试时有效**，跨机只能作参考。
+        let capture_tick = unsafe { GetTickCount64() } as u32;
         match grabbed {
             Ok(Some(f)) => {
                 has_new_frame = true;
                 // 缓存最近一帧像素（整体换出，不 clone）；RequestFull 静止时用它重发
-                cached = Some(f);
+                cached = Some(Arc::new(f));
             }
             Ok(None) => {
                 // 没有任何像素变化：一个字节的画面数据都不发（零变化零发送的源头）
@@ -575,18 +613,100 @@ fn capture_loop(
             Err(CaptureError::Init(m)) => return Err(format!("采集初始化失败：{m}")),
         };
 
-        // 整帧请求：有新帧就用新帧；静止桌面（grab 返回 None）用缓存帧补发整帧，
-        // 否则客户端在完全静止时会一直等不到 full 帧。
-        let mut request_full_now = shared.request_full.swap(false, Ordering::Relaxed);
-        if request_full_now && !has_new_frame && cached.is_none() {
-            // 还没抓到过任何像素（刚连上且桌面一直没变）：把请求放回去，下一轮再补
-            shared.request_full.store(true, Ordering::Relaxed);
-            request_full_now = false;
+        let request_full_now = shared.request_full.swap(false, Ordering::Relaxed);
+
+        // ---------- 视频模式：整帧丢给编码线程，块路径不发 ----------
+        if mode_switch.mode() == Mode::Video {
+            let mut back_to_blocks = false;
+            match pipeline.as_ref() {
+                None => {
+                    // 不该发生：进视频模式的前提是有流水线
+                    log::warn!("视频流水线不存在，回块模式");
+                    mode_switch.disable_video();
+                    back_to_blocks = true;
+                }
+                Some(p) => {
+                    if p.send_failed() {
+                        log::warn!("视频码流发送失败，结束会话");
+                        break;
+                    }
+                    if p.is_broken() {
+                        log::warn!("视频编码器已失效，永久回块模式");
+                        mode_switch.disable_video();
+                        back_to_blocks = true;
+                    } else {
+                        if request_full_now {
+                            // 视频模式下整帧请求 = 让编码器出 IDR（不要回块模式）
+                            p.request_keyframe();
+                            log::info!("视频模式收到整帧请求 → 请求 IDR");
+                        }
+                        let total_blocks = track.grid.count() as usize;
+                        let changed_n = match cached.as_deref() {
+                            Some(f) => video_changed_ratio(&mut track, f, &mut rects, &mut cand),
+                            None => 0,
+                        };
+                        if has_new_frame {
+                            match mode_switch.observe(changed_n, total_blocks) {
+                                ModeEvent::ExitToBlocks => {
+                                    log::info!(
+                                        "变化比例回落到 {:.1}%，切回块模式（发整帧重同步）",
+                                        100.0 * changed_n as f32 / total_blocks.max(1) as f32
+                                    );
+                                    // 丢掉在途/待编码的旧世代 AU
+                                    p.new_generation();
+                                    back_to_blocks = true;
+                                }
+                                ModeEvent::EnterVideo => {}
+                                ModeEvent::None => {
+                                    if shared.ack_seen()
+                                        && shared.inflight_bytes() > MAX_INFLIGHT_BYTES
+                                    {
+                                        sec.dropped += 1;
+                                        log::debug!("视频流控丢帧");
+                                    } else if let Some(frame) = cached.clone() {
+                                        p.submit(frame, seq, video_gen, capture_tick);
+                                        seq = seq.wrapping_add(1);
+                                    }
+                                }
+                            }
+                        } else {
+                            // 静止的一拍：按视频帧率算一帧 0 变化，攒够 30 拍回块模式
+                            mode_switch.observe(0, total_blocks);
+                        }
+                    }
+                }
+            }
+
+            if back_to_blocks {
+                force_full = true;
+                track.scan_all = true;
+                force_cache_resend = cached.is_some();
+                next_grab_at = Instant::now();
+                // 落到下面的块模式路径，同一轮就把整帧发出去
+            } else {
+                if let Err(e) = cursor.poll_and_send(&shared, &mut sec) {
+                    log_send_failure(&shared, "发送光标", &e);
+                    break;
+                }
+                next_grab_at = t_cap + video_interval;
+                continue;
+            }
         }
+
+        // ---------- 块模式 ----------
         if request_full_now {
+            // 整帧请求：有新帧就用新帧；静止桌面（grab 返回 None）用缓存帧补发整帧，
+            // 否则客户端在完全静止时会一直等不到 full 帧。
             force_full = true;
+            force_cache_resend = true;
         }
-        let resend_from_cache = request_full_now && !has_new_frame;
+        if has_new_frame {
+            force_cache_resend = false;
+        }
+        let resend_from_cache = force_cache_resend && !has_new_frame;
+        if resend_from_cache {
+            force_cache_resend = false;
+        }
 
         if !has_new_frame && !resend_from_cache {
             // 静止且没有整帧请求：只转发光标，画面 0 字节
@@ -598,8 +718,12 @@ fn capture_loop(
             continue;
         }
 
-        let Some(frame) = cached.as_ref() else {
-            // 没有像素可用：只转发光标
+        let Some(frame) = cached.as_deref() else {
+            // 还没有抓到过任何像素：把整帧请求放回去，抓到帧之后再补
+            if request_full_now {
+                shared.request_full.store(true, Ordering::Relaxed);
+                force_cache_resend = true;
+            }
             if let Err(e) = cursor.poll_and_send(&shared, &mut sec) {
                 log_send_failure(&shared, "发送光标", &e);
                 break;
@@ -675,6 +799,30 @@ fn capture_loop(
             if send_full || !track.have_prev || known != Some(hash) {
                 changed.push((idx, hash));
             }
+        }
+
+        // 块模式下也观察变化比例：连续 3 帧 > 45% 就切视频通道
+        match mode_switch.observe(changed.len(), track.grid.count() as usize) {
+            ModeEvent::EnterVideo => {
+                if let Some(p) = pipeline.as_ref() {
+                    log::info!(
+                        "变化比例 {} / {} 块，切到视频模式（请求 IDR，码率 {}kbps）",
+                        changed.len(),
+                        track.grid.count(),
+                        args.video_bitrate / 1000
+                    );
+                    video_gen = p.new_generation();
+                    p.request_keyframe();
+                    force_full = false;
+                    next_grab_at = Instant::now();
+                    if let Err(e) = cursor.poll_and_send(&shared, &mut sec) {
+                        log_send_failure(&shared, "发送光标", &e);
+                        break;
+                    }
+                    continue;
+                }
+            }
+            ModeEvent::ExitToBlocks | ModeEvent::None => {}
         }
 
         if changed.is_empty() {
@@ -818,9 +966,27 @@ fn capture_loop(
         cs.shape_captures,
         cs.last_shape_capture_us
     );
+    let final_video = pipeline
+        .as_ref()
+        .map(|p| p.counters())
+        .unwrap_or_default();
+    let video_summary = stats::VideoLine {
+        mode: mode_switch.mode().label(),
+        fps: final_video.aus as f64 / session_secs.max(0.001),
+        kbps: (final_video.bytes as f64 * 8.0 / 1000.0) / session_secs.max(0.001),
+    };
+    if let Some(p) = pipeline.as_ref() {
+        log::info!(
+            "视频通道 {}：发出 {} 个 AU / {} 字节，待编码队列丢弃 {} 帧",
+            p.codec_name(),
+            final_video.aus,
+            final_video.bytes,
+            p.dropped_frames()
+        );
+    }
     log::info!(
         "会话结束，总计 {} capture_ms_avg={capture_avg:.2}",
-        stats::format_summary(&total, session_secs)
+        stats::format_summary(&total, session_secs, &video_summary)
     );
     Ok(())
 }
@@ -835,24 +1001,42 @@ fn log_send_failure(shared: &Shared, what: &str, e: &io::Error) {
 }
 
 /// 每秒一行统计（--stats）。格式见 stats.rs，被 Lead 的验收脚本按 kbps= 抓数。
+#[allow(clippy::too_many_arguments)]
 fn report_if_due(
     args: &Args,
     sec: &mut Stats,
     total: &mut Stats,
     last_report: &mut Instant,
     session_start: Instant,
+    mode: &'static str,
+    video_now: VideoCounters,
+    last_video: &mut VideoCounters,
 ) {
     let now = Instant::now();
     let elapsed = now.saturating_duration_since(*last_report);
     if elapsed < Duration::from_secs(1) {
         return;
     }
+    let interval = elapsed.as_secs_f64();
+
+    // 视频 AU 也计入总帧数/字节数（这样 kbps 是真实线上码率），再单独给出 video_kbps/video_fps
+    let d_aus = video_now.aus.saturating_sub(last_video.aus);
+    let d_bytes = video_now.bytes.saturating_sub(last_video.bytes);
+    *last_video = video_now;
+    sec.frames += d_aus;
+    sec.bytes += d_bytes;
+    let video_line = stats::VideoLine {
+        mode,
+        fps: d_aus as f64 / interval,
+        kbps: (d_bytes as f64 * 8.0 / 1000.0) / interval,
+    };
+
     total.add(sec);
     if args.stats {
         let session_secs = now.saturating_duration_since(session_start).as_secs_f64();
         println!(
             "{}",
-            stats::format_line(total, sec, session_secs, elapsed.as_secs_f64())
+            stats::format_line(total, sec, session_secs, interval, &video_line)
         );
         let _ = io::stdout().flush();
     }
@@ -885,6 +1069,53 @@ fn candidates_for_rects(grid: &Grid, rects: &[Rect], out: &mut Vec<u32>) {
     }
     out.sort_unstable();
     out.dedup();
+}
+
+/// 视频模式只关心"变化块比例"：逐候选块算哈希并**立即**写回（不编码、不发块），
+/// 返回这一帧变化的块数。
+fn video_changed_ratio(
+    track: &mut Track,
+    frame: &Frame,
+    rects: &mut Vec<Rect>,
+    cand: &mut Vec<u32>,
+) -> usize {
+    if frame.full {
+        cand.clear();
+        cand.extend(0..track.grid.count());
+    } else {
+        rects.clear();
+        rects.extend_from_slice(&frame.dirty);
+        for mv in &frame.moves {
+            rects.push(mv.dst);
+            rects.push(mv.src);
+        }
+        candidates_for_rects(&track.grid, &rects, cand);
+    }
+    let mut changed = 0usize;
+    for &idx in cand.iter() {
+        let Some(rect) = track.grid.block_rect(idx, track.width, track.height) else {
+            continue;
+        };
+        let Some(offset) = pixel_offset(&rect, frame.stride) else {
+            continue;
+        };
+        if offset >= frame.bgra.len() {
+            continue;
+        }
+        let hash = norm_hash(lrc_capture::hash_block(
+            &frame.bgra[offset..],
+            frame.stride,
+            rect.w,
+            rect.h,
+        ));
+        if track.hashes.get(idx as usize).copied() != Some(hash) {
+            changed += 1;
+        }
+        if let Some(slot) = track.hashes.get_mut(idx as usize) {
+            *slot = hash;
+        }
+    }
+    changed
 }
 
 /// 块左上角在帧缓冲里的字节偏移。
@@ -1179,7 +1410,7 @@ mod tests {
     #[test]
     fn stats_line_has_all_keys() {
         let zero = Stats::default();
-        let line = stats::format_line(&zero, &zero, 1.0, 1.0);
+        let line = stats::format_line(&zero, &zero, 1.0, 1.0, &stats::VideoLine::default());
         for key in [
             "t=",
             "fps=",

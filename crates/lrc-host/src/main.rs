@@ -14,6 +14,7 @@ mod cli;
 mod input;
 mod session;
 mod stats;
+mod video;
 
 use std::net::TcpListener;
 use std::process::ExitCode;

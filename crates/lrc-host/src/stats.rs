@@ -25,12 +25,22 @@ pub struct Stats {
 }
 
 /// 视频通道在统计行里的三个字段（mode 是瞬时状态，fps/kbps 是本区间增量）。
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VideoLine {
     /// "blocks" 或 "video"
     pub mode: &'static str,
     pub fps: f64,
     pub kbps: f64,
+}
+
+impl Default for VideoLine {
+    fn default() -> Self {
+        Self {
+            mode: "blocks",
+            fps: 0.0,
+            kbps: 0.0,
+        }
+    }
 }
 
 impl Stats {

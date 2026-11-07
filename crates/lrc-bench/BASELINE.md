@@ -10,7 +10,7 @@
   `encode_lossless_block` / `encode_jpeg_block`（bench 不再自己复刻容器格式）。
 - 机器：Windows / Rust 1.93.1 MSVC / `--release`（opt-level=3 + thin LTO + codegen-units=1）。
 
-## 本基线的输入帧
+## 本基线的输入帧（x.com 帧；办公内容基线见下一节）
 
 | 项 | 值 |
 |---|---|
@@ -60,6 +60,40 @@ mixed / all-jpeg            -       2.78x       1.65x       1.63x       1.00x   
 mixed / all-loss            -       1.74x       2.75x       2.49x      10.00x         7.13x
 ```
 
+## 办公内容基线（office-frame.bgra）
+
+> ⚠ **注意**：`captures/office-frame.bgra` 目前是 8,294,400 字节**全 0**（占位帧，长度对、内容空）。
+> bench 会检测到并**回退到内置合成桌面帧**（IDE 风格：壁纸 + 3 个窗口 + 细线文字），
+> 所以下表的口径是"合成办公画面"，不是真实抓屏。表头 `帧源` 会写明用的是合成帧。
+> 拿到真实办公抓帧后重跑本命令即可替换本表（帧指纹会变）。
+
+```
+scenario   changed_blocks  bytes_avg bytes_p95 bytes_max    kbps@30fps enc_ms_avg  tag[L/J/R]
+static                0.0        0.0         0         0          0.00      0.894  L0/J0/R0
+typing               16.1     4327.4      6329      6475       1038.58      1.954  L1936/J0/R0
+scroll              117.5    25842.3     28509     28966       6202.15      7.837  L14096/J0/R0
+full                510.0   104162.7    105094    105396      24999.05     23.100  L61200/J0/R0
+video               510.0   481805.9    483074    483633     115633.41    173.628  L0/J61200/R0
+```
+
+无损模式分布（同样是"办公画面"最有说服力的一栏）：
+
+```
+scenario     lossless     mode0 预测     mode1 原样    mode2 pal8    mode3 pal4   palette 占比
+typing           1936           24            5             0          1907        98.5%
+scroll          14096          588          529             0         12979        92.1%
+full            61200         5003         1080             0         55117        90.1%
+```
+
+- **palette 命中率 90–98%**，而且几乎全是 **palette4**（≤16 色）——办公/代码画面每个
+  64×64 块只有几种颜色，4bit 索引正是为它准备的；palette8 在这类内容上一次都没赢。
+- 打字 ≈ **1.04 Mbps**、滚动 ≈ **6.2 Mbps**、整屏重编 ≈ **25 Mbps**；static 仍是 0 字节。
+- 与上面 x.com 帧（照片/视频，块内均 241 色）**不可直接比**：同一套参数下办公内容的
+  绝对字节只有照片内容的 ~1/2（full 104 KB vs 240 KB），而 palette 收益 / 命中率天差地别。
+- 注：lead 早前的同一条命令跑出 4,241 / 25,065 / 104,191（palette 97.9/90.8/90.1%），
+  与上表差 <2%，是同一张合成帧、codec 修 palette 白像素 bug 之前的构建。
+
+复现：`cargo run --release -p lrc-bench -- --frame captures/office-frame.bgra --frames 120`
 ## ratio_limit 0.55 → 0.20（同一帧 A/B，30 帧，两次都开调色板）
 
 | scenario | 0.55（旧） | 0.20（新） | 变化 |

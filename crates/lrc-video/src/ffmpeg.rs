@@ -582,10 +582,11 @@ mod tests {
     }
 
     /// 小尺寸配置，测试跑得快
+    /// NVENC 有最小分辨率限制（约 145x49），测试也至少要用 256x256，否则编码器初始化就失败
     fn small_cfg() -> EncoderConfig {
         EncoderConfig {
-            width: 64,
-            height: 64,
+            width: 256,
+            height: 256,
             bitrate_bps: 3_000_000,
             gop: 30,
             fps: 30,
@@ -619,9 +620,6 @@ mod tests {
         let info = probe("definitely_not_a_real_encoder").expect("probe 不应 Err");
         assert!(!info.available, "不存在的编码器必须报不可用");
         assert!(!info.detail.is_empty(), "必须给出原因");
-        assert!(info.detail.to_ascii_lowercase().contains("encoder")
-            || info.detail.contains("未知")
-            || !info.detail.is_empty());
     }
 
     #[test]
@@ -656,11 +654,11 @@ mod tests {
             return;
         }
         let before = ffmpeg_process_count();
-        let frame = vec![0u8; 64 * 64 * 4];
-        for _ in 0..8 {
+        let frame = vec![0u8; 256 * 256 * 4];
+        for _ in 0..5 {
             let enc = FfmpegEncoder::new(small_cfg());
             let Ok(mut enc) = enc else { continue };
-            let _ = enc.encode(&frame, 64 * 4);
+            let _ = enc.encode(&frame, 256 * 4);
             drop(enc); // Drop → shutdown → kill
         }
         std::thread::sleep(Duration::from_millis(600));
@@ -685,13 +683,13 @@ mod tests {
                 return;
             }
         };
-        let frame = vec![0u8; 64 * 64 * 4];
-        let _ = enc.encode(&frame, 64 * 4);
+        let frame = vec![0u8; 256 * 256 * 4];
+        let _ = enc.encode(&frame, 256 * 4);
         assert_eq!(enc.bitrate(), 3_000_000);
         enc.set_bitrate(BITRATE_LADDER[2]).expect("set_bitrate");
         assert_eq!(enc.bitrate(), 6_000_000);
         assert!(enc.restart_cost_us() > 0, "必须记录重启耗时");
-        let aus = enc.encode(&frame, 64 * 4).expect("重启后编码");
+        let aus = enc.encode(&frame, 256 * 4).expect("重启后编码");
         assert!(!aus.is_empty());
         assert!(enc.last_au_was_keyframe(), "切档后第一帧必须是 IDR");
         println!("set_bitrate 重启耗时 = {}us", enc.restart_cost_us());

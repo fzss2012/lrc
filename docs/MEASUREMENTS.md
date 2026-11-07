@@ -24,6 +24,18 @@
 | host CPU（30 s 累计） | 0.67 s ≈ 单核 2.2% |
 | client CPU（30 s 累计） | 0.17 s ≈ 单核 0.6% |
 
+### 1.2 M2 视频通道（mandelbrot 全屏运动画面，真实 host + 真实 client）
+
+| 指标 | 实测 |
+|---|---|
+| 块模式（同内容） | 约 29–41 Mbps |
+| **视频模式（HEVC NVENC 4 Mbps CBR）** | **2.2–3.1 Mbps** |
+| 码率降幅 | **≈10×** |
+| 客户端管线延迟 `lat_ms` | **42–48 ms**（含 NVENC 编码 ~20 ms + 客户端软解 ~14 ms） |
+| 视频帧率 | 15–21 fps（受 ffplay 的 mandelbrot 生成速度限制，不是链路限制） |
+| 模式切换 | 播完 1–2 秒内自动切回 `mode=blocks`，客户端同步 |
+| 码流合法性 | host 侧把 AU dump 后 `ffprobe` → `codec_name=hevc 1920x1080 nb_read_frames=92`，与发出的 AU 数一致 |
+
 ## 2. 采集（`capture-probe`）
 
 | 指标 | 数值 |

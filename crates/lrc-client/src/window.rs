@@ -598,33 +598,6 @@ impl AppState {
         // 尺寸变了（被控端分辨率切换）：重建呈现面 + clean
         self.ensure_surface_for(width, height);
 
-        // 更新干净帧（光标合成底图），否则光标一移动就会擦出视频帧之前的内容
-        let rows = height as usize;
-        if self.clean.len() < clean_stride.saturating_mul(rows + 1) {
-            self.clean.clear();
-            self.clean.resize(clean_stride.saturating_mul(rows + 1), 0);
-        }
-        for row in 0..rows {
-            let Some(src_off) = row.checked_mul(stride) else {
-                break;
-            };
-            let Some(dst_off) = row.checked_mul(clean_stride) else {
-                break;
-            };
-            let (Some(src_end), Some(dst_end)) =
-                (src_off.checked_add(clean_stride), dst_off.checked_add(clean_stride))
-            else {
-                break;
-            };
-            let (Some(src), Some(dst)) = (
-                frame.bgra.get(src_off..src_end),
-                self.clean.get_mut(dst_off..dst_end),
-            ) else {
-                break;
-            };
-            dst.copy_from_slice(src);
-        }
-
         // 整帧上屏：视频路径只用 update_full
         let mut degraded = false;
         match &mut self.surface {
@@ -654,13 +627,48 @@ impl AppState {
             self.degrade_to_gdi();
         }
 
+        // 更新干净帧（光标合成底图），否则光标一移动就会擦出视频帧之前的内容。
+        // 行步长一致时直接把解码缓冲挪进 clean（省一次全屏拷贝），末尾补一行 padding。
+        let rows = height as usize;
+        let needed = clean_stride.saturating_mul(rows + 1);
+        if stride == clean_stride {
+            let mut bgra = frame.bgra;
+            bgra.resize(needed, 0);
+            self.clean = bgra;
+        } else {
+            if self.clean.len() < needed {
+                self.clean.clear();
+                self.clean.resize(needed, 0);
+            }
+            for row in 0..rows {
+                let (Some(src_off), Some(dst_off)) =
+                    (row.checked_mul(stride), row.checked_mul(clean_stride))
+                else {
+                    break;
+                };
+                let (Some(src_end), Some(dst_end)) =
+                    (src_off.checked_add(clean_stride), dst_off.checked_add(clean_stride))
+                else {
+                    break;
+                };
+                let (Some(src), Some(dst)) = (
+                    frame.bgra.get(src_off..src_end),
+                    self.clean.get_mut(dst_off..dst_end),
+                ) else {
+                    break;
+                };
+                dst.copy_from_slice(src);
+            }
+        }
+
         // update_full 换掉了整张纹理：强制下一次光标合成把光标画到新帧上
         self.cursor.drawn = None;
         self.cursor.version = 0;
         self.need_present = true;
         log::trace!(
-            "视频帧上屏 seq={} {}x{} stride={}",
+            "视频帧上屏 seq={} ts={} {}x{} stride={}",
             frame.seq,
+            frame.ts_ms,
             width,
             height,
             stride
