@@ -113,15 +113,17 @@ pub fn dead_after() -> Duration {
     })
 }
 /// 最小 RTO。
-const MIN_RTO: Duration = Duration::from_millis(100);
+/// 最小 RTO：跨公网 RTT 就 80-95ms，100ms 会在 ACK 还在路上时就重传（放大元凶）。
+const MIN_RTO: Duration = Duration::from_millis(200);
 /// RTO 指数退避上限。
 const MAX_RTO: Duration = Duration::from_secs(1);
 /// recv_timeout 的轮询间隔（锁外 sleep）。
 const POLL: Duration = Duration::from_millis(1);
-/// 最小 ACK 间隔（否则一个 1MB 消息会触发 800+ 个 ACK）。
-const ACK_INTERVAL: Duration = Duration::from_millis(2);
-/// 同一个队头消息的 NACK 最小间隔（否则会形成"ACK→重传→ACK"放大环）。
-const NACK_INTERVAL: Duration = Duration::from_millis(20);
+/// 最小 ACK 间隔下限（实际取 max(这个值, SRTT/8)）：
+/// ACK 也要走中继、也算钱，2ms 一个太奢侈。
+const ACK_INTERVAL_MIN: Duration = Duration::from_millis(5);
+/// NACK 最小间隔的下限（实际间隔取 max(这个值, SRTT)：快链路补得快，慢链路别催）。
+const NACK_INTERVAL_MIN: Duration = Duration::from_millis(20);
 /// 一次 ACK 周期里额外报告几条乱序消息的 NACK（轮转，避免只通知队头 → 其它消息只能靠 RTO 全量重传）。
 const EXTRA_NACK: usize = 3;
 /// 一条消息停滞多久后，才把"尾部缺口"当成真丢包去 NACK。
@@ -131,12 +133,20 @@ const PUMP_BATCH: usize = 256;
 /// 单次 drive 里最多处理几条超时消息（避免重传风暴）。
 const DRIVE_BATCH: usize = 1;
 /// 单次 flush 最多发多少个数据报（软限速：突发打得太快会把对端 socket 缓冲打爆，
-/// UDP 丢了就得靠重传补，比限速贵得多）。
-const FLUSH_BURST: usize = 8;
-/// 单次 RTO 重传最多补多少个分片（配合 NACK 精确补洞，避免全量重发放大）。
-const RTO_BURST: usize = 32;
+/// UDP 丢了就得靠重传补，比限速贵得多）。4 个/次 ≈ 数 MB/s 上限，足够 2-8Mbps 视频。
+const FLUSH_BURST: usize = 4;
+/// 单次 RTO 重传最多补多少个分片（RTO 只做"轻探测"，精确补洞交给 NACK；
+/// 32 片会让 RTO 与 NACK 双补，是跨公网放大的第二个来源）。
+const RTO_BURST: usize = 8;
 /// 待发包队列上限（超了丢最旧；丢掉的会被 RTO 重传补上）。
 const OUT_QUEUE_MAX: usize = 16384;
+/// 在途消息窗口（消息数）：必须 ≤ ACK 的 32 位窗口，否则 ACK 位图覆盖不到，
+/// 发送端会以为没收到而反复 RTO 重传 —— 这就是跨公网放大 4 倍的主因之一。
+const MAX_INFLIGHT_MSGS: usize = 32;
+/// 在途字节上限（大消息不能因为条数少就无限灌）。
+/// 在途字节上限：约等于 BDP 的几倍。设太大（1MB）会在 2Mbps 链路上堆进 4 秒的缓冲，
+/// 中继/对端 socket 缓冲一溢出就是成片丢包 → 重传放大。256KB 在 2~10Mbps 都合适。
+const MAX_INFLIGHT_BYTES: usize = 256 * 1024;
 /// socket 收发缓冲目标值（Windows 默认可能只有 64 KB，视频大帧突发会被内核直接丢掉）。
 const SOCKET_BUFFER: i32 = 4 * 1024 * 1024;
 
@@ -187,10 +197,36 @@ pub struct UdpStats {
     pub inflight: u32,
     /// 收到但乱序等待中的消息数
     pub pending: u32,
+    /// 线上发出的总字节（含重传、ACK、PING；放大率分子用）
+    pub sent_bytes: u64,
+    /// 应用层 payload 字节（放大率分母用）
+    pub data_bytes: u64,
+    /// RTO 触发的重传分片数
+    pub rto_retrans: u64,
+    /// NACK 触发的重传分片数
+    pub nack_retrans: u64,
+    /// 发出的 ACK 包数
+    pub acks_sent: u64,
+    /// 发出的 NACK 条目数
+    pub nacks_sent: u64,
+    /// RTT 抖动（RFC6298 的 RTTVAR）
+    pub rtt_var_ms: f32,
+}
+
+impl UdpStats {
+    /// 线上字节 / 应用层字节（1.0 = 没有额外开销；跨公网 relay 场景要看这个）。
+    pub fn amplification(&self) -> f64 {
+        if self.data_bytes == 0 {
+            return 0.0;
+        }
+        self.sent_bytes as f64 / self.data_bytes as f64
+    }
 }
 
 /// 发送中的一条消息。
 struct SendMsg {
+    /// 消息序号（在 send 里就分配好，排 backlog 时也保持顺序）
+    seq: u32,
     /// 预组好的数据报（已含 relay 信封），下标即 frag
     frags: Vec<Vec<u8>>,
     /// 每片是否已被确认
@@ -207,6 +243,8 @@ struct SendMsg {
     resend_cursor: usize,
     /// 入队时发送队列是空的（= 立即出网），这样算出的 RTT 才没有排队时间
     timely: bool,
+    /// 所有分片的线上总字节（在途字节窗口用）
+    wire_bytes: usize,
 
 }
 
@@ -220,6 +258,8 @@ struct RecvMsg {
     max_frag: usize,
     /// 该分片是否已经被 NACK 报过一次（丢包统计只数唯一缺口，避免同一片每轮 ACK 重复计数）
     notified: Vec<bool>,
+    /// 收到这条消息第一个分片的时刻（NACK 要等一个 RTT 之后再报，别把"还在路上"的片当丢了）
+    first_seen: Instant,
 }
 
 impl RecvMsg {
@@ -231,6 +271,7 @@ impl RecvMsg {
             last_seen: now,
             max_frag: 0,
             notified: vec![false; total as usize],
+            first_seen: now,
         }
     }
 
@@ -274,6 +315,10 @@ struct Inner {
     // ---- 发送侧 ----
     next_seq: u32,
     unacked: BTreeMap<u32, SendMsg>,
+    /// 因为窗口满而还没发出去的消息（send 不阻塞，排队等 ACK 腾窗口）
+    backlog: VecDeque<SendMsg>,
+    /// 在途字节数（unacked 里所有分片的线上字节和）
+    inflight_bytes: usize,
     out_queue: VecDeque<Vec<u8>>,
     sent_frags: u64,
     retransmits: u64,
@@ -284,6 +329,15 @@ struct Inner {
     ready: VecDeque<Vec<u8>>,
     recv_frags: u64,
     nack_missing: u64,
+    sent_bytes: u64,
+    data_bytes: u64,
+    rto_retrans: u64,
+    nack_retrans: u64,
+    acks_sent: u64,
+    nacks_sent: u64,
+    rttvar_ms: f32,
+    /// 最近一次收到 ACK 的时刻（RTO 只在"对端 ACK 停了"时才触发）
+    last_ack_recv: Option<Instant>,
 
     // ---- 时间/保活 ----
     last_send_any: Instant,
@@ -296,6 +350,8 @@ struct Inner {
     /// 额外 NACK 的轮转游标
     nack_cursor: usize,
     ping_nonce: u32,
+    /// 最近一次发 PING 的时刻（保活节拍，忙时也要发）
+    last_ping_at: Instant,
     /// 最近一次 PING 发出的时刻（算 RTT 用）
     ping_sent: Option<Instant>,
     dead: bool,
@@ -347,6 +403,7 @@ impl Inner {
             sent += 1;
             match self.socket.send_to(front, addr) {
                 Ok(_) => {
+                    self.sent_bytes += front.len() as u64;
                     self.out_queue.pop_front();
                     self.last_send_any = Instant::now();
                 }
@@ -420,20 +477,34 @@ impl Inner {
 
     fn update_rtt(&mut self, rtt: Duration) {
         let ms = rtt.as_secs_f32() * 1000.0;
-        self.srtt_ms = if self.srtt_ms <= 0.0 {
-            ms
+        if self.srtt_ms <= 0.0 {
+            self.srtt_ms = ms;
+            return;
+        }
+        // RFC6298：RTTVAR 用 |SRTT - 样本| 的指数平均
+        let diff = (self.srtt_ms - ms).abs();
+        self.rttvar_ms = if self.rttvar_ms <= 0.0 {
+            diff
         } else {
-            self.srtt_ms * 0.875 + ms * 0.125
+            self.rttvar_ms * 0.75 + diff * 0.25
         };
+        self.srtt_ms = self.srtt_ms * 0.875 + ms * 0.125;
     }
 
     fn rto_for(&self) -> Duration {
-        let twice = self.srtt_ms * 2.0;
-        let base = if twice.is_finite() && twice > 0.0 {
-            Duration::from_millis(twice as u64)
+        // RTO 必须显著大于真实 RTT：跨公网 RTT≈90ms 时，100ms 的 RTO 会在 ACK 还在路上
+        // 就先重传一遍（这是"放大 4 倍"的主因之一）。
+        // 取 2*SRTT + max(20ms, 4*RTTVAR)，下限 MIN_RTO、上限 MAX_RTO。
+        if self.srtt_ms <= 0.0 {
+            return MIN_RTO;
+        }
+        let jitter = (self.rttvar_ms * 4.0).max(20.0);
+        let ms = self.srtt_ms * 2.0 + jitter;
+        let base = Duration::from_millis(if ms.is_finite() && ms > 0.0 {
+            ms as u64
         } else {
-            Duration::ZERO
-        };
+            MIN_RTO.as_millis() as u64
+        });
         base.max(MIN_RTO).min(MAX_RTO)
     }
 
@@ -499,6 +570,29 @@ impl Inner {
         }
     }
 
+    /// 这条消息现在允许 NACK 吗？
+    ///
+    /// 跨公网 RTT≈90ms：如果收到第一片就立刻报"缺 5 片"，那 5 片其实还在路上，
+    /// 重传一遍就是纯放大。所以至少要等 1.5 个 RTT 再报缺口。
+    /// 同一条消息两次 NACK 的最小间隔：至少一个 RTT，避免"重传还没到就再催一遍"。
+    fn nack_interval(&self) -> Duration {
+        if self.srtt_ms > 0.0 {
+            Duration::from_millis(self.srtt_ms as u64).max(NACK_INTERVAL_MIN)
+        } else {
+            NACK_INTERVAL_MIN
+        }
+    }
+
+    fn nack_ready(&self, msg: &RecvMsg, now: Instant) -> bool {
+        let delay = if self.srtt_ms > 0.0 {
+            Duration::from_millis((f64::from(self.srtt_ms) * 1.5) as u64)
+                .max(Duration::from_millis(8))
+        } else {
+            Duration::from_millis(100)
+        };
+        now.saturating_duration_since(msg.first_seen) >= delay
+    }
+
     /// 回一个 ACK：ack/ack_bits 是消息级累积确认，NACK 清单直说"缺哪几片"。
     ///
     /// force：有消息刚好完成交付时必须立刻发（否则发送端要等一个 RTO 才释放 inflight）。
@@ -519,11 +613,13 @@ impl Inner {
         let mut missing = self
             .recv_msgs
             .get(&nack_seq)
+            .filter(|m| self.nack_ready(m, now))
             .map(|m| m.missing(now))
             .unwrap_or_default();
         if !missing.is_empty() {
+            let interval = self.nack_interval();
             let due = match self.nack_times.get(&nack_seq) {
-                Some(at) => now.saturating_duration_since(*at) >= NACK_INTERVAL,
+                Some(at) => now.saturating_duration_since(*at) >= interval,
                 None => true,
             };
             if due {
@@ -536,8 +632,13 @@ impl Inner {
         }
 
         // ACK 本身也限流：一个 1MB 消息有 800+ 片，每片回一个 ACK 纯属浪费
+        let ack_interval = if self.srtt_ms > 0.0 {
+            Duration::from_millis((self.srtt_ms / 8.0) as u64).max(ACK_INTERVAL_MIN)
+        } else {
+            ACK_INTERVAL_MIN
+        };
         let ack_due = match self.last_ack_at {
-            Some(at) => now.saturating_duration_since(at) >= ACK_INTERVAL,
+            Some(at) => now.saturating_duration_since(at) >= ack_interval,
             None => true,
         };
         if !force && !ack_due && missing.is_empty() {
@@ -545,6 +646,8 @@ impl Inner {
         }
         self.last_ack_at = Some(now);
 
+        self.acks_sent += 1;
+        self.nacks_sent += missing.len() as u64;
         let p = self.ack_packet(bits, nack_seq, &missing);
         self.emit_inner(p);
 
@@ -564,19 +667,25 @@ impl Inner {
         let mut extras: Vec<(u32, Vec<u16>)> = Vec::new();
         for off in 0..take {
             let seq = keys[(start + off) % keys.len()];
+            let interval = self.nack_interval();
             let due = match self.nack_times.get(&seq) {
-                Some(at) => now.saturating_duration_since(*at) >= NACK_INTERVAL,
+                Some(at) => now.saturating_duration_since(*at) >= interval,
                 None => true,
             };
             if !due {
                 continue;
             }
             if let Some(m) = self.recv_msgs.get(&seq) {
+                if !self.nack_ready(m, now) {
+                    continue;
+                }
                 let miss = m.missing(now);
                 if !miss.is_empty() {
                     self.nack_times.insert(seq, now);
                     let newly = self.mark_notified(seq, &miss);
                     self.nack_missing += newly;
+                    self.acks_sent += 1;
+                    self.nacks_sent += miss.len() as u64;
                     extras.push((seq, miss));
                 }
             }
@@ -628,6 +737,7 @@ impl Inner {
         }
         let ack = read_u32(&p[5..9]);
         let bits = read_u32(&p[9..13]);
+        self.last_ack_recv = Some(now);
         let nack_seq = read_u32(&p[ACK_NACK_SEQ_OFF..ACK_NACK_SEQ_OFF + 4]);
         let nack_cnt = p[ACK_NACK_CNT_OFF] as usize;
 
@@ -645,7 +755,10 @@ impl Inner {
         }
         for seq in done {
             if let Some(msg) = self.unacked.remove(&seq) {
-                if msg.retries == 0 && msg.timely {
+                self.inflight_bytes = self.inflight_bytes.saturating_sub(msg.wire_bytes);
+                // 只有"单片 + 没排队"的消息，其 ACK 时刻才≈真实 RTT；
+                // 多片消息要等整条收齐才回 ACK，拿来当 RTT 样本会把 RTO 估偏。
+                if msg.retries == 0 && msg.timely && msg.frags.len() == 1 {
                     let rtt = now.saturating_duration_since(msg.first_sent);
                     self.update_rtt(rtt);
                 }
@@ -670,14 +783,59 @@ impl Inner {
                         resend.push(msg.frags[f].clone());
                     }
                 }
-
+                if !resend.is_empty() {
+                    // 补洞算一次"发送"，RTO 从这个点重新计时：
+                    // 既不重复补，也不会像"完全压制 RTO"那样在弱网里卡死。
+                    msg.last_sent = now;
+                }
             }
             if !resend.is_empty() {
                 self.retransmits += resend.len() as u64;
+                self.nack_retrans += resend.len() as u64;
                 for d in resend {
                     self.emit(d);
                 }
             }
+        }
+    }
+
+    /// 把 backlog 里排队的消息按窗口（条数 + 字节）放进在途集合并推到发送队列。
+    ///
+    /// 为什么要窗口：ACK 的 ack_bits 只有 32 位，在途消息一多，窗口外的消息永远
+    /// 得不到确认 → 发送端只能靠 RTO 反复重传（跨公网 RTT 90ms 时就是 4 倍放大的主因）。
+    fn pump_backlog(&mut self) {
+        loop {
+            let Some(front) = self.backlog.front() else {
+                return;
+            };
+            let wire = front.wire_bytes;
+            // 至少放一条进去，避免"单条大消息超过窗口"把自己卡死
+            if !self.unacked.is_empty()
+                && (self.unacked.len() >= MAX_INFLIGHT_MSGS
+                    || self.inflight_bytes + wire > MAX_INFLIGHT_BYTES)
+            {
+                return;
+            }
+            let Some(mut msg) = self.backlog.pop_front() else {
+                return;
+            };
+            // RTO 时钟从"真正出网"这一刻开始算：在 backlog 里排队的时间不是传输时间，
+            // 否则窗口一满就会把还在排队的消息当成"超时未确认"重传一遍。
+            let sent_at = Instant::now();
+            msg.first_sent = sent_at;
+            msg.last_sent = sent_at;
+            msg.rto = self.rto_for();
+            msg.timely = self.out_queue.is_empty();
+            self.inflight_bytes += msg.wire_bytes;
+            self.sent_frags += msg.frags.len() as u64;
+            for d in &msg.frags {
+                if self.out_queue.len() >= OUT_QUEUE_MAX {
+                    self.out_queue.pop_front();
+                    self.queue_dropped += 1;
+                }
+                self.out_queue.push_back(d.clone());
+            }
+            self.unacked.insert(msg.seq, msg);
         }
     }
 
@@ -690,16 +848,23 @@ impl Inner {
             .map(|(seq, _)| *seq)
             .collect();
         for seq in done {
-            self.unacked.remove(&seq);
+            if let Some(msg) = self.unacked.remove(&seq) {
+                self.inflight_bytes = self.inflight_bytes.saturating_sub(msg.wire_bytes);
+            }
         }
     }
 
     /// 驱动重传与保活（不发数据也不会掉线）。
     fn drive(&mut self) {
         let now = Instant::now();
+        // ACK 腾出窗口后，把 backlog 里的消息放进来
+        self.pump_backlog();
 
-        // 保活：空闲 1s 发一次 PING
-        if now.saturating_duration_since(self.last_send_any) >= PING_IDLE {
+        // 保活：每 1s 发一次 PING —— 不管有没有在发数据。
+        // 只有空闲才发的话，忙的时候永远没有 RTT 样本，RTO 会一直停在最小值，
+        // 跨公网 RTT 90ms 时就会"ACK 还在路上就开始重传"（放大主因）。
+        if now.saturating_duration_since(self.last_ping_at) >= PING_IDLE {
+            self.last_ping_at = now;
             self.ping_nonce = self.ping_nonce.wrapping_add(1);
             let nonce = self.ping_nonce;
             self.ping_sent = Some(now);
@@ -756,6 +921,7 @@ impl Inner {
         }
         if !resend.is_empty() {
             self.retransmits += resend.len() as u64;
+            self.rto_retrans += resend.len() as u64;
             for d in resend {
                 self.emit(d);
             }
@@ -839,6 +1005,8 @@ impl UdpConn {
             conn_id,
             next_seq: 0,
             unacked: BTreeMap::new(),
+            backlog: VecDeque::new(),
+            inflight_bytes: 0,
             out_queue: VecDeque::new(),
             sent_frags: 0,
             retransmits: 0,
@@ -847,6 +1015,14 @@ impl UdpConn {
             ready: VecDeque::new(),
             recv_frags: 0,
             nack_missing: 0,
+            sent_bytes: 0,
+            data_bytes: 0,
+            rto_retrans: 0,
+            nack_retrans: 0,
+            acks_sent: 0,
+            nacks_sent: 0,
+            rttvar_ms: 0.0,
+            last_ack_recv: None,
             last_send_any: now,
             last_recv_any: now,
             srtt_ms: 0.0,
@@ -854,6 +1030,7 @@ impl UdpConn {
             nack_times: HashMap::new(),
             nack_cursor: 0,
             ping_nonce: 0,
+            last_ping_at: now,
             ping_sent: None,
             dead: false,
             queue_dropped: 0,
@@ -896,6 +1073,7 @@ impl UdpConn {
 
         let mut g = self.lock();
         let now = Instant::now();
+        g.data_bytes += payload.len() as u64;
         let seq = g.next_seq;
         g.next_seq = g.next_seq.wrapping_add(1);
 
@@ -914,31 +1092,29 @@ impl UdpConn {
         }
 
         let n = frags.len();
-        g.sent_frags += n as u64;
         let rto = g.rto_for();
-        let timely = g.out_queue.is_empty();
-        for d in &frags {
-            if g.out_queue.len() >= OUT_QUEUE_MAX {
-                g.out_queue.pop_front();
-                g.queue_dropped += 1;
-            }
-            g.out_queue.push_back(d.clone());
+        let timely = g.out_queue.is_empty() && g.backlog.is_empty() && g.unacked.is_empty();
+        let wire_bytes = frags.iter().map(Vec::len).sum();
+        g.backlog.push_back(SendMsg {
+            seq,
+            frags,
+            acked: vec![false; n],
+            first_sent: now,
+            last_sent: now,
+            rto,
+            retries: 0,
+            resend_cursor: 0,
+            timely,
+            wire_bytes,
+        });
+        // 窗口没满就立刻放出去；满了就排队等 ACK 腾窗口（send 不阻塞调用方）
+        g.pump_backlog();
+        if !g.backlog.is_empty() {
+            // 窗口满：顺手抽一下 socket 把 ACK 收进来，避免"只发不收"的调用方把窗口堵死
+            g.pump();
+            g.drive();
         }
         g.flush();
-        g.unacked.insert(
-            seq,
-            SendMsg {
-                frags,
-                acked: vec![false; n],
-                first_sent: now,
-                last_sent: now,
-                rto,
-                retries: 0,
-                resend_cursor: 0,
-                timely,
-
-            },
-        );
         Ok(())
     }
 
@@ -1002,6 +1178,13 @@ impl UdpConn {
             retransmits: g.retransmits,
             inflight: g.unacked.len() as u32,
             pending: g.recv_msgs.len() as u32,
+            sent_bytes: g.sent_bytes,
+            data_bytes: g.data_bytes,
+            rto_retrans: g.rto_retrans,
+            nack_retrans: g.nack_retrans,
+            acks_sent: g.acks_sent,
+            nacks_sent: g.nacks_sent,
+            rtt_var_ms: g.rttvar_ms,
         }
     }
 
@@ -1638,5 +1821,118 @@ mod tests {
             "干净链路 loss 应接近 0，实际 {}‰（口径又算歪了）",
             sb.loss_permille
         );
+    }
+
+    // ---------------------------------------------------------------- 11) WAN 仿真放大率
+
+    /// 带单向延迟的代理（模拟跨公网 RTT），可注入丢包。
+    fn spin_wan_proxy(
+        px: UdpSocket,
+        a_addr: SocketAddr,
+        b_addr: SocketAddr,
+        delay_ms: u64,
+        drop_every: u32,
+    ) -> (Arc<AtomicU64>, Arc<AtomicBool>, thread::JoinHandle<u64>) {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let d = Arc::clone(&dropped);
+        let s = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            px.set_read_timeout(Some(Duration::from_millis(2))).expect("t");
+            let mut queue: VecDeque<(Instant, SocketAddr, Vec<u8>)> = VecDeque::new();
+            let mut buf = [0u8; 2048];
+            let mut n: u64 = 0;
+            let mut forwarded: u64 = 0;
+            while !s.load(Ordering::Relaxed) {
+                if let Ok((len, from)) = px.recv_from(&mut buf) {
+                    n += 1;
+                    if drop_every > 0 && n % u64::from(drop_every) == 0 {
+                        d.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let dst = if from == a_addr { b_addr } else { a_addr };
+                        queue.push_back((
+                            Instant::now() + Duration::from_millis(delay_ms),
+                            dst,
+                            buf[..len].to_vec(),
+                        ));
+                    }
+                }
+                let now = Instant::now();
+                while let Some((due, _, _)) = queue.front() {
+                    if *due > now {
+                        break;
+                    }
+                    if let Some((_, dst, data)) = queue.pop_front() {
+                        let _ = px.send_to(&data, dst);
+                        forwarded += 1;
+                    }
+                }
+            }
+            forwarded
+        });
+        (dropped, stop, handle)
+    }
+
+    fn wan_case(label: &str, drop_every: u32, count: u32) {
+        let pa = bind();
+        let pb = bind();
+        let px = bind();
+        let a_addr = pa.local_addr().expect("a");
+        let b_addr = pb.local_addr().expect("b");
+        let px_addr = px.local_addr().expect("px");
+        // 单向 45ms → RTT ≈ 90ms（和实测 87~94ms 对齐）
+        let (dropped, stop, proxy) = spin_wan_proxy(px, a_addr, b_addr, 45, drop_every);
+        let a = Arc::new(UdpConn::new(pa, px_addr, PeerMode::Direct).expect("conn a"));
+        let b = Arc::new(UdpConn::new(pb, px_addr, PeerMode::Direct).expect("conn b"));
+
+        let a_tx = Arc::clone(&a);
+        let sender = thread::spawn(move || {
+            for i in 0..count {
+                // 3 KB ≈ 3 个分片，接近块模式一帧的常见大小
+                a_tx.send(&make_msg(i, 3000)).expect("send");
+            }
+            drive_until_drained(&a_tx, Duration::from_secs(90))
+        });
+        let got = drain(&b, count as usize, Duration::from_secs(90));
+        let settle = Instant::now() + Duration::from_secs(30);
+        while a.stats().inflight > 0 && Instant::now() < settle {
+            b.tick().expect("tick b");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let drained = sender.join().expect("join sender");
+        stop.store(true, Ordering::Relaxed);
+        let _ = proxy.join();
+
+        assert!(drained, "还有未确认消息");
+        assert_eq!(got.len(), count as usize, "少收了消息");
+        for (i, msg) in got.iter().enumerate() {
+            check_msg(msg, i as u32);
+        }
+        let sa = a.stats();
+        let lost = dropped.load(Ordering::Relaxed);
+        println!(
+            "[11 WAN 仿真 {label}] data={} B wire={} B 放大={:.2}x | 重传 RTO={} NACK={} | ACK={} NACK条目={} | rtt={:.1}ms jitter={:.1}ms | 代理丢包 {lost}",
+            sa.data_bytes,
+            sa.sent_bytes,
+            sa.amplification(),
+            sa.rto_retrans,
+            sa.nack_retrans,
+            sa.acks_sent,
+            sa.nacks_sent,
+            sa.rtt_ms,
+            sa.rtt_var_ms
+        );
+        assert!(
+            sa.amplification() < 1.3,
+            "{label}: 放大率应 < 1.3x，实际 {:.2}x",
+            sa.amplification()
+        );
+    }
+
+    /// 目标：RTT≈90ms、丢包 0%/3% 时，线上字节 / 应用层字节 < 1.3x。
+    #[test]
+    fn wan_like_amplification_stays_low() {
+        wan_case("0% 丢包", 0, 300);
+        wan_case("~3% 丢包", 34, 300);
     }
 }
