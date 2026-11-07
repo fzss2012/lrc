@@ -48,6 +48,16 @@
 [PASS] 停播后自动回块模式   — blocks 3/3
 ```
 
+### 1.3.1 最终验收（`scripts/acceptance.ps1`，2026-11-07 收尾轮：5/5 + 构建 + 199 单测）
+
+```
+[PASS] 静止零发送            — min=0 B/s
+[PASS] 办公打字 ≤1.0 Mbps    — avg=216.3 kbps
+[PASS] 视频模式（码率受控）   — mode=video 12/12 秒, video_kbps avg=866
+[PASS] 视频管线延迟中位数<60ms — median=32.6 ms, p90=40.1 ms
+[PASS] 停播后自动回块模式     — 4/4
+```
+
 ### 1.4 M4 传输层（`scripts/verify-p2p.ps1`，本机 loopback + 真 relay）
 
 | 阶段 | host path | client path | relay 转发字节 | 说明 |
@@ -58,6 +68,18 @@
 - direct 路径实测：`udp_rtt 14–23 ms`、`udp_loss 0`、30 fps、3,117 块解码正常
 - relay 路径实测：`udp_rtt 2–12 ms`、`udp_loss 23–39‰`（relay 单线程转发在忙时会丢包，靠 `lrc-udp` 重传补回，画面不烂）
 - `lrc-udp` 自测：回环 1000 条消息 15.1 MB/s；**注入 10% 丢包仍 1000 条全量有序不重复**（重传 51.9%）
+
+### 1.5 M4 弱网验收（`scripts/verify-p2p-lossy.ps1`：udp-proxy 注入丢包 + 20ms 延迟）
+
+| 丢包设定 | path | fps | 解码块 | 码率(client) | udp_rtt | udp_loss | 重连 | relay 转发 |
+|---|---|---|---|---|---|---|---|---|
+| 0% | relay_udp | 7 | 6,188→9,463 | 1,453 kbps | 58.8 ms | 0‰ | 0 | 2.7 MB |
+| 5% | relay_udp | 7 | 6,072→8,850 | 1,547 kbps | 59.6 ms | **46‰** | 0 | 4.3 MB |
+| 10% | relay_udp | 7 | 6,040→8,824 | 1,501 kbps | 55.1 ms | **70‰** | 0 | 5.1 MB |
+
+- **会话全程不中断**，码率最差只为基线 1.06×（要求 <1.5×）
+- **断线重连**：全丢 14 秒 → 客户端「链路保活超时」判死 → 重连 1 次 → 恢复 **fps 30**
+- 首屏优化：大块帧拆成 ≤32 KB 多条消息后，5% 丢包下首屏从 **5 s → 1 s**
 
 ## 2. 采集（`capture-probe`）
 

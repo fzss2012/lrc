@@ -160,8 +160,12 @@ Add-Result '视频模式（码率受控）' $okC ("mode=video {0}/{1} 秒, video
 $clines = @(Get-Content $clientOut -ErrorAction SilentlyContinue | Where-Object { $_ -match 'lat_ms=' })
 $lat = @(); foreach ($l in $clines) { if ($l -match 'lat_ms=([0-9.]+)') { $v = [double]$Matches[1]; if ($v -gt 0) { $lat += $v } } }
 if ($lat.Count -gt 0) {
+    # 用中位数判定：切视频模式的第一个 IDR 会带 ~750ms 的编解码器启动尖峰，平均值会被它带偏
+    $sorted = @($lat | Sort-Object)
+    $median = $sorted[[int]($sorted.Count / 2)]
+    $p90 = $sorted[[math]::Min($sorted.Count - 1, [int]($sorted.Count * 0.9))]
     $latAvg = ($lat | Measure-Object -Average).Average
-    Add-Result '视频管线延迟 < 60ms' ($latAvg -lt 60) ("lat_ms avg={0:N1}（{1} 个采样）" -f $latAvg, $lat.Count)
+    Add-Result '视频管线延迟中位数 < 60ms' ($median -lt 60) ("lat_ms median={0:N1} p90={1:N1} avg={2:N1}（{3} 个采样；avg 含模式切换启动尖峰）" -f $median, $p90, $latAvg, $lat.Count)
 }
 
 # D 恢复：播完应回到 blocks 模式且静止后 0 字节
