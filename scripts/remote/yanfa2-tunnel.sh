@@ -15,7 +15,16 @@
 set -u
 VPS_USER="${VPS_USER:-ubuntu}"
 VPS_HOST="${VPS_HOST:-118.24.79.47}"
-KEY="${KEY:-$HOME/.ssh/id_ed25519}"
+# 私钥查找顺序：显式 KEY > ~/.ssh/lrc_tunnel > ~/.ssh/id_ed25519
+if [ -n "${KEY:-}" ]; then
+  :
+elif [ -f "$HOME/.ssh/lrc_tunnel" ]; then
+  KEY="$HOME/.ssh/lrc_tunnel"
+elif [ -f "$HOME/.ssh/id_ed25519" ]; then
+  KEY="$HOME/.ssh/id_ed25519"
+else
+  KEY="$HOME/.ssh/lrc_tunnel"
+fi
 SSH_PORT="${SSH_PORT:-2222}"
 VNC_PORT="${VNC_PORT:-5900}"
 RETRY="${RETRY:-5}"
@@ -36,8 +45,14 @@ while true; do
   if [ -n "$VNC_PORT" ]; then
     ARGS+=(-R "127.0.0.1:$VNC_PORT:127.0.0.1:5900")
   fi
-  log "连接 $VPS_USER@$VPS_HOST：ssh=$SSH_PORT${VNC_PORT:+ vnc=$VNC_PORT}"
+  log "连接 $VPS_USER@$VPS_HOST（key=$KEY）：ssh=$SSH_PORT${VNC_PORT:+ vnc=$VNC_PORT}"
   ssh "${ARGS[@]}" "$VPS_USER@$VPS_HOST"
-  log "隧道断开（exit=$?），${RETRY}s 后重连"
+  rc=$?
+  if [ $rc -eq 255 ]; then
+    log "认证/连接失败（exit=255）：确认私钥已放到 $KEY 且公钥已在 VPS 的 ~/.ssh/authorized_keys 里"
+  else
+    log "隧道断开（exit=$rc）"
+  fi
+  log "${RETRY}s 后重连"
   sleep "$RETRY"
 done
