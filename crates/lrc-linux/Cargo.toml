@@ -1,0 +1,33 @@
+[package]
+name = "lrc-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lrc-host-linux"
+path = "src/bin/lrc-host-linux.rs"
+
+[[bin]]
+name = "lrc-client-linux"
+path = "src/bin/lrc-client-linux.rs"
+
+[[bin]]
+name = "x11-probe"
+path = "src/bin/x11-probe.rs"
+
+[dependencies]
+lrc-proto.workspace = true
+lrc-codec.workspace = true
+lrc-transport.workspace = true
+lrc-udp.workspace = true
+lrc-relay.workspace = true
+lrc-video.workspace = true
+lrc-adapt.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+log.workspace = true
+env_logger.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+x11rb = { version = "0.13", features = ["xtest", "shm"] }

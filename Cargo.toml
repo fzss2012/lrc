@@ -12,6 +12,7 @@ members = [
     "crates/lrc-video",
     "crates/lrc-adapt",
     "crates/lrc-audio",
+    "crates/lrc-linux",
     "crates/lrc-udp",
     "crates/lrc-relay",
 ]
@@ -31,6 +32,7 @@ lrc-transport = { path = "crates/lrc-transport" }
 lrc-video = { path = "crates/lrc-video" }
 lrc-adapt = { path = "crates/lrc-adapt" }
 lrc-audio = { path = "crates/lrc-audio" }
+lrc-linux = { path = "crates/lrc-linux" }
 lrc-udp = { path = "crates/lrc-udp" }
 lrc-relay = { path = "crates/lrc-relay" }
 
