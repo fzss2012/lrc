@@ -32,6 +32,7 @@
 
 设计与线格式见 `docs/DESIGN.md`，里程碑见 `docs/ROADMAP.md`，
 使用手册见 `docs/USAGE.md`，实测数据见 `docs/MEASUREMENTS.md`，
+**Linux（X11）被控端/控制端见 `docs/LINUX.md`**，
 **VPS 部署（lrc-relay）见 `docs/VPS-DEPLOY.md`**（含本次腾讯云部署的真实记录与排障清单）。
 
 ## 快速开始
