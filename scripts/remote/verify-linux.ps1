@@ -38,6 +38,21 @@ using System.Runtime.InteropServices;
 public class LrcWin32 {
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern int GetWindowTextW(IntPtr h, System.Text.StringBuilder s, int max);
+    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+    public static IntPtr FindByTitlePart(string part) {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr h, IntPtr l) {
+            var sb = new System.Text.StringBuilder(512);
+            GetWindowTextW(h, sb, 512);
+            string t = sb.ToString();
+            if (IsWindowVisible(h) && t.Length > 0 && t.Contains(part)) { found = h; return false; }
+            return true;
+        }, IntPtr.Zero);
+        return found;
+    }
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr h, out RECT r);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
@@ -142,6 +157,7 @@ function Start-RemoteHost {
 }
 function Test-ClientPixels([string]$WindowTitle, [int]$Cols, [int]$Rows, [int]$Cell) {
     $hwnd = [LrcWin32]::FindWindow($null, $WindowTitle)
+    if ($hwnd -eq [IntPtr]::Zero) { $hwnd = [LrcWin32]::FindByTitlePart($WindowTitle) }
     if ($hwnd -eq [IntPtr]::Zero) {
         return [pscustomobject]@{ Ok = $false; Detail = ('找不到窗口 ' + $WindowTitle) }
     }
