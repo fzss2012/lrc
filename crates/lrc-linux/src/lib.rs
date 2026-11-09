@@ -12,9 +12,11 @@
 //! - `bin/lrc-client-linux.rs`                      → client-app
 
 pub mod capture;
+pub mod cursor;
 pub mod display;
 pub mod input;
 
 pub use capture::{Frame, X11Capturer};
+pub use cursor::{CursorPoll, CursorShape, CursorState, CursorWatcher, CursorWatcherStats};
 pub use display::DisplayInfo;
 pub use input::{send_key, send_mouse_button, send_mouse_move, send_wheel};

@@ -30,4 +30,4 @@ log.workspace = true
 env_logger.workspace = true
 sha2.workspace = true
 hmac.workspace = true
-x11rb = { version = "0.13", features = ["xtest", "shm"] }
+x11rb = { version = "0.13", features = ["xtest", "shm", "xfixes"] }
