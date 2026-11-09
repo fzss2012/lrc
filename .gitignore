@@ -4,3 +4,4 @@
 *.obj
 /tools/**/out
 /captures
+.deploy/
