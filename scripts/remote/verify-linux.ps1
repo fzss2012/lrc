@@ -18,7 +18,7 @@ param(
     [int]$Seconds      = 30,
     [string]$Password  = '1234',
     [int]$LocalPort    = 17800,
-    [int]$RemotePort   = 7800,
+    [int]$RemotePort   = 17801,
     [string]$Title     = 'lrc-verify',
     [switch]$SkipBuild,
     [switch]$SkipPixels,
@@ -113,7 +113,7 @@ function RemoteLines([string]$cmd) {
     Write-Output -NoEnumerate $arr
 }
 function Stop-RemoteProcs {
-    Remote 'pkill -f lrc-host-linux 2>/dev/null; pkill -f x11-pattern 2>/dev/null; true' -AllowFail | Out-Null
+    Remote 'pkill -9 -f lrc-host-linux 2>/dev/null; pkill -9 -f x11-pattern 2>/dev/null; for i in $(seq 1 10); do ss -ltn 2>/dev/null | grep -q ":7800 " || break; sleep 0.5; done; true' -AllowFail | Out-Null
     $script:remotePid = $null
 }
 function Stop-LocalClient {
@@ -135,6 +135,10 @@ function Start-RemoteHost {
     Remote $cmd -AllowFail | Out-Null
     Start-Sleep -Seconds 2
     $script:remotePid = (Remote 'pgrep -f lrc-host-linux | head -1').Trim()
+    $portCmd = 'ss -ltn 2>/dev/null | grep -c ' + $RemotePort + '; true'
+    $rawListen = Remote $portCmd -AllowFail
+    $script:hostListening = (($rawListen -replace '[^0-9]', ''))
+    if ($script:hostListening -eq '') { $script:hostListening = '0' }
 }
 function Test-ClientPixels([string]$WindowTitle, [int]$Cols, [int]$Rows, [int]$Cell) {
     $hwnd = [LrcWin32]::FindWindow($null, $WindowTitle)
@@ -281,7 +285,8 @@ try {
                 $stat = ((Remote 'tail -1 /tmp/host.log 2>/dev/null') -replace '\s+', ' ').Trim()
                 $mp = ($script:screenW * $script:screenH) / (1920.0 * 1080.0)
                 $cpu1080 = $cpu / [math]::Max($mp, 0.1)
-                Add-Result '静止 CPU (<5% @1080p)' ($cpu1080 -lt 5.0) ('实测 {0:N2}% @ {1}x{2}（折合 1080p {3:N2}%）| {4}' -f $cpu, $script:screenW, $script:screenH, $cpu1080, $stat)
+                $listenOk = $script:hostListening -gt 0
+                Add-Result '静止 CPU (<5% @1080p)' (($cpu1080 -lt 5.0) -and $listenOk) ('实测 {0:N2}% @ {1}x{2}（折合 1080p {3:N2}%）| 监听={4} | {5}' -f $cpu, $script:screenW, $script:screenH, $cpu1080, $script:hostListening, $stat)
             } else {
                 Add-Result '静止 CPU (<5%)' $false ('读不到 /proc/' + $script:remotePid + '/stat')
             }
@@ -303,8 +308,17 @@ try {
         $fwdArgs = @('-o', ('ProxyCommand=' + $vpsProxy), '-i', $RemoteKey, '-o', 'StrictHostKeyChecking=no',
                      '-o', 'UserKnownHostsFile=NUL', '-o', 'BatchMode=yes', '-p', '2222', '-N',
                      '-L', ($LocalPort.ToString() + ':127.0.0.1:' + $RemotePort), 'yanfa2@127.0.0.1')
-        $script:tunnelProc = Start-Process -FilePath 'ssh' -ArgumentList $fwdArgs -PassThru -WindowStyle Hidden
-        Start-Sleep -Seconds 2
+        # ssh 参数里有空格的 ProxyCommand：Start-Process 的 -ArgumentList 数组会被拼成一行打散，
+        # 所以生成一个 .ps1（每项用 ConvertTo-Json 转义）再去启动它。
+        $fwdScript = Join-Path $cap 'tunnel.ps1'
+        $body = New-Object System.Collections.ArrayList
+        [void]$body.Add('$a = @(')
+        foreach ($x in $fwdArgs) { [void]$body.Add('  ' + (ConvertTo-Json $x)) }
+        [void]$body.Add(')')
+        [void]$body.Add('& ssh @a')
+        Set-Content -Path $fwdScript -Value $body -Encoding UTF8
+        $script:tunnelProc = Start-Process -FilePath powershell -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $fwdScript) -PassThru -WindowStyle Hidden
+        Start-Sleep -Seconds 3
         Add-Result 'SSH 端口转发' (-not $script:tunnelProc.HasExited) ('127.0.0.1:' + $LocalPort + ' -> yanfa2:' + $RemotePort)
 
         Stop-RemoteProcs
@@ -356,6 +370,16 @@ try {
                 Remote 'pkill -f x11-pattern 2>/dev/null; true' -AllowFail | Out-Null
                 Start-Pattern '--static' 40
                 Start-Sleep -Seconds 3
+                # 这才是要测的"全屏采集 + 块哈希"：已经连上客户端、画面静止
+                $c1 = (Remote ('awk ''{print $14+$15}'' /proc/' + $script:remotePid + '/stat')).Trim()
+                Start-Sleep -Seconds 6
+                $c2 = (Remote ('awk ''{print $14+$15}'' /proc/' + $script:remotePid + '/stat')).Trim()
+                if (($c1 -match '^\d+$') -and ($c2 -match '^\d+$')) {
+                    $cpu2 = (([int]$c2 - [int]$c1) / 100.0 / 6.0) * 100.0
+                    $mp = ($script:screenW * $script:screenH) / (1920.0 * 1080.0)
+                    $cpu2n = $cpu2 / [math]::Max($mp, 0.1)
+                    Add-Result '静止 CPU（已连接）' ($cpu2n -lt 5.0) ('实测 {0:N2}% @ {1}x{2}（折合 1080p {3:N2}%）' -f $cpu2, $script:screenW, $script:screenH, $cpu2n)
+                }
                 $rows = [int][math]::Ceiling($script:screenH / [double]$cell)
                 if ($rows -gt 8) { $rows = 8 }
                 $pix = Test-ClientPixels -WindowTitle $Title -Cols 8 -Rows $rows -Cell $cell

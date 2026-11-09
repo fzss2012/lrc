@@ -809,6 +809,7 @@ fn x11_button(button: u8) -> u8 {
 }
 
 fn apply_input(ev: InputEvent) {
+    log::debug!("输入注入 {ev:?}");
     match ev {
         InputEvent::MouseMove { x, y } => lrc_linux::send_mouse_move(x, y),
         InputEvent::MouseButton {
@@ -820,12 +821,13 @@ fn apply_input(ev: InputEvent) {
             lrc_linux::send_mouse_move(x, y);
             lrc_linux::send_mouse_button(x11_button(button), down);
         }
-        InputEvent::Wheel { dy, x, y, .. } => {
+        InputEvent::Wheel { dx, dy, x, y } => {
             lrc_linux::send_mouse_move(x, y);
-            // 协议：dy 单位 120，正值=向上滚；X11 send_wheel 负数=向上
-            let notches = -(i32::from(dy) / 120);
-            if notches != 0 {
-                lrc_linux::send_wheel(notches);
+            if dy != 0 {
+                lrc_linux::send_wheel(wheel_dy_to_x11(dy));
+            }
+            if dx != 0 {
+                log::debug!("忽略水平滚轮 dx={dx}（X11 侧只注入垂直滚轮）");
             }
         }
         InputEvent::Key {
@@ -840,6 +842,12 @@ fn apply_input(ev: InputEvent) {
             lrc_linux::send_key(unicode_keysym(codepoint), down)
         }
     }
+}
+
+/// 协议里的滚轮 dy **已经是"格"**（客户端把 WHEEL_DELTA=120 除过，正数=向上）；
+/// lrc-linux 的 send_wheel 约定"正数向下、负数向上"，所以取反。
+fn wheel_dy_to_x11(dy: i16) -> i32 {
+    -i32::from(dy)
 }
 
 /// Unicode 码点 → X11 keysym（ASCII 直接用码点，其余用 0x01000000 | cp）。
@@ -1639,6 +1647,10 @@ mod tests {
         assert_eq!(x11_button(lrc_proto::input::mouse_button::LEFT), 1);
         assert_eq!(x11_button(lrc_proto::input::mouse_button::RIGHT), 3);
         assert_eq!(x11_button(lrc_proto::input::mouse_button::MIDDLE), 2);
+        // 滚轮：dy 已经是格数，正=向上 → X11 负数=向上
+        assert_eq!(wheel_dy_to_x11(1), -1);
+        assert_eq!(wheel_dy_to_x11(-1), 1);
+        assert_eq!(wheel_dy_to_x11(3), -3);
         assert_eq!(unicode_keysym(0x41), 0x41);
         assert_eq!(unicode_keysym(0x4e2d), 0x0100_4e2d);
     }

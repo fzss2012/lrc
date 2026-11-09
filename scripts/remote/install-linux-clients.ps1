@@ -55,7 +55,7 @@ PartOf=graphical-session.target
 Type=simple
 Environment=DISPLAY=$Display
 Environment=XAUTHORITY=$Auth
-ExecStart=%h/lrc/bin/lrc-host-linux --password $Password --display $Display --stats --signal $Signal --room $Room --p2p auto
+ExecStart=%h/lrc/bin/lrc-host-linux --password $Password --display $Display --stats --listen 127.0.0.1:7800
 Restart=always
 RestartSec=3
 StandardOutput=append:%h/lrc/host.log
