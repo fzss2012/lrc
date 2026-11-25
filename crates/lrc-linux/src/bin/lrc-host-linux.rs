@@ -102,10 +102,15 @@ struct Args {
     signal: Option<SocketAddr>,
     room: u32,
     p2p: P2pMode,
+    /// P2P 模式下等客户端来登记的秒数。
+    ///
+    /// host 是串行的（一次只服务一条链路）：等 peer 期间 TCP 监听**不 accept**，
+    /// 所以同时开了 TCP 兜底时会拖慢 TCP 客户端。要兼顾两种接入就调小这个值。
+    peer_wait: u32,
 }
 
 fn usage() -> &'static str {
-    "用法: lrc-host-linux --password <PWD> [--listen IP:PORT] [--display :1] [--fps N] [--quality N]\n                         [--stats] [--signal IP:PORT] [--room N] [--p2p auto|off|direct|relay]\n                         [--monitor <输出名> | --region WxH+X+Y]\n                         [--video off|auto|h264] [--video-bitrate N] [--video-max-fps N]"
+    "用法: lrc-host-linux --password <PWD> [--listen IP:PORT] [--display :1] [--fps N] [--quality N]\n                         [--stats] [--signal IP:PORT] [--room N] [--p2p auto|off|direct|relay]\n                         [--peer-wait SECS]\n                         [--monitor <输出名> | --region WxH+X+Y]\n                         [--video off|auto|h264] [--video-bitrate N] [--video-max-fps N]"
 }
 
 /// 取一个参数值：支持 --flag value 与 --flag=value 两种写法。
@@ -135,6 +140,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut signal: Option<SocketAddr> = None;
     let mut room: u32 = 1;
     let mut p2p = P2pMode::Auto;
+    let mut peer_wait: u32 = PEER_WAIT.as_secs() as u32;
 
     let mut it = argv.into_iter();
     while let Some(arg) = it.next() {
@@ -212,6 +218,16 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
                 let v = take_value(&mut it, inline_val.clone(), &name)?;
                 room = v.parse::<u32>().map_err(|_| format!("--room 需要整数，收到 {v}"))?;
             }
+            "--peer-wait" => {
+                let v = take_value(&mut it, inline_val.clone(), &name)?;
+                let n = v
+                    .parse::<u32>()
+                    .map_err(|_| format!("--peer-wait 需要整数（秒），收到 {v}"))?;
+                if n == 0 || n > 3600 {
+                    return Err(format!("--peer-wait 应在 1..=3600，收到 {n}"));
+                }
+                peer_wait = n;
+            }
             "--p2p" => {
                 let v = take_value(&mut it, inline_val.clone(), &name)?;
                 p2p = match v.as_str() {
@@ -247,6 +263,7 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
         signal,
         room,
         p2p,
+        peer_wait,
     })
 }
 
@@ -334,34 +351,107 @@ fn can_retry(mode: P2pMode) -> bool {
     fallback_on_failure(mode) == Fallback::Tcp
 }
 
+/// 接入一条链路。
+///
+/// 同时开 P2P 和 TCP 兜底时，P2P 的"登记 + 等 peer + 打洞"跑在独立线程里，
+/// 主线程阻塞在 TCP accept 上；先到的那条赢，另一条被取消。
+/// 这样两种接入方式真正并存，而不是"等 P2P 60 秒期间 TCP 客户端干等"。
 fn acquire_link(listener: Option<&TcpListener>, args: &Args) -> Result<AcquiredLink, String> {
-    if should_try_p2p(args.p2p, args.signal) {
-        if let Some(relay) = args.signal {
-            match establish_udp(relay, args.room, args.p2p) {
-                Ok(l) => return Ok(l),
-                Err(e) => match fallback_on_failure(args.p2p) {
-                    Fallback::Tcp => log::warn!("P2P/relay 不可用（{e}），回退 TCP"),
-                    Fallback::Fatal => {
-                        return Err(format!(
-                            "P2P/relay 不可用（{e}），--p2p {} 不降级",
-                            args.p2p.label()
-                        ))
-                    }
-                },
-            }
-        }
+    let Some(relay) = args.signal.filter(|_| should_try_p2p(args.p2p, args.signal)) else {
+        return accept_tcp(listener);
+    };
+    // 只开了 P2P、没有 TCP 兜底：直接在当前线程等（没有别的事可做）
+    if listener.is_none() {
+        return establish_udp(relay, args.room, args.p2p, args.peer_wait, None).map_err(|e| {
+            format!("P2P/relay 不可用（{e}），--p2p {} 不降级", args.p2p.label())
+        });
     }
-    accept_tcp(listener)
+
+    // P2P 与 TCP 并存：P2P 线程 + 主线程 accept，先到的赢
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = std::sync::mpsc::channel::<Result<AcquiredLink, String>>();
+    {
+        let cancel = Arc::clone(&cancel);
+        let p2p = args.p2p;
+        let room = args.room;
+        let peer_wait = args.peer_wait;
+        std::thread::Builder::new()
+            .name("lrc-host-linux-p2p".to_string())
+            .spawn(move || {
+                let r = establish_udp(relay, room, p2p, peer_wait, Some(&cancel));
+                let _ = tx.send(r);
+            })
+            .map_err(|e| format!("启动 P2P 线程失败：{e}"))?;
+    }
+
+    // 主线程轮询两条路：P2P 先成功就用它；TCP 先连上就取消 P2P
+    let Some(listener) = listener else {
+        return Err("内部错误：需要 TCP 监听但没有".to_string());
+    };
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("listener set_nonblocking 失败：{e}"))?;
+    loop {
+        // 1) P2P 有结果了？
+        match rx.try_recv() {
+            Ok(Ok(l)) => return Ok(l),
+            Ok(Err(e)) => match fallback_on_failure(args.p2p) {
+                // auto：P2P 挂了还能靠 TCP，继续等
+                Fallback::Tcp => log::warn!("P2P/relay 不可用（{e}），继续等 TCP"),
+                Fallback::Fatal => {
+                    return Err(format!("--p2p {} 要求 P2P 成功：{e}", args.p2p.label()))
+                }
+            },
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                log::warn!("P2P 线程已退出（不会再有心跳）");
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        // 2) TCP 有人连进来？
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                cancel.store(true, Ordering::Relaxed);
+                let conn = lrc_transport::Conn::from_tcp(stream)
+                    .map_err(|e| format!("from_tcp 失败：{e}"))?;
+                let (writer, reader) =
+                    link::from_tcp(conn).map_err(|e| format!("拆分流失败：{e}"))?;
+                log::info!("TCP 链路就绪：path={} peer={peer}（已取消 P2P 等待）", link::PATH_TCP);
+                return Ok(AcquiredLink {
+                    writer,
+                    reader,
+                    path: link::PATH_TCP,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => return Err(format!("accept 失败：{e}")),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
-fn establish_udp(relay: SocketAddr, room: u32, p2p: P2pMode) -> Result<AcquiredLink, String> {
+fn establish_udp(
+    relay: SocketAddr,
+    room: u32,
+    p2p: P2pMode,
+    peer_wait: u32,
+    cancel: Option<&AtomicBool>,
+) -> Result<AcquiredLink, String> {
     log::info!(
-        "P2P：向 relay {relay} 登记房间 {room}（--p2p {}，等客户端 {}s，打洞超时 {}ms）",
+        "P2P：向 relay {relay} 登记房间 {room}（--p2p {}，等客户端 {peer_wait}s，打洞超时 {}ms）",
         p2p.label(),
-        PEER_WAIT.as_secs(),
         punch_timeout(p2p).as_millis()
     );
-    let established = lrc_relay::establish(true, relay, room, None, PEER_WAIT, punch_timeout(p2p))
+    static NEVER: AtomicBool = AtomicBool::new(false);
+    let stop = cancel.unwrap_or(&NEVER);
+    let established = lrc_relay::establish_cancellable(
+        true,
+        relay,
+        room,
+        None,
+        Duration::from_secs(u64::from(peer_wait)),
+        punch_timeout(p2p),
+        stop,
+    )
         .map_err(|e| format!("relay 建立失败：{e}"))?;
     let peer = established.conn_peer();
     let lrc_relay::Established { socket, mode, .. } = established;
@@ -2348,6 +2438,7 @@ mod tests {
         assert_eq!(a.signal, None);
         assert_eq!(a.room, 1);
         assert_eq!(a.p2p, P2pMode::Auto);
+        assert_eq!(a.peer_wait, 60);
     }
 
     #[test]
@@ -2401,9 +2492,17 @@ mod tests {
         assert!(parse_args(argv(&["--password", "1", "--fps", "999"])).is_err());
         assert!(parse_args(argv(&["--password", "1", "--quality", "0"])).is_err());
         assert!(parse_args(argv(&["--password", "1", "--p2p", "hole"])).is_err());
+        assert!(parse_args(argv(&["--password", "1", "--peer-wait", "0"])).is_err());
+        assert!(parse_args(argv(&["--password", "1", "--peer-wait", "99999"])).is_err());
         assert!(parse_args(argv(&["--password", "1", "--signal", "nope"])).is_err());
         assert!(parse_args(argv(&["--password", "1", "--bogus"])).is_err());
         assert!(parse_args(argv(&["--password", "1", "--region", "1920"])).is_err());
+    }
+
+    #[test]
+    fn peer_wait_custom() {
+        let a = parse_args(argv(&["--password", "1", "--peer-wait", "8"])).expect("parse");
+        assert_eq!(a.peer_wait, 8);
     }
 
     #[test]

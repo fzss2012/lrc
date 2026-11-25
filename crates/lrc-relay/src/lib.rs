@@ -38,6 +38,7 @@ pub mod server;
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// 房间号（单观看者场景下 host 与 client 用同一个 room）。
@@ -423,10 +424,25 @@ impl HostSession {
 
     /// 阻塞等一个客户端连进来（期间持续发 KEEPALIVE 保持房间存活）。
     pub fn wait_peer(&mut self, timeout: Duration) -> RelayResult<Option<SocketAddr>> {
+        self.wait_peer_until(timeout, &AtomicBool::new(false))
+    }
+
+    /// 同 wait_peer，但可以被 stop 提前打断（返回 Ok(None)）。
+    ///
+    /// 用途：host 同时开 P2P 和 TCP 兜底时，P2P 等待在独立线程里跑；
+    /// TCP 先连进来就把 stop 置位，让 P2P 线程立刻收手，不要攥着房间干等。
+    pub fn wait_peer_until(
+        &mut self,
+        timeout: Duration,
+        stop: &AtomicBool,
+    ) -> RelayResult<Option<SocketAddr>> {
         let deadline = Instant::now() + timeout;
         let mut next_ka = Instant::now();
         let mut buf = vec![0u8; 2048];
         loop {
+            if stop.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
             let now = Instant::now();
             if now >= deadline {
                 return Ok(None);
@@ -577,10 +593,31 @@ pub fn establish(
     peer_wait: Duration,
     punch_timeout: Duration,
 ) -> RelayResult<Established> {
+    establish_cancellable(
+        is_host,
+        relay,
+        room,
+        bind,
+        peer_wait,
+        punch_timeout,
+        &AtomicBool::new(false),
+    )
+}
+
+/// 同 [establish]，但 host 侧等 peer 时可被 stop 打断。
+pub fn establish_cancellable(
+    is_host: bool,
+    relay: SocketAddr,
+    room: Room,
+    bind: Option<SocketAddr>,
+    peer_wait: Duration,
+    punch_timeout: Duration,
+    stop: &AtomicBool,
+) -> RelayResult<Established> {
     if is_host {
         let mut hs = HostSession::register(relay, room, bind)?;
         let tag = hs.tag();
-        let Some(peer) = hs.wait_peer(peer_wait)? else {
+        let Some(peer) = hs.wait_peer_until(peer_wait, stop)? else {
             // 没人来：仍然给一个 relay 模式（host 会继续被 KEEPALIVE 保活）
             return Ok(Established {
                 socket: hs.take_socket(),
