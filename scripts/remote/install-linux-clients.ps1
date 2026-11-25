@@ -17,6 +17,10 @@ param(
     [string]$Auth     = '/run/user/1000/gdm/Xauthority',
     # 只推一台显示器：给 RandR 输出名（例如 DP-1）；留空 = 推整个 X root（双屏会合并）
     [string]$Monitor  = '',
+    # 视频通道：auto = 有 NVENC 就用（全屏视频/滚动这类高运动内容自动切）；off = 只用块模式
+    [string]$Video    = 'auto',
+    [int]$VideoBitrate = 4000000,
+    [int]$VideoMaxFps  = 30,
     [switch]$SkipBuild
 )
 $ErrorActionPreference = 'Stop'
@@ -58,7 +62,7 @@ PartOf=graphical-session.target
 Type=simple
 Environment=DISPLAY=$Display
 Environment=XAUTHORITY=$Auth
-ExecStart=%h/lrc/bin/lrc-host-linux --password $Password --display $Display$monitorArg --stats --listen 127.0.0.1:7800
+ExecStart=%h/lrc/bin/lrc-host-linux --password $Password --display $Display$monitorArg --video $Video --video-bitrate $VideoBitrate --video-max-fps $VideoMaxFps --stats --listen 127.0.0.1:7800
 Restart=always
 RestartSec=3
 StandardOutput=append:%h/lrc/host.log
