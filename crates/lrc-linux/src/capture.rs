@@ -116,6 +116,9 @@ impl Drop for ShmSegment {
 pub struct X11Capturer {
     conn: RustConnection,
     root: x11rb::protocol::xproto::Window,
+    /// 采集区域左上角（root 坐标）；整屏采集时是 (0, 0)
+    region_x: i16,
+    region_y: i16,
     width: u32,
     height: u32,
     /// 服务器返回数据的每行字节数（32bpp 下就是 width*4，但按 setup 里的格式算更稳）
@@ -126,7 +129,19 @@ pub struct X11Capturer {
 }
 
 impl X11Capturer {
+    /// 采整屏（等于 X root 尺寸）。
     pub fn new(display: DisplayInfo) -> Result<Self, CaptureError> {
+        Self::new_with_region(display, None)
+    }
+
+    /// 只采 root 上的一个矩形区域（例如单台 1920x1080 显示器）。
+    ///
+    /// 区域必须完整落在 root 内，否则返回错误（不做静默裁剪：裁了画面就对不上，
+    /// 用户会以为"图像缺一块"）。
+    pub fn new_with_region(
+        display: DisplayInfo,
+        region: Option<crate::display::Region>,
+    ) -> Result<Self, CaptureError> {
         let (conn, screen_num) =
             x11rb::connect(None).map_err(|e| CaptureError::Connect(e.to_string()))?;
         let setup = conn.setup();
@@ -135,15 +150,44 @@ impl X11Capturer {
             .get(screen_num)
             .ok_or_else(|| CaptureError::Connect(format!("screen {screen_num} 不存在")))?;
         let root = screen.root;
-        let width = if display.width > 0 {
-            display.width
-        } else {
-            screen.width_in_pixels as u32
-        };
-        let height = if display.height > 0 {
-            display.height
-        } else {
-            screen.height_in_pixels as u32
+        let root_w = u32::from(screen.width_in_pixels);
+        let root_h = u32::from(screen.height_in_pixels);
+        let (region_x, region_y, width, height) = match region {
+            Some(r) => {
+                let right = u32::try_from(r.x)
+                    .ok()
+                    .and_then(|x| x.checked_add(r.width))
+                    .unwrap_or(u32::MAX);
+                let bottom = u32::try_from(r.y)
+                    .ok()
+                    .and_then(|y| y.checked_add(r.height))
+                    .unwrap_or(u32::MAX);
+                if right > root_w || bottom > root_h {
+                    return Err(CaptureError::Connect(format!(
+                        "采集区域 {r} 超出屏幕 {root_w}x{root_h}"
+                    )));
+                }
+                let x = i16::try_from(r.x).map_err(|_| {
+                    CaptureError::Connect(format!("采集区域 X={} 超出 X11 坐标上限", r.x))
+                })?;
+                let y = i16::try_from(r.y).map_err(|_| {
+                    CaptureError::Connect(format!("采集区域 Y={} 超出 X11 坐标上限", r.y))
+                })?;
+                (x, y, r.width, r.height)
+            }
+            None => {
+                let width = if display.width > 0 {
+                    display.width
+                } else {
+                    root_w
+                };
+                let height = if display.height > 0 {
+                    display.height
+                } else {
+                    root_h
+                };
+                (0, 0, width, height)
+            }
         };
         if width == 0 || height == 0 {
             return Err(CaptureError::Connect(format!("屏幕尺寸非法: {width}x{height}")));
@@ -183,12 +227,19 @@ impl X11Capturer {
         Ok(Self {
             conn,
             root,
+            region_x,
+            region_y,
             width,
             height,
             bytes_per_line,
             bits_per_pixel,
             shm,
         })
+    }
+
+    /// 实际采集区域的左上角（root 坐标）。
+    pub fn origin(&self) -> (i32, i32) {
+        (i32::from(self.region_x), i32::from(self.region_y))
     }
 
     /// 当前走的采集路径："shm" 或 "get_image"。
@@ -223,8 +274,8 @@ impl X11Capturer {
             self.conn
                 .shm_get_image(
                     self.root,
-                    0,
-                    0,
+                    self.region_x,
+                    self.region_y,
                     w as u16,
                     h as u16,
                     !0,
@@ -266,8 +317,8 @@ impl X11Capturer {
             .get_image(
                 ImageFormat::Z_PIXMAP,
                 self.root,
-                0,
-                0,
+                self.region_x,
+                self.region_y,
                 w as u16,
                 h as u16,
                 !0,

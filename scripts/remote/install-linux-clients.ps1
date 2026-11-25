@@ -15,6 +15,8 @@ param(
     [int]$Room        = 1,
     [string]$Display  = ':1',
     [string]$Auth     = '/run/user/1000/gdm/Xauthority',
+    # 只推一台显示器：给 RandR 输出名（例如 DP-1）；留空 = 推整个 X root（双屏会合并）
+    [string]$Monitor  = '',
     [switch]$SkipBuild
 )
 $ErrorActionPreference = 'Stop'
@@ -45,6 +47,7 @@ Write-Host '=== [2/4] 安装二进制到 ~/lrc/bin ===' -ForegroundColor Cyan
 Run-Remote 'mkdir -p ~/lrc/bin && cp ~/lrc-build/target/release/lrc-host-linux ~/lrc-build/target/release/lrc-client-linux ~/lrc/bin/ && ls -la ~/lrc/bin/' | Out-Null
 
 Write-Host '=== [3/4] 写 systemd 用户服务 ===' -ForegroundColor Cyan
+$monitorArg = if ($Monitor) { ' --monitor ' + $Monitor } else { '' }
 $unitHost = @"
 [Unit]
 Description=lrc 被控端 (X11 $Display)
@@ -55,7 +58,7 @@ PartOf=graphical-session.target
 Type=simple
 Environment=DISPLAY=$Display
 Environment=XAUTHORITY=$Auth
-ExecStart=%h/lrc/bin/lrc-host-linux --password $Password --display $Display --stats --listen 127.0.0.1:7800
+ExecStart=%h/lrc/bin/lrc-host-linux --password $Password --display $Display$monitorArg --stats --listen 127.0.0.1:7800
 Restart=always
 RestartSec=3
 StandardOutput=append:%h/lrc/host.log

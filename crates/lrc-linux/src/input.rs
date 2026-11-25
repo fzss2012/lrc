@@ -3,10 +3,12 @@
 //! 对外是**无状态函数**（与 Windows 端的 `lrc_capture` 输入注入同形），内部维护一条
 //! 全局 X11 连接 + keysym→keycode 缓存，第一次调用时惰性建立。
 //!
-//! 坐标系：XTEST 的 MotionNotify 用**绝对坐标且以 root window 为基准**，
-//! 正好等于被控端的整屏 BGRA 像素坐标（X11 无 HiDPI 缩放）。
+//! 坐标系：XTEST 的 MotionNotify 用**绝对坐标且以 root window 为基准**。
+//! 只推一台显示器时，客户端送来的是"采集区域内的相对坐标"，这里加上区域原点
+//! 换算成 root 坐标（见 set_pointer_origin）。整屏采集时原点就是 (0, 0)。
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use x11rb::connection::Connection;
@@ -188,6 +190,25 @@ fn global() -> MutexGuard<'static, Option<Input>> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 采集区域原点（root 坐标）。客户端坐标是区域内相对坐标，注入前要加上它。
+static POINTER_ORIGIN: AtomicI32 = AtomicI32::new(0);
+static POINTER_ORIGIN_Y: AtomicI32 = AtomicI32::new(0);
+
+/// 设置采集区域原点（root 坐标）。只推一台显示器时必须设，
+/// 否则点击会整体偏移（例如双屏时右屏的 (0,0) 被当成 root 的 (0,0)）。
+pub fn set_pointer_origin(x: i32, y: i32) {
+    POINTER_ORIGIN.store(x, Ordering::Relaxed);
+    POINTER_ORIGIN_Y.store(y, Ordering::Relaxed);
+}
+
+/// 当前采集区域原点（root 坐标）。
+pub fn pointer_origin() -> (i32, i32) {
+    (
+        POINTER_ORIGIN.load(Ordering::Relaxed),
+        POINTER_ORIGIN_Y.load(Ordering::Relaxed),
+    )
+}
+
 /// 查询当前指针位置（root 坐标）。用于自测注入是否真的生效；失败返回 None。
 pub fn pointer_pos() -> Option<(i32, i32)> {
     let mut g = global();
@@ -195,7 +216,7 @@ pub fn pointer_pos() -> Option<(i32, i32)> {
     inp.pointer_pos_inner()
 }
 
-/// 移动鼠标到屏幕绝对坐标。
+/// 移动鼠标到**采集区域内**的绝对坐标（会加上采集区域原点）。
 ///
 /// X 的指针加速会作用在"绝对移动产生的增量"上，实测落点可能差 1–3 px（远程控制里
 /// 足以点歪小按钮）。这里读回位置、偏了就补发一次——第二次的增量很小，加速畸变可忽略，
@@ -203,8 +224,9 @@ pub fn pointer_pos() -> Option<(i32, i32)> {
 pub fn send_mouse_move(x: i32, y: i32) {
     let mut g = global();
     let Some(inp) = g.as_mut() else { return };
-    let px = x.clamp(0, i16::MAX as i32) as i16;
-    let py = y.clamp(0, i16::MAX as i32) as i16;
+    let (ox, oy) = pointer_origin();
+    let px = x.saturating_add(ox).clamp(0, i16::MAX as i32) as i16;
+    let py = y.saturating_add(oy).clamp(0, i16::MAX as i32) as i16;
     if let Err(e) = inp.fake(EV_MOTION_NOTIFY, 0, px, py) {
         log::warn!("{e}");
         return;

@@ -3,11 +3,15 @@
 //! 用法（与 Windows 版一致）：
 //!   lrc-host-linux --password 1234 [--display :1] [--listen 0.0.0.0:7800]
 //!                  [--signal <vps>:7801 --room 1 --p2p auto|relay|direct|off]
+//!                  [--monitor DP-1 | --region 1920x1080+0+0]
 //!
 //! 与 Windows 版 crates/lrc-host 的差别（平台相关部分）：
 //! - 采集：lrc_linux::X11Capturer 每次抓整屏，没有脏区通知，靠块哈希自己算增量
 //! - 输入：lrc_linux::input 的 XTEST 封装，键位需要把 Windows scancode 翻成 X11 keysym
-//! - 不做：视频通道、音频、光标形状、显示器切换、自适应控制器（后续再加）
+//! - 多显示器：Windows 版按 DXGI 输出逐屏推；Linux 版是**单个 X root**，
+//!   双屏会被合成一张（例如 3840x1080）。只想推一台屏时用 --monitor / --region
+//!   裁出那块矩形，ServerHello 报的是这块的尺寸，输入坐标也按这块换算。
+//! - 不做：视频通道、音频、光标形状、显示器切换（SelectDisplay 忽略）、自适应控制器
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener};
@@ -81,6 +85,10 @@ struct Args {
     listen: String,
     /// X11 display 名（例如 ":1"）；None = 用环境变量 DISPLAY
     display: Option<String>,
+    /// 只推 root 上的一块区域（例如单台 1920x1080 显示器）
+    region: Option<lrc_linux::Region>,
+    /// 按 RandR 输出名选一台显示器（例如 DP-1）；与 --region 二选一
+    monitor: Option<String>,
     fps: u32,
     quality: u8,
     stats: bool,
@@ -90,7 +98,7 @@ struct Args {
 }
 
 fn usage() -> &'static str {
-    "用法: lrc-host-linux --password <PWD> [--listen IP:PORT] [--display :1] [--fps N] [--quality N]\n                         [--stats] [--signal IP:PORT] [--room N] [--p2p auto|off|direct|relay]"
+    "用法: lrc-host-linux --password <PWD> [--listen IP:PORT] [--display :1] [--fps N] [--quality N]\n                         [--stats] [--signal IP:PORT] [--room N] [--p2p auto|off|direct|relay]\n                         [--monitor <输出名> | --region WxH+X+Y]"
 }
 
 /// 取一个参数值：支持 --flag value 与 --flag=value 两种写法。
@@ -109,6 +117,8 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     let mut password: Option<String> = None;
     let mut listen = String::from("0.0.0.0:7800");
     let mut display: Option<String> = None;
+    let mut region: Option<lrc_linux::Region> = None;
+    let mut monitor: Option<String> = None;
     let mut fps: u32 = 30;
     let mut quality: u8 = 85;
     let mut stats = false;
@@ -130,6 +140,11 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
             "--password" => password = Some(take_value(&mut it, inline_val.clone(), &name)?),
             "--listen" => listen = take_value(&mut it, inline_val.clone(), &name)?,
             "--display" => display = Some(normalize_display(&take_value(&mut it, inline_val.clone(), &name)?)),
+            "--region" => {
+                let v = take_value(&mut it, inline_val.clone(), &name)?;
+                region = Some(lrc_linux::Region::parse(&v)?);
+            }
+            "--monitor" => monitor = Some(take_value(&mut it, inline_val.clone(), &name)?),
             "--fps" => {
                 let v = take_value(&mut it, inline_val.clone(), &name)?;
                 fps = v.parse::<u32>().map_err(|_| format!("--fps 需要整数，收到 {v}"))?;
@@ -173,10 +188,15 @@ fn parse_args(argv: Vec<String>) -> Result<Args, String> {
     if password.is_empty() {
         return Err("--password 不能为空".to_string());
     }
+    if region.is_some() && monitor.is_some() {
+        return Err("--region 与 --monitor 只能给一个".to_string());
+    }
     Ok(Args {
         password,
         listen,
         display,
+        region,
+        monitor,
         fps,
         quality,
         stats,
@@ -607,11 +627,28 @@ fn run(link: AcquiredLink, args: &Args) -> Result<(), String> {
     };
     log::info!("采集屏幕：{info}");
 
+    // 2.1) 只推一台显示器时的采集区域（--region / --monitor）
+    let region = match resolve_region(args) {
+        Ok(r) => r,
+        Err(e) => {
+            log::error!("采集区域解析失败：{e}");
+            writer.shutdown();
+            return Ok(());
+        }
+    };
+    let (out_w, out_h) = match region {
+        Some(r) => {
+            log::info!("只推显示器区域：{r}（整屏 root 是 {info}）");
+            (r.width, r.height)
+        }
+        None => (info.width, info.height),
+    };
+
     let nonce_s = make_nonce(args.room as u64);
     let srv = Message::ServerHello(ServerHello {
         version: PROTO_VERSION,
-        width: info.width,
-        height: info.height,
+        width: out_w,
+        height: out_h,
         rotation: 0,
         nonce_s,
     });
@@ -650,7 +687,7 @@ fn run(link: AcquiredLink, args: &Args) -> Result<(), String> {
         }
     };
 
-    let result = capture_loop(args, info, Arc::clone(&shared), path);
+    let result = capture_loop(args, info, region, Arc::clone(&shared), path);
 
     shared.stop_now();
     shared.shutdown();
@@ -1137,16 +1174,47 @@ fn chunk_flags(index: usize, send_full: bool) -> u8 {
     }
 }
 
+/// 解析 --region / --monitor：都没有就是整屏（None）。
+fn resolve_region(args: &Args) -> Result<Option<lrc_linux::Region>, String> {
+    if let Some(r) = args.region {
+        return Ok(Some(r));
+    }
+    let Some(want) = args.monitor.as_deref() else {
+        return Ok(None);
+    };
+    let monitors = lrc_linux::monitors().map_err(|e| format!("枚举显示器失败：{e}"))?;
+    if monitors.is_empty() {
+        return Err("--monitor：RandR 没报告任何已连接的显示器".to_string());
+    }
+    let listed = monitors
+        .iter()
+        .map(|m| m.to_string())
+        .collect::<Vec<_>>()
+        .join("，");
+    match lrc_linux::pick_monitor(&monitors, Some(want)) {
+        Some(m) => {
+            log::info!("--monitor {want} → {m}（共 {list:?}）", list = listed);
+            Ok(Some(m.region()))
+        }
+        None => Err(format!("--monitor {want} 没找到；已连接：{listed}")),
+    }
+}
+
 fn capture_loop(
     args: &Args,
     info: lrc_linux::DisplayInfo,
+    region: Option<lrc_linux::Region>,
     shared: Arc<Shared>,
     path: &'static str,
 ) -> Result<(), String> {
-    let mut capturer =
-        lrc_linux::X11Capturer::new(info).map_err(|e| format!("创建 X11 采集器失败：{e}"))?;
-    let mut grid = Grid::new(BLOCK_SIZE, info.width, info.height)
-        .ok_or_else(|| format!("网格非法 {}x{}", info.width, info.height))?;
+    let mut capturer = lrc_linux::X11Capturer::new_with_region(info, region)
+        .map_err(|e| format!("创建 X11 采集器失败：{e}"))?;
+    // 鼠标注入要加采集区域原点，否则单屏模式下点击整体偏移
+    let (origin_x, origin_y) = capturer.origin();
+    lrc_linux::set_pointer_origin(origin_x, origin_y);
+    let mut grid = Grid::new(BLOCK_SIZE, capturer.size().0, capturer.size().1)
+        .ok_or_else(|| format!("网格非法 {}x{}", capturer.size().0, capturer.size().1))?;
+    let (out_w, out_h) = capturer.size();
     log::info!("采集路径：{}", capturer.path_name());
     let mut hashes: Vec<u64> = vec![0; grid.count() as usize];
     let mut have_prev = false;
@@ -1168,7 +1236,7 @@ fn capture_loop(
     let mut sec = Stats::default();
     let mut last_report = Instant::now();
     let mut capture_failures: u32 = 0;
-    let mut cur_size = (info.width, info.height);
+    let mut cur_size = (out_w, out_h);
     // 光标：X11 的 GetImage 不含光标，必须走 XFixes 单独抓（位置 + 位图）
     let mut cursor_watcher = match lrc_linux::CursorWatcher::new(None) {
         Ok(w) => Some(w),
@@ -1181,7 +1249,9 @@ fn capture_loop(
     let cursor_poll_interval = Duration::from_millis(16);
 
     log::info!(
-        "推流 {}x{} = {}x{} 块（{}px），上限 {}fps，JPEG q{}",
+        "推流 {}x{}（整屏 {}x{}） = {}x{} 块（{}px），上限 {}fps，JPEG q{}",
+        out_w,
+        out_h,
         info.width,
         info.height,
         grid.blocks_x,
@@ -1245,10 +1315,18 @@ fn capture_loop(
                             sec.cursor += 1;
                         }
                     }
+                    // 单屏模式下光标坐标要换算成采集区域内的相对坐标，
+                    // 跑到区域外就当作不可见（客户端不该在别的屏上画光标）。
+                    let rel_x = st.x - origin_x;
+                    let rel_y = st.y - origin_y;
+                    let inside = rel_x >= 0
+                        && rel_y >= 0
+                        && u32::try_from(rel_x).map_or(false, |v| v < out_w)
+                        && u32::try_from(rel_y).map_or(false, |v| v < out_h);
                     let pos = Message::CursorPos(lrc_proto::CursorPos {
-                        x: clamp_i16(st.x),
-                        y: clamp_i16(st.y),
-                        visible: st.visible,
+                        x: clamp_i16(rel_x.clamp(0, i32::from(i16::MAX))),
+                        y: clamp_i16(rel_y.clamp(0, i32::from(i16::MAX))),
+                        visible: st.visible && inside,
                     })
                     .encode();
                     if let Err(e) = shared.send(&pos) {
@@ -1502,6 +1580,8 @@ mod tests {
         assert_eq!(a.password, "1234");
         assert_eq!(a.listen, "0.0.0.0:7800");
         assert_eq!(a.display, None);
+        assert_eq!(a.region, None);
+        assert_eq!(a.monitor, None);
         assert_eq!(a.fps, 30);
         assert_eq!(a.quality, 85);
         assert!(!a.stats);
@@ -1529,11 +1609,22 @@ mod tests {
             "9",
             "--p2p",
             "relay",
+            "--region",
+            "1920x1080+1920+0",
         ]))
         .expect("parse");
         assert_eq!(a.password, "secret");
         assert_eq!(a.listen, "127.0.0.1:9000");
         assert_eq!(a.display.as_deref(), Some(":1"));
+        assert_eq!(
+            a.region,
+            Some(lrc_linux::Region {
+                x: 1920,
+                y: 0,
+                width: 1920,
+                height: 1080
+            })
+        );
         assert_eq!(a.fps, 24);
         assert_eq!(a.quality, 70);
         assert!(a.stats);
@@ -1552,6 +1643,23 @@ mod tests {
         assert!(parse_args(argv(&["--password", "1", "--p2p", "hole"])).is_err());
         assert!(parse_args(argv(&["--password", "1", "--signal", "nope"])).is_err());
         assert!(parse_args(argv(&["--password", "1", "--bogus"])).is_err());
+        assert!(parse_args(argv(&["--password", "1", "--region", "1920"])).is_err());
+    }
+
+    #[test]
+    fn monitor_and_region_are_exclusive() {
+        let a = parse_args(argv(&["--password", "1", "--monitor", "DP-1"])).expect("parse");
+        assert_eq!(a.monitor.as_deref(), Some("DP-1"));
+        assert_eq!(a.region, None);
+        assert!(parse_args(argv(&[
+            "--password",
+            "1",
+            "--monitor",
+            "DP-1",
+            "--region",
+            "1920x1080"
+        ]))
+        .is_err());
     }
 
     #[test]

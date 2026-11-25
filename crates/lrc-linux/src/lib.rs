@@ -18,5 +18,5 @@ pub mod input;
 
 pub use capture::{Frame, X11Capturer};
 pub use cursor::{CursorPoll, CursorShape, CursorState, CursorWatcher, CursorWatcherStats};
-pub use display::DisplayInfo;
-pub use input::{send_key, send_mouse_button, send_mouse_move, send_wheel};
+pub use display::{monitors, pick_monitor, DisplayInfo, MonitorInfo, Region};
+pub use input::{send_key, send_mouse_button, send_mouse_move, send_wheel, set_pointer_origin};

@@ -16,7 +16,8 @@ Windows 版的 `lrc-host` / `lrc-client` 依赖 DXGI/D3D11/Win32，不能直接�
 |---|---|
 | 系统 | Ubuntu 24.04.4 LTS，内核 6.17，**X11**（Xorg 在 `:1`） |
 | 硬件 | 32 核 / 64 GB / RTX 5090 |
-| 屏幕 | **3840×1080 单个 X root**（双屏被 X 合并），60×17 块网格 |
+| 屏幕 | 双屏：`DP-1` 1920×1080+0+0（primary）、`HDMI-0` 1920×1080+1920+0；X root = **3840×1080** |
+| 单屏模式 | `--monitor DP-1`（RandR 输出名）或 `--region 1920x1080+0+0` → 推 1920×1080，30×17 块网格 |
 | 采集 | MIT-SHM **3.5 ms/帧**（回退 GetImage 6.95 ms，`LRC_NO_SHM=1` 可强制回退） |
 | 光标 | XFixes `GetCursorImage`，不动时 0 上报；poll 约 90–120 µs |
 | 输入 | XTEST（含指针加速补偿、keysym→keycode 临时映射） |
@@ -45,6 +46,30 @@ ssh -F C:\Users\sss\.ssh\lrc-ssh-config -N -L 7800:127.0.0.1:7800 yanfa2
 # 2) 另一个窗口起客户端
 target\release\lrc-client.exe --password 1234 --connect 127.0.0.1:7800 --stats
 ```
+
+### 只推一台显示器（双屏被 X 合并时）
+
+X11 的 root 是**一张合成画面**（yanfa2 是 3840×1080），默认推的是整张。
+只要一台 1920×1080 的屏时，被控端裁一块出来：
+
+```bash
+# 按 RandR 输出名（推荐：名字跟着硬件走，左右换了也不用改参数）
+~/lrc/bin/lrc-host-linux --password 1234 --display :1 --monitor DP-1
+
+# 或者直接给区域（WxH+X+Y，root 坐标）
+~/lrc/bin/lrc-host-linux --password 1234 --display :1 --region 1920x1080+1920+0
+```
+
+装上系统服务时用安装脚本的一行参数：`-Monitor DP-1`。
+
+行为说明（三处都按"这块区域"算，不会串到另一台屏）：
+
+| 环节 | 单屏模式下的行为 |
+|---|---|
+| ServerHello | 报**区域**尺寸（1920×1080），客户端窗口随之变成 16:9 |
+| 采集 | `GetImage(ShmGetImage)` 只取 (x,y,w,h)，线上只有这块的像素 |
+| 鼠标 | 客户端坐标 + 区域原点 → root 坐标；**实测**点 client (640,360) 落在 DP-1 的 (960,540)、HDMI-0 的 (2880,540) |
+| 光标 | 位置换算成区域内坐标；跑到区域外按不可见处理，不会在画面上画出别处的光标 |
 
 ### 从 yanfa2 控 Windows
 
@@ -76,7 +101,8 @@ sudo ip rule add sport 7801 lookup main pref 8998
 ## 本期没做
 
 - **音频**（lrc-audio 是 WASAPI，Linux 要重写 PulseAudio/PipeWire）
-- 视频通道（NVENC）、自适应降级、多显示器切换（Linux 端目前只有块模式、单 X root）
+- 视频通道（NVENC）、自适应降级、多显示器切换（Linux 端只有块模式；
+  多屏要么整张 root 一起推，要么用 --monitor / --region 定死一台，运行中不能切）
 - **Wayland**（只支持 X11；Wayland 会话下采集要换 PipeWire+portal）
 
 ## 构建/测试
@@ -85,6 +111,6 @@ sudo ip rule add sport 7801 lookup main pref 8998
 # 同步源码到 yanfa2 并构建
 powershell -NoProfile -File scripts\remote\linux-build.ps1
 powershell -NoProfile -File scripts\remote\linux-build.ps1 -CargoArgs "test -p lrc-linux"
-# 一键安装（构建 + 装 bin + systemd 用户服务）
-powershell -NoProfile -File scripts\remote\install-linux-clients.ps1
+# 一键安装（构建 + 装 bin + systemd 用户服务）；只要一台屏时加 -Monitor
+powershell -NoProfile -File scripts\remote\install-linux-clients.ps1 -Monitor DP-1
 ```
