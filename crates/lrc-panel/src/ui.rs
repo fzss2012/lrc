@@ -18,13 +18,16 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DispatchMessageW,
-    GetCursorPos, GetDlgItem, GetMessageW, GetWindowLongPtrW, LoadCursorW, LoadIconW,
+    GetCursorPos, GetDlgItem, GetMessageW, GetWindowLongPtrW, LoadCursorW,
+    LoadIconW,
     PostQuitMessage, RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowLongPtrW,
     SetWindowTextW, SetTimer, ShowWindow, TrackPopupMenu, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, CW_USEDEFAULT, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA, HMENU,
+    CS_VREDRAW, CW_USEDEFAULT, ES_AUTOHSCROLL, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
+    GWLP_USERDATA, HMENU,
     IDC_ARROW, IDI_APPLICATION, MF_CHECKED, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_SHOWNORMAL,
     TPM_RIGHTBUTTON, WM_CLOSE, WM_COMMAND, WM_CREATE, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP,
-    WM_SETFONT, WM_TIMER, WM_USER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    WM_SETFONT, WM_TIMER, WM_USER, WNDCLASSW, WS_BORDER, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE,
     WS_VSCROLL,
 };
 
@@ -37,6 +40,10 @@ const ID_BTN_TOGGLE: usize = 200;
 const ID_BTN_RESTART: usize = 202;
 const ID_BTN_TUNNEL: usize = 205;
 const ID_BTN_SETTINGS: usize = 206;
+/// 远程视口：目标地址输入框
+const ID_VIEW_ADDR: usize = 110;
+/// 远程视口：打开/关闭
+const ID_BTN_VIEW: usize = 207;
 
 const ID_TRAY_SHOW: usize = 300;
 const ID_TRAY_SETTINGS: usize = 301;
@@ -48,6 +55,8 @@ struct App {
     config_path: PathBuf,
     tray: bool,
     icon_added: bool,
+    /// 远程视口进程（lrc-client）。None = 没打开。
+    viewer: std::cell::RefCell<Option<std::process::Child>>,
 }
 
 fn window_class() -> PCWSTR {
@@ -59,7 +68,13 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 pub fn run(ipc_addr: SocketAddr, config_path: PathBuf, tray: bool) -> Result<(), String> {
-    let app = Box::new(App { ipc_addr, config_path, tray, icon_added: false });
+    let app = Box::new(App {
+        ipc_addr,
+        config_path,
+        tray,
+        icon_added: false,
+        viewer: std::cell::RefCell::new(None),
+    });
     let app_ptr: *mut App = Box::into_raw(app);
 
     let module =
@@ -97,7 +112,7 @@ pub fn run(ipc_addr: SocketAddr, config_path: PathBuf, tray: bool) -> Result<(),
             CW_USEDEFAULT,
             CW_USEDEFAULT,
             640,
-            470,
+            520,
             None,
             None,
             Some(hinstance),
@@ -150,17 +165,27 @@ unsafe extern "system" fn wndproc(
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, cs.lpCreateParams as isize) };
             let app = &mut *(cs.lpCreateParams as *mut App);
 
-            create_child(hwnd, "EDIT", "", 12, 12, 600, 270, ID_STATUS);
-            create_child(hwnd, "BUTTON", "暂停服务", 12, 296, 140, 36, ID_BTN_TOGGLE);
-            create_child(hwnd, "BUTTON", "重启服务", 162, 296, 120, 36, ID_BTN_RESTART);
-            create_child(hwnd, "BUTTON", "连接远程", 292, 296, 140, 36, ID_BTN_TUNNEL);
-            create_child(hwnd, "BUTTON", "设置", 442, 296, 100, 36, ID_BTN_SETTINGS);
+            // 状态区（本机被控）
+            create_child(hwnd, "READONLY", "", 12, 12, 600, 230, ID_STATUS);
+
+            // ---- 本机：让别人连进来 ----
+            create_child(hwnd, "STATIC", "本机允许被远程控制", 12, 250, 600, 20, 998);
+            create_child(hwnd, "BUTTON", "暂停服务", 12, 272, 140, 36, ID_BTN_TOGGLE);
+            create_child(hwnd, "BUTTON", "重启服务", 162, 272, 120, 36, ID_BTN_RESTART);
+            create_child(hwnd, "BUTTON", "允许远程接入", 292, 272, 140, 36, ID_BTN_TUNNEL);
+            create_child(hwnd, "BUTTON", "设置", 442, 272, 100, 36, ID_BTN_SETTINGS);
+
+            // ---- 远程视口：连到别的电脑看画面 ----
+            create_child(hwnd, "STATIC", "远程控制其他电脑", 12, 322, 600, 20, 997);
+            create_child(hwnd, "INPUT", "", 12, 344, 380, 30, ID_VIEW_ADDR);
+            create_child(hwnd, "BUTTON", "打开远程画面", 402, 344, 140, 30, ID_BTN_VIEW);
+
             create_child(
                 hwnd,
                 "STATIC",
                 "关闭窗口会缩到托盘，服务继续在后台运行",
                 12,
-                344,
+                386,
                 600,
                 24,
                 999,
@@ -174,6 +199,7 @@ unsafe extern "system" fn wndproc(
         }
         WM_TIMER => {
             refresh(hwnd);
+            sync_viewer_button(hwnd);
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -201,6 +227,7 @@ unsafe extern "system" fn wndproc(
                     refresh(hwnd);
                 }
                 ID_BTN_SETTINGS => open_settings(hwnd),
+                ID_BTN_VIEW => toggle_viewer(hwnd),
                 ID_TRAY_SHOW => {
                     unsafe {
                         let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
@@ -302,6 +329,155 @@ fn toggle_autostart(hwnd: HWND) {
     }
 }
 
+
+/// 读取输入框里的地址。
+fn viewer_addr(hwnd: HWND) -> String {
+    // 用 WM_GETTEXT 读：GetWindowTextW 在跨进程/消息过滤场景下可能读不到控件内容
+    // （实测在面板自身进程里也会返回 0，而 WM_GETTEXT 稳定）。
+    const WM_GETTEXT: u32 = 0x000D;
+    let mut buf = [0u16; 256];
+    unsafe {
+        let edit = GetDlgItem(Some(hwnd), ID_VIEW_ADDR as i32).unwrap_or_default();
+        if edit.0.is_null() {
+            log::warn!("找不到地址输入框控件");
+            return String::new();
+        }
+        let len = SendMessageW(edit, 0x000E, Some(WPARAM(0)), Some(LPARAM(0)));
+        let n = SendMessageW(
+            edit,
+            WM_GETTEXT,
+            Some(WPARAM(buf.len())),
+            Some(LPARAM(buf.as_mut_ptr() as isize)),
+        );
+        log::info!(
+            "addr read: hwnd={edit:?} textlen={} got={}",
+            len.0,
+            n.0
+        );
+        let n = n.0.max(0) as usize;
+        String::from_utf16_lossy(&buf[..n.min(buf.len())])
+            .trim()
+            .to_string()
+    }
+}
+
+/// 视口进程是否还活着（并在活着时回收句柄）。
+fn viewer_running(hwnd: HWND) -> bool {
+    let app = unsafe { app_of(hwnd) };
+    let mut slot = app.viewer.borrow_mut();
+    match slot.as_mut() {
+        Some(child) => match child.try_wait() {
+            Ok(None) => true,
+            Ok(Some(_)) | Err(_) => {
+                *slot = None;
+                false
+            }
+        },
+        None => false,
+    }
+}
+
+fn sync_viewer_button(hwnd: HWND) {
+    let running = viewer_running(hwnd);
+    set_button_text(hwnd, ID_BTN_VIEW, if running { "关闭远程画面" } else { "打开远程画面" });
+}
+
+/// 打开/关闭远程视口。
+///
+/// 视口是独立的 lrc-client 窗口（它自己有完整的渲染/输入转发），
+/// 面板只负责把它拉起来和关掉——这样两者互不影响，视口崩溃也不会拖垮服务。
+fn toggle_viewer(hwnd: HWND) {
+    if viewer_running(hwnd) {
+        let app = unsafe { app_of(hwnd) };
+        if let Some(mut child) = app.viewer.borrow_mut().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            log::info!("已关闭远程画面");
+        }
+        sync_viewer_button(hwnd);
+        return;
+    }
+
+    let addr = viewer_addr(hwnd);
+    log::info!("打开远程画面：addr=<{addr}>");
+    if addr.is_empty() {
+        show_message(
+            hwnd,
+            "请先填写要连接的对方地址，例如 192.168.1.10:7805",
+        );
+        return;
+    }
+
+    // 客户端和执行面板放在同一目录（产物是一起发布的）
+    let client = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(|d| d.join("lrc-client.exe")))
+        .unwrap_or_else(|| std::path::PathBuf::from("lrc-client.exe"));
+    if !client.is_file() {
+        show_message(
+            hwnd,
+            &format!("找不到远程画面程序：\n{}\n\n请确认 lrc-client.exe 与本程序在同一目录。", client.display()),
+        );
+        return;
+    }
+
+    // 密码走环境变量，不出现在命令行（命令行对同机其它用户可见）
+    let password = unsafe { app_of(hwnd) }
+        .config_path
+        .parent()
+        .and_then(|_| read_config_password())
+        .unwrap_or_default();
+
+    let mut cmd = std::process::Command::new(&client);
+    cmd.arg("--connect").arg(&addr);
+    if !password.is_empty() {
+        cmd.env("LRC_PASSWORD", &password);
+    }
+    match cmd.spawn() {
+        Ok(child) => {
+            log::info!("已打开远程画面：{addr}（pid={}）", child.id());
+            unsafe { app_of(hwnd) }.viewer.borrow_mut().replace(child);
+        }
+        Err(e) => show_message(hwnd, &format!("打开远程画面失败：{e}")),
+    }
+    sync_viewer_button(hwnd);
+}
+
+/// 从配置文件里取 password（视口要和本机服务用同一个密码）。
+fn read_config_password() -> Option<String> {
+    let text = std::fs::read_to_string(lrc_supervisor::config_file::config_path()).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == "password" {
+                let v = v.trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 在状态区显示一条提示（不弹模态框——模态框会卡住整个消息循环，
+/// 用户不点掉之前面板完全不响应，实测很难受）。
+fn show_message(hwnd: HWND, text: &str) {
+    log::warn!("{text}");
+    let mut msg = String::from(text);
+    if !msg.ends_with('\n') {
+        msg.push('\n');
+    }
+    let w = wide(&msg);
+    unsafe {
+        let child = GetDlgItem(Some(hwnd), ID_STATUS as i32).unwrap_or_default();
+        let _ = SetWindowTextW(child, PCWSTR::from_raw(w.as_ptr()));
+    }
+}
+
 fn open_settings(hwnd: HWND) {
     let p = unsafe { app_of(hwnd) }.config_path.clone();
     let _ = std::process::Command::new("notepad").arg(&p).spawn();
@@ -318,13 +494,26 @@ fn create_child(
     id: usize,
 ) -> HWND {
     let extra = match class {
-        "EDIT" => {
+        // 状态区：只读多行 EDIT。
+        // 注意必须区分"只读展示"和"可输入"两种 EDIT——
+        // 之前统一按只读多行建，导致地址输入框用户打不进字（实测）。
+        "READONLY" => {
             let es = (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL.0 as i32) as u32;
+            windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(es)
+        }
+        // 输入框：单行可编辑
+        "INPUT" => {
+            let es = (ES_AUTOHSCROLL | WS_TABSTOP.0 as i32) as u32;
             windows::Win32::UI::WindowsAndMessaging::WINDOW_STYLE(es)
         }
         _ => WS_BORDER,
     };
-    let class_w = wide(class);
+    // 我们自己的类别名 -> 真正的 Win32 窗口类
+    let win_class = match class {
+        "READONLY" | "INPUT" => "EDIT",
+        other => other,
+    };
+    let class_w = wide(win_class);
     let text_w = wide(text);
     unsafe {
         let hwnd = CreateWindowExW(
@@ -342,7 +531,7 @@ fn create_child(
             None,
         )
         .unwrap_or_default();
-        if class != "EDIT" {
+        if class != "READONLY" {
             let mut font = GetStockObject(DEFAULT_GUI_FONT);
             if font.is_invalid() {
                 font = GetStockObject(SYSTEM_FONT);
@@ -397,7 +586,13 @@ fn refresh(hwnd: HWND) {
         .find(|l| l.starts_with("tunnel.running="))
         .map(|l| l.contains("true"))
         .unwrap_or(false);
-    set_button_text(hwnd, ID_BTN_TUNNEL, if tunnel_running { "断开远程" } else { "连接远程" });
+    // 这个开关控制的是"别人能不能连进来"（反向隧道），
+    // 和下面"远程控制其他电脑"（我去连别人）是两回事，文案必须区分开。
+    set_button_text(
+        hwnd,
+        ID_BTN_TUNNEL,
+        if tunnel_running { "停止远程接入" } else { "允许远程接入" },
+    );
 
     let text = if raw.is_empty() {
         String::from("无法连接后台服务。\r\n\r\n请确认程序正在运行，或检查设置。")
@@ -426,12 +621,15 @@ fn render(raw: &str) -> String {
         v => v == "true",
     };
     let healthy = get("host.healthy") == "true";
+    let busy = get("host.busy") == "true";
     let tunnel_running = get("tunnel.running") == "true";
     let tunnel_healthy = get("tunnel.healthy") == "true";
 
-    // 主状态一句话
+    // 主状态一句话。busy = 有客户端正连着（单流 host 的正常状态）
     let headline = if !enabled {
         "服务已暂停"
+    } else if busy {
+        "正在被远程控制"
     } else if healthy {
         "服务运行中"
     } else {
@@ -453,6 +651,8 @@ fn render(raw: &str) -> String {
     // 画面服务
     let stream = if !enabled {
         "已暂停"
+    } else if busy {
+        "使用中"
     } else if healthy {
         "正常"
     } else {
@@ -514,7 +714,7 @@ mod tests {
 
     fn sample(enabled: bool, healthy: bool) -> String {
         format!(
-            "service_enabled={enabled}\naccept_clients={enabled}\nhost.healthy={healthy}\nhost.running={healthy}\nhost.probe_ms=12\nhost.restarts=0\nsupervisor.pid=42\nsupervisor.uptime_s=200\ntunnel.enabled=true\ntunnel.running=true\ntunnel.healthy=true\ntunnel.remote=yanfa2:17800\ntunnel.reconnects=0\nhost.exe_freshness=match\nhost.last_error=-\ntunnel.last_error=-\nhost.exe=C:\\x.exe\nhost.exe_built=2026-01-01T00:00\n"
+            "service_enabled={enabled}\naccept_clients={enabled}\nhost.healthy={healthy}\nhost.busy=false\nhost.running={healthy}\nhost.probe_ms=12\nhost.restarts=0\nsupervisor.pid=42\nsupervisor.uptime_s=200\ntunnel.enabled=true\ntunnel.running=true\ntunnel.healthy=true\ntunnel.remote=yanfa2:17800\ntunnel.reconnects=0\nhost.exe_freshness=match\nhost.last_error=-\ntunnel.last_error=-\nhost.exe=C:\\x.exe\nhost.exe_built=2026-01-01T00:00\n"
         )
     }
 
@@ -539,6 +739,16 @@ mod tests {
         let raw = sample(true, true).replace("host.exe_freshness=match", "host.exe_freshness=stale");
         let out = render(&raw);
         assert!(out.contains("重启服务"), "{out}");
+    }
+
+    #[test]
+    fn render_busy_is_not_treated_as_failure() {
+        // host 单流：有客户端连上时探测必失败，但那是"正在服务"不是故障。
+        // 如果面板把它显示成"正在恢复"，用户会以为服务坏了。
+        let raw = sample(true, true).replace("host.busy=false", "host.busy=true");
+        let out = render(&raw);
+        assert!(out.contains("正在被远程控制"), "{out}");
+        assert!(!out.contains("正在恢复"), "{out}");
     }
 
     #[test]

@@ -32,6 +32,9 @@ struct Slot {
     /// 端口上已经有别人起的实例，我们只是接管观测
     adopted: bool,
     healthy: bool,
+    /// 正在为某个客户端服务（host 是单流的：有人连上时探测必然失败，
+    /// 那不是故障，是它在干活）。
+    busy: bool,
     probe_ms: Option<u64>,
     last_error: Option<String>,
     restarts: u32,
@@ -48,6 +51,7 @@ impl Slot {
             exe: None,
             adopted: false,
             healthy: false,
+            busy: false,
             probe_ms: None,
             last_error: None,
             restarts: 0,
@@ -67,6 +71,7 @@ impl Slot {
                 self.pid = None;
                 self.exe = None;
                 self.healthy = false;
+                self.busy = false;
                 let code = status
                     .code()
                     .map(|c| c.to_string())
@@ -87,6 +92,7 @@ impl Slot {
         self.pid = child.id().into();
         self.child = Some(child);
         self.healthy = false;
+        self.busy = false;
         self.adopted = false;
         self.next_start = None;
     }
@@ -262,13 +268,28 @@ impl Daemon {
         if self.host.child.is_some() || self.host.adopted {
             let addr = self.cfg.host_addr();
             let r = probe::probe_host(&addr, PROBE_TIMEOUT);
-            self.host.healthy = r.ok;
             self.host.probe_ms = Some(r.elapsed_ms);
-            if !r.ok {
-                self.host.last_error = r.error.clone();
-                log::warn!("host 探测失败: {:?}", r.error);
-            } else {
+            if r.ok {
+                self.host.healthy = true;
+                self.host.busy = false;
                 self.host.last_error = None;
+            } else {
+                // host 是单流的：一个客户端占着连接时，探测连不进来、
+                // 或者连进来也拿不到握手回应——这是"正在服务"，不是"坏了"。
+                //
+                // 之前没区分这两种情况，探测一失败就当成 host 挂了并重启，
+                // 等于把用户正在用的远程会话直接掐断（实测复现）。
+                let serving = self.host_alive() && port_has_established(&addr);
+                self.host.busy = serving;
+                self.host.healthy = serving;
+                self.host.last_error = if serving {
+                    None
+                } else {
+                    r.error.clone()
+                };
+                if !serving {
+                    log::warn!("host 探测失败: {:?}", r.error);
+                }
             }
         }
         // 隧道：本地端口通只说明 ssh 客户端还活着；真正的判据是**远端在监听**。
@@ -308,14 +329,16 @@ impl Daemon {
                 self.spawn_host();
             }
         }
-        // host 被接管后进程可能被别人杀掉
-        if self.host.adopted {
-            if !self.host.healthy && self.host.child.is_none() {
-                // 连续探测失败：放弃接管，自己拉起
-                log::warn!("接管的 host 已不可用，转为自行拉起");
-                self.host.adopted = false;
-                self.host.next_start = Some(Instant::now());
-            }
+        // host 被接管后进程可能被别人杀掉。
+        // 判据必须是"进程真的没了"——不能看探测结果：它在服务客户端时
+        // 探测一定失败，那时候重拉等于把用户的会话踢掉。
+        if self.host.adopted && !self.host_alive() {
+            log::warn!("接管的 host 进程已不存在，转为自行拉起");
+            self.host.adopted = false;
+            self.host.pid = None;
+            self.host.healthy = false;
+            self.host.busy = false;
+            self.host.next_start = Some(Instant::now());
         }
         // tunnel
         if self.cfg.tunnel.is_some() && self.tunnel.child.is_none() {
@@ -462,6 +485,7 @@ impl Daemon {
                 pid: self.host.pid,
                 exe: self.host.exe.clone(),
                 healthy: self.host.healthy,
+                busy: self.host.busy,
                 probe_ms: self.host.probe_ms,
                 last_error: self.host.last_error.clone(),
                 restarts: self.host.restarts,
@@ -496,6 +520,7 @@ impl Daemon {
             s.host.pid.map(|p| p.to_string()).unwrap_or_else(|| String::from("-"))
         ));
         out.push_str(&format!("host.healthy={}\n", s.host.healthy));
+        out.push_str(&format!("host.busy={}\n", s.host.busy));
         out.push_str(&format!(
             "host.probe_ms={}\n",
             s.host.probe_ms.map(|v| v.to_string()).unwrap_or_else(|| String::from("-"))
@@ -618,6 +643,63 @@ fn spawn_tunnel(t: &TunnelConfig) -> Result<Child, String> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     cmd.spawn().map_err(|e| format!("spawn ssh 失败: {e}"))
+}
+
+impl Daemon {
+    /// host 进程本身是否还在（不管它健不健康）。
+    fn host_alive(&self) -> bool {
+        if self.host.child.is_some() {
+            return true;
+        }
+        if !self.host.adopted {
+            return false;
+        }
+        // 接管的实例：看 PID 还在不在
+        match self.host.pid {
+            Some(pid) => pid_running(pid),
+            None => find_pid_on_port(&self.cfg.host_addr()).is_some(),
+        }
+    }
+}
+
+/// 某端口上是否存在 ESTABLISHED 连接（说明有客户端正连着）。
+///
+/// host 是单流设计：有客户端占用时，健康探测必然失败。
+/// 靠这个把"正在服务"和"真的挂了"区分开。
+fn port_has_established(addr: &str) -> bool {
+    let Some(port) = addr.rsplit(':').next() else {
+        return false;
+    };
+    let Ok(out) = Command::new("netstat").args(["-ano"]).output() else {
+        return false;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        if !line.contains("ESTABLISHED") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        if cols[1].rsplit(':').next() == Some(port) {
+            return true;
+        }
+    }
+    false
+}
+
+/// PID 对应的进程是否还活着。
+fn pid_running(pid: u32) -> bool {
+    let out = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()),
+        Err(_) => false,
+    }
 }
 
 /// 从 `netstat -ano` 里找监听某端口的 PID（接管外部已启动实例用）。

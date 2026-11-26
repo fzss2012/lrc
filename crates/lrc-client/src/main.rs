@@ -29,7 +29,8 @@ fn main() -> ExitCode {
         }
     }
 
-    let cfg = match cli::Config::parse(std::env::args().skip(1)) {
+    let env_password = std::env::var("LRC_PASSWORD").ok();
+    let cfg = match cli::Config::parse_with(std::env::args().skip(1), env_password.as_deref()) {
         Ok(cli::Parsed::Run(cfg)) => cfg,
         Ok(cli::Parsed::Help) => {
             print!("{}", cli::USAGE);

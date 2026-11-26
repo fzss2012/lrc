@@ -5,7 +5,7 @@ pub const USAGE: &str = "\
 
   --connect <addr>   被控端 TCP 地址，例如 127.0.0.1:7800（连不上会每秒重试，窗口保持打开）；
                      给了 --signal 且 --p2p != off 时可省略——但省略后 P2P 失败无法回退 TCP
-  --password <pwd>   认证密码，作为 HMAC-SHA256 的 key
+  --password <pwd>   认证密码，作为 HMAC-SHA256 的 key（也可用环境变量 LRC_PASSWORD）
   --title <text>     窗口标题，默认 \"lrc viewer\"
   --audio on|off     音频通道，默认 on（设备不可用会自动降级为 off，不影响视频）
   --audio-dump <path> 把解码后的 PCM(s16le 48k/2ch) 追加写到文件，调试用
@@ -87,8 +87,20 @@ pub enum Parsed {
 }
 
 impl Config {
-    /// 解析 `--flag value` 与 `--flag=value` 两种写法。
+    /// 解析 `--flag value` 与 `--flag=value` 两种写法（无环境变量兜底）。
+    #[allow(dead_code)] // 保留给测试与外部调用；主程序走 parse_with
     pub fn parse<I>(args: I) -> Result<Parsed, String>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        Self::parse_with(args, None)
+    }
+
+    /// 同 [`Config::parse`]，但允许从环境变量取密码。
+    ///
+    /// 面板启动客户端时用这个：密码走环境变量 `LRC_PASSWORD`，
+    /// 不会出现在进程命令行里（命令行对同机其它用户可见）。
+    pub fn parse_with<I>(args: I, env_password: Option<&str>) -> Result<Parsed, String>
     where
         I: IntoIterator<Item = String>,
     {
@@ -159,7 +171,12 @@ impl Config {
         }
 
         if !has_password {
-            return Err(String::from("缺少 --password <密码>"));
+            match env_password.filter(|p| !p.is_empty()) {
+                Some(p) => {
+                    cfg.password = p.to_string();
+                }
+                None => return Err(String::from("缺少 --password <密码>（或环境变量 LRC_PASSWORD）")),
+            }
         }
         // --connect 可选：给了 --signal 且 --p2p != off 时 P2P 优先，TCP 只是兜底
         let p2p_available = cfg.signal.is_some() && cfg.p2p.enabled();

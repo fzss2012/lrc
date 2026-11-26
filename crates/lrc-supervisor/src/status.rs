@@ -20,6 +20,8 @@ pub struct HostStatus {
     pub exe: Option<ExeIdentity>,
     /// 应用层探测：能否连上并完成一次协议级交互
     pub healthy: bool,
+    /// 正在为客户端服务（单流 host 的繁忙状态，属于正常而非故障）
+    pub busy: bool,
     /// 最近一次探测耗时（毫秒）
     pub probe_ms: Option<u64>,
     /// 最近一次探测失败原因
