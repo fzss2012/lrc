@@ -1,0 +1,15 @@
+[package]
+name = "lrc-panel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lrc-panel"
+path = "src/main.rs"
+
+[dependencies]
+lrc-supervisor.workspace = true
+log.workspace = true
+env_logger.workspace = true
+windows.workspace = true

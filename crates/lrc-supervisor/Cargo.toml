@@ -1,0 +1,17 @@
+[package]
+name = "lrc-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lrc-supervisord"
+path = "src/bin/lrc-supervisord.rs"
+
+[[bin]]
+name = "lrc-ctl"
+path = "src/bin/lrc-ctl.rs"
+
+[dependencies]
+log.workspace = true
+env_logger.workspace = true

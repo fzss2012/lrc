@@ -449,6 +449,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lrc-panel"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "log",
+ "lrc-supervisor",
+ "windows",
+]
+
+[[package]]
 name = "lrc-proto"
 version = "0.1.0"
 
@@ -472,6 +482,14 @@ dependencies = [
  "lrc-proto",
  "thiserror",
  "windows",
+]
+
+[[package]]
+name = "lrc-supervisor"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "log",
 ]
 
 [[package]]
