@@ -260,6 +260,11 @@ fn peel(rx: &mut Vec<u8>, out: &mut Vec<u8>) -> io::Result<Option<usize>> {
 }
 
 /// 阻塞读到一条完整消息。优先从 rx 里切，不够再读；读满一条即返回。
+///
+/// 关键约定：**读到的字节一律留在 rx 里**，包括读超时/出错之前已经到达的那部分。
+/// 以前这里用 `read_exact` 直接补消息体，一旦碰上读超时就把 "已读进 rx 的半个包"
+/// 连同缓冲一起 truncate 掉——那批字节在 socket 里已经没了，后续永远等不齐，
+/// 会话就此半死不活（客户端继续发，host 一直等到天荒地老）。
 fn recv_blocking(
     stream: &mut TcpStream,
     rx: &mut Vec<u8>,
@@ -270,48 +275,49 @@ fn recv_blocking(
         if let Some(len) = peel(rx, out)? {
             return Ok(Some(len));
         }
-        if rx.len() >= LEN_PREFIX {
-            // 已知整条消息多长：直接补满，避免一块块读再拷贝。
+        // 还差多少：知道长度就只要补齐这一条，否则按块读。
+        let want = if rx.len() >= LEN_PREFIX {
             let len = parse_len(rx)?;
-            let total = LEN_PREFIX + len;
-            let have = rx.len();
-            rx.resize(total, 0);
-            match stream.read_exact(&mut rx[have..]) {
-                Ok(()) => {
-                    *recv_bytes += (total - have) as u64;
-                    continue;
-                }
-                Err(e) => {
-                    rx.truncate(have);
-                    if e.kind() == io::ErrorKind::UnexpectedEof {
-                        return Err(io::Error::new(
-                            io::ErrorKind::UnexpectedEof,
-                            format!("消息体被截断：只有 {have}/{total} 字节"),
-                        ));
-                    }
-                    return Err(e);
-                }
-            }
+            (LEN_PREFIX + len).saturating_sub(rx.len()).min(READ_CHUNK)
+        } else {
+            READ_CHUNK
         }
-        // 连长度前缀都没凑齐。
-        let mut buf = [0u8; 4096];
-        match stream.read(&mut buf) {
+        .max(1);
+        let have = rx.len();
+        rx.resize(have + want, 0);
+        match stream.read(&mut rx[have..]) {
             Ok(0) => {
-                return if rx.is_empty() {
-                    Ok(None)
-                } else {
-                    Err(io::Error::new(
+                // 对端关闭：截掉没填上的尾巴，再按"已经攒到哪一步"给结论。
+                rx.truncate(have);
+                if have == 0 {
+                    // 一条没攒到：干净关闭。
+                    return Ok(None);
+                }
+                if have < LEN_PREFIX {
+                    // 长度头都没齐：对端在头中途关掉。
+                    return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "对端在长度前缀中途关闭",
-                    ))
-                };
+                    ));
+                }
+                // 长度头齐了但消息体没齐：截断。
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("消息体被截断：只有 {have} 字节"),
+                ));
             }
             Ok(n) => {
                 *recv_bytes += n as u64;
-                rx.extend_from_slice(&buf[..n]);
+                rx.truncate(have + n);
             }
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                rx.truncate(have);
+            }
+            Err(e) => {
+                // 超时 / 出错：这批新字节没收下，但之前缓冲的半个包必须原样保留。
+                rx.truncate(have);
+                return Err(e);
+            }
         }
     }
 }

@@ -493,7 +493,11 @@ pub fn run(link: crate::path::AcquiredLink, args: &Args, nonce_seq: u64) -> Resu
     result
 }
 
-/// 握手阶段单条消息的读超时（TCP/UDP 通用：LinkReader::recv_timeout 超时返回 Ok(None)）。
+/// 握手阶段单条消息的读超时（TCP/UDP 通用）。
+///
+/// `LinkReader::recv_timeout` 只在**真的超时**时返回 `Ok(None)`；
+/// 对端已关闭会返回 `Err(UnexpectedEof)`（见 lrc-transport::link 的 P0 注释），
+/// 那种情况按读失败处理，不会被误判成"连上但不说话"。
 fn recv_msg_timeout(reader: &mut LinkReader, buf: &mut Vec<u8>, timeout: Duration) -> Result<usize, Reject> {
     match reader.recv_timeout(buf, timeout).map_err(Reject::Io)? {
         Some(n) => Ok(n),
@@ -579,7 +583,7 @@ fn reader_loop(mut reader: LinkReader, shared: Arc<Shared>) {
         if shared.stop() {
             break;
         }
-        // 统一用 recv_timeout：TCP 下等价于原来的阻塞读（超时返回 None 再轮询），
+        // 统一用 recv_timeout：TCP 下超时返回 None 再轮询（对端关闭则是 Err，见下），
         // UDP 下还能顺便让 UdpConn 内部状态机（重传/保活）跑起来。
         match reader.recv_timeout(&mut buf, READ_POLL) {
             Ok(Some(n)) => {
